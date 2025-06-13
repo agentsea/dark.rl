@@ -1,6 +1,8 @@
 <p align="center">
-  <img src="./static/darkrl10.jpeg" alt="Nebulous Logo" width="400">
+  <img src="static/dark_rl_alpha_refined.png" alt="Nebulous Logo" width="400">
 </p>
+
+# Dark RL
 
 Advanced kernels for reinforcement learning.
 
