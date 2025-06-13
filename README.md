@@ -1,6 +1,8 @@
-# Nano-vLLM
+<p align="center">
+  <img src="./static/darkrl10.jpeg" alt="Nebulous Logo" width="400">
+</p>
 
-A lightweight vLLM implementation built from scratch.
+Advanced kernels for reinforcement learning.
 
 ## Key Features
 
