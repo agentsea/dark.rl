@@ -2,11 +2,11 @@ import os
 import time
 from random import randint, seed
 
-from nanovllm import LLM, SamplingParams
+from dark import LLM, SamplingParams
 
 # from vllm import LLM, SamplingParams
 
-# This script benchmarks the throughput of the nanovllm engine.
+# This script benchmarks the throughput of the dark engine.
 # Throughput is a measure of how many tokens the engine can generate per second.
 
 # --- Benchmark Configuration ---

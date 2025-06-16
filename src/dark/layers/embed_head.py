@@ -3,7 +3,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-from nanovllm.utils.context import get_context
+from dark.utils.context import get_context
 
 
 class VocabParallelEmbedding(nn.Module):

@@ -3,11 +3,11 @@ from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
-from nanovllm.config import Config
-from nanovllm.engine.model_runner import ModelRunner
-from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.sequence import Sequence
-from nanovllm.sampling_params import SamplingParams
+from dark.config import Config
+from dark.engine.model_runner import ModelRunner
+from dark.engine.scheduler import Scheduler
+from dark.engine.sequence import Sequence
+from dark.sampling_params import SamplingParams
 
 
 class LLMEngine:

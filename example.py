@@ -2,9 +2,9 @@ import os
 
 from transformers import AutoTokenizer
 
-from nanovllm import LLM, SamplingParams
+from dark import LLM, SamplingParams
 
-# This script provides a simple example of how to use the nanovllm engine
+# This script provides a simple example of how to use the dark engine
 # directly as a Python library, without the API server.
 
 # 1. Define the path to the model and initialize the tokenizer and the LLM engine.

@@ -4,7 +4,7 @@ import triton.language as tl
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from torch import nn
 
-from nanovllm.utils.context import get_context
+from dark.utils.context import get_context
 
 
 @triton.jit

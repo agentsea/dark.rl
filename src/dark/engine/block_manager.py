@@ -3,7 +3,7 @@ from collections import deque
 import numpy as np
 import xxhash
 
-from nanovllm.engine.sequence import Sequence
+from dark.engine.sequence import Sequence
 
 
 def compute_hash(token_ids: list[int], prefix: int = -1):

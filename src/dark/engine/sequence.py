@@ -2,7 +2,7 @@ from copy import copy
 from enum import Enum, auto
 from itertools import count
 
-from nanovllm.sampling_params import SamplingParams
+from dark.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):

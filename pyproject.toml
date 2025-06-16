@@ -20,8 +20,14 @@ dependencies = [
     "xxhash",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest"
+]
+
 [project.urls]
 Homepage="https://github.com/pbarker/dark.rl"
 
 [tool.setuptools]
+package-dir = {"" = "src"}
 packages = ["dark"]
