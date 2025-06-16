@@ -3,13 +3,13 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
+name = "dark-rl"
 version = "0.1.0"
-authors = [{ name = "Xingkai Yu" }]
+authors = [{ name = "Patrick Barker" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "a lightweight vLLM implementation built from scratch"
+description = "Advanced Kernels for Reinforcement Learning"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/pbarker/dark.rl"
 
 [tool.setuptools]
-packages = ["nanovllm"]
+packages = ["dark"]
