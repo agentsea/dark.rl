@@ -1,10 +1,24 @@
+# coding=utf-8
+# Copyright 2025 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from typing import Optional
 import torch
 import triton
 import triton.language as tl
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
 from torch import nn
-
-from dark.utils.context import get_context
+import torch.nn.functional as F
 
 
 @triton.jit
@@ -79,6 +93,44 @@ def store_kvcache(
     )
 
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+
 class Attention(nn.Module):
     """
         The core attention module.
@@ -103,7 +155,9 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bs: int, seq_len: int
+    ):
         """
         Performs the attention forward pass.
 
@@ -126,14 +180,40 @@ class Attention(nn.Module):
             The output tensor from the attention calculation.
         """
         o: torch.Tensor
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
-        context = get_context()
-        k_cache = self.k_cache
-        v_cache = self.v_cache
-        store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-        if context.is_prefill:
+
+        if context.is_training:
+            q = q.view(bs, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+            k = k.view(bs, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = v.view(bs, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        else:
+            q = q.view(-1, self.num_heads, self.head_dim)
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+            v = v.view(-1, self.num_kv_heads, self.head_dim)
+
+        if not context.is_training:
+            k_cache = self.k_cache
+            v_cache = self.v_cache
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+
+        if context.is_training:
+            # The original flash_attn_func call that was causing errors.
+            # This is preserved in case we want to debug it later.
+            # o = flash_attn_func(
+            #     q,
+            #     k,
+            #     v,
+            #     softmax_scale=self.scale,
+            #     causal=True,
+            # )
+
+            # Using PyTorch's standard attention for the training path.
+            # Manually handle GQA by repeating K and V heads.
+            if self.num_kv_heads < self.num_heads:
+                k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+                v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            o = o.transpose(1, 2).contiguous()
+        elif context.is_prefill:
             if context.block_tables is not None:  # prefix cache
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(

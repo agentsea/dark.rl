@@ -1,3 +1,17 @@
+# coding=utf-8
+# Copyright 2025 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import torch
 from torch import nn
 
@@ -13,23 +27,30 @@ class RMSNorm(nn.Module):
     before normalization.
     """
 
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-    ) -> None:
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        RMSNorm is equivalent to T5LayerNorm
+        """
         super().__init__()
-        self.hidden_size = hidden_size
-        self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
 
-    @torch.compile
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
     def rms_forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Performs standard RMSNorm.
+        Performs standard RMSNorm (out-of-place version to keep autograd intact).
 
         Args:
             x: The input tensor.
@@ -38,57 +59,36 @@ class RMSNorm(nn.Module):
             The normalized tensor.
         """
         orig_dtype = x.dtype
-        # Calculations are done in float32 for precision.
-        x = x.to(torch.float32)
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        # Normalize and apply the learnable weight.
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x
+        x_fp32 = x.to(torch.float32)
+        var = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+        normed = x_fp32 * torch.rsqrt(var + self.variance_epsilon)
+        normed = normed.to(orig_dtype)
+        return normed * self.weight
 
-    @torch.compile
     def add_rms_forward(
         self,
         x: torch.Tensor,
         residual: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
-        Performs RMSNorm with a residual connection added first.
-
-        This is a common "pre-layernorm" pattern. The residual is added to the
-        input *before* the normalization is applied.
-
-        Args:
-            x: The input tensor.
-            residual: The residual tensor to be added to the input.
-
-        Returns:
-            A tuple containing the normalized tensor and the new residual,
-            which is the sum of the input and the old residual.
+        RMSNorm with a residual connection added first (out-of-place operations).
         """
         orig_dtype = x.dtype
-        # Add residual in float32 for precision.
-        x = x.to(torch.float32).add_(residual.to(torch.float32))
-        # The new residual is the result of the addition.
-        residual = x.to(orig_dtype)
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        # Normalize and apply the learnable weight.
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x, residual
+        # Addition in float32 for numerical stability.
+        x_fp32 = x.to(torch.float32) + residual.to(torch.float32)
+        new_residual = x_fp32.to(orig_dtype)
+
+        var = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+        normed = x_fp32 * torch.rsqrt(var + self.variance_epsilon)
+        normed = normed.to(orig_dtype)
+        return normed * self.weight, new_residual
 
     def forward(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """
-
-        Main forward pass that dispatches to the correct normalization function.
-        If a residual is provided, it uses the 'add_rms_forward' method.
-        Otherwise, it uses the standard 'rms_forward' method.
-        """
+        """Main forward pass selecting the correct RMSNorm variant."""
         if residual is None:
             return self.rms_forward(x)
-        else:
-            return self.add_rms_forward(x, residual)
+        return self.add_rms_forward(x, residual)

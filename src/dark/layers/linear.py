@@ -82,10 +82,15 @@ class ReplicatedLinear(LinearBase):
         # Main linear transformation
         y = F.linear(x, self.weight, self.bias)
         # Add the LoRA result if LoRA is enabled
-        if self.lora_rank > 0:
+        if self.lora_rank > 0 and self.training:
             lora_x = F.linear(x, self.lora_a)
             lora_x = F.linear(lora_x, self.lora_b)
-            y += lora_x * self.scaling
+            lora_x = lora_x * self.scaling
+            y = y + lora_x
+        elif self.lora_rank > 0:
+            lora_x = F.linear(x, self.lora_a)
+            lora_x = F.linear(lora_x, self.lora_b)
+            y = y + lora_x * self.scaling
         return y
 
 
@@ -159,7 +164,7 @@ class ColumnParallelLinear(LinearBase):
         if self.lora_rank > 0:
             lora_x = F.linear(x, self.lora_a)
             lora_x = F.linear(lora_x, self.lora_b)
-            y += lora_x * self.scaling
+            y = y + lora_x * self.scaling
         return y
 
 
@@ -176,11 +181,19 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         input_size: int,
         output_sizes: list[int],
         bias: bool = False,
+        lora_rank: int = 0,
+        lora_alpha: float = 1.0,
     ):
         self.output_sizes = output_sizes
         tp_size = 1  # get_tensor_model_parallel_world_size()
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
-        super().__init__(input_size, sum(output_sizes), bias=bias)
+        super().__init__(
+            input_size,
+            sum(output_sizes),
+            bias=bias,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+        )
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int
@@ -208,6 +221,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int | None = None,
         bias: bool = False,
+        lora_rank: int = 0,
+        lora_alpha: float = 1.0,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -229,7 +244,9 @@ class QKVParallelLinear(ColumnParallelLinear):
             self.num_kv_heads * self.head_size * tp_size,  # v_proj
         ]
 
-        super().__init__(input_size, output_size, bias)
+        super().__init__(
+            input_size, output_size, bias=bias, lora_rank=lora_rank, lora_alpha=lora_alpha
+        )
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str
@@ -321,7 +338,7 @@ class RowParallelLinear(LinearBase):
         if self.lora_rank > 0:
             lora_x = F.linear(x, self.lora_a)
             lora_x = F.linear(lora_x, self.lora_b)
-            y += lora_x * self.scaling
+            y = y + lora_x * self.scaling
 
         # Sum the partial results from all GPUs.
         if self.tp_size > 1:

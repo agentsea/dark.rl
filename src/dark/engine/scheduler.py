@@ -1,7 +1,6 @@
 from collections import deque
 
 from dark.config import Config
-from dark.engine.block_manager import BlockManager
 from dark.engine.sequence import Sequence, SequenceStatus
 
 
@@ -18,18 +17,10 @@ class Scheduler:
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
-        self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-        self.block_manager = BlockManager(
-            config.num_kvcache_blocks, config.kvcache_block_size
-        )
-
-        # Queues for managing sequence states.
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
-
         self.num_finished = 0
-        self.num_tokens = 0
 
     def is_finished(self):
         """Checks if there are any pending or running sequences."""
@@ -57,66 +48,20 @@ class Scheduler:
             A tuple containing the list of scheduled sequences and a boolean
             indicating if it is a prefill batch (`True`) or a decode batch (`False`).
         """
-        # --- Stage 1: Try to schedule prefill sequences ---
+        # Simple scheduling: move all waiting to running
         scheduled_seqs = []
-        num_seqs = 0
-        num_batched_tokens = 0
-        while self.waiting and num_seqs < self.max_num_seqs:
-            seq = self.waiting[0]
-            # Check if adding the next sequence would exceed batch limits or if
-            # there's not enough memory.
-            if num_batched_tokens + len(
-                seq
-            ) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
-                break
-            num_seqs += 1
-            self.block_manager.allocate(seq)
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
-            seq.status = SequenceStatus.RUNNING
-            self.waiting.popleft()
-            self.running.append(seq)
-            scheduled_seqs.append(seq)
-
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        # --- Stage 2: Schedule decode sequences ---
-        while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
-            # If a running sequence cannot have a new token appended (due to lack of
-            # memory), we may need to preempt another sequence to make space.
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    # If this is the only running sequence and it can't proceed,
-                    # it must be preempted.
-                    self.preempt(seq)
-                    break
-            else:
-                num_seqs += 1
-                self.block_manager.may_append(seq)
+        is_prefill = False
+        if self.waiting:
+            is_prefill = True
+            while self.waiting:
+                seq = self.waiting.popleft()
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
                 scheduled_seqs.append(seq)
+        else:
+            scheduled_seqs = list(self.running)
 
-        # Re-populate the running queue with the newly scheduled decode batch.
-        running = deque(scheduled_seqs)
-        running.extend(self.running)
-        self.running = running
-
-        assert scheduled_seqs
-        return scheduled_seqs, False
-
-    def preempt(self, seq: Sequence):
-        """
-        Preempts a running sequence, moving it back to the waiting queue.
-
-        This involves deallocating its KV cache blocks to free up memory.
-        The sequence is added to the front of the waiting queue to give it
-        priority in the next scheduling iteration.
-        """
-        seq.status = SequenceStatus.WAITING
-        self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
+        return scheduled_seqs, is_prefill
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]):
         """
@@ -127,13 +72,11 @@ class Scheduler:
         sequences are removed from the running queue and their resources are
         deallocated.
         """
-        self.num_tokens += len(token_ids)
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
             if (
                 not seq.ignore_eos and token_id == self.eos
             ) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
                 self.running.remove(seq)
                 self.num_finished += 1

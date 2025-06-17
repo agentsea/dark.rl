@@ -5,76 +5,24 @@ from transformers import AutoTokenizer
 from dark import LLM, SamplingParams
 
 # --- Script Configuration ---
-MODEL_PATH = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+MODEL_PATH = "Qwen/Qwen3-0.6B"
+
+# A quirky target sentence we want the tiny LoRA fine-tune to memorize.
+TARGET_SENTENCE = "Purple ducklings whistle jazz tunes."
+TARGET_PROMPT = "Purple ducklings"
 
 def main():
     """
     An integration script that performs a few training steps and then runs inference.
     """
-    # 1. Check if model exists
-    if not os.path.exists(MODEL_PATH):
-        print(f"Model not found at {MODEL_PATH}", file=sys.stderr)
-        print("Please download the model or update the MODEL_PATH variable.", file=sys.stderr)
-        sys.exit(1)
-
-    # 2. Initialize tokenizer and LLM
+    # 1. Initialize tokenizer and LLM
     print("--> Initializing tokenizer and LLM...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
     # enforce_eager is needed for training to work correctly with .backward()
     llm = LLM(MODEL_PATH, enforce_eager=True, lora_rank=8)
     print("--> Initialization complete.")
 
-    # 3. Prepare training data
-    print("\n--> Preparing training data...")
-    training_sentence = "The quick brown fox jumps over the lazy dog."
-    input_ids = tokenizer.encode(training_sentence, return_tensors="pt")[0].cuda()
-    labels = input_ids.clone()
-
-    # For causal LM, the labels are the input ids shifted by one
-    input_ids = input_ids[:-1]
-    labels = labels[1:]
-    
-    positions = torch.arange(0, len(input_ids), dtype=torch.long).cuda()
-    print("--> Data preparation complete.")
-
-    # 4. Set up optimizer and loss function
-    optimizer = torch.optim.Adam(llm.model_runner.model.parameters(), lr=1e-4)
-    loss_fn = torch.nn.CrossEntropyLoss()
-
-    # 5. Training loop
-    print("\n--> Starting training loop...")
-    llm.train()
-    initial_loss = None
-    final_loss = None
-
-    for i in range(5):
-        optimizer.zero_grad()
-        
-        # Forward pass
-        logits = llm.forward_train(input_ids, positions)
-        
-        # Calculate loss
-        loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
-        
-        # Backward pass and optimization
-        loss.backward()
-        optimizer.step()
-        
-        print(f"Step {i}, Loss: {loss.item()}")
-        if i == 0:
-            initial_loss = loss.item()
-        if i == 4:
-            final_loss = loss.item()
-    print("--> Training complete.")
-
-    # Assert that the loss has decreased
-    if not (initial_loss is not None and final_loss is not None and final_loss < initial_loss):
-        print("\nError: Loss did not decrease during training.", file=sys.stderr)
-        sys.exit(1)
-    
-    print("\nSuccessfully confirmed that loss decreased during training.")
-
-    # 6. Switch to evaluation mode and run inference
+    # 2. Switch to evaluation mode and run inference
     print("\n--> Running inference...")
     llm.eval()
     
@@ -83,7 +31,7 @@ def main():
     
     outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
 
-    # 7. Check inference output and print results
+    # 3. Check inference output and print results
     generated_text = outputs[0]['text']
     print(f"\nPrompt: {prompts[0]!r}")
     print(f"Generated text: {generated_text!r}")
@@ -94,6 +42,60 @@ def main():
 
     print("\nIntegration test passed!")
 
+    # 2b. Baseline generation with the target prompt before fine-tuning.
+    print("\n--> Baseline generation for target prompt (before fine-tune)...")
+    baseline_outputs = llm.generate([TARGET_PROMPT], sampling_params, use_tqdm=False)
+    baseline_text = baseline_outputs[0]['text']
+    print(f"Prompt: {TARGET_PROMPT!r}\nBaseline generated text: {baseline_text!r}")
+    # Not asserting anything here—goal is just to inspect difference after fine-tune.
+
+    # 3. Prepare training data
+    print("\n--> Preparing training data...")
+    input_ids = tokenizer.encode(TARGET_SENTENCE, return_tensors="pt").cuda()
+
+    # 4. Set up optimizer
+    optimizer = torch.optim.Adam(llm.model_runner.model.parameters(), lr=1e-3)
+
+    # 5. Training loop
+    print("\n--> Starting training loop...")
+    llm.train()
+    initial_loss = None
+    final_loss = None
+
+    for i in range(20):
+        optimizer.zero_grad()
+        
+        # Forward pass
+        loss = llm.forward_train(input_ids)
+        
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+        
+        print(f"Step {i}, Loss: {loss.item()}")
+        if i == 0:
+            initial_loss = loss.item()
+        if i == 19:
+            final_loss = loss.item()
+    print("--> Training complete.")
+
+    # Assert that the loss has decreased
+    if final_loss is not None and initial_loss is not None and final_loss >= initial_loss:
+        print("Error: Loss did not decrease during training", file=sys.stderr)
+        sys.exit(1)
+
+    # 6. Test that the model has learned to produce the target continuation
+    print("\n--> Verifying fine-tuned behavior...")
+    llm.eval()
+    outputs_ft = llm.generate([TARGET_PROMPT], sampling_params, use_tqdm=False)
+    generated_ft = outputs_ft[0]['text']
+    print(f"Prompt: {TARGET_PROMPT!r}\nGenerated text after fine-tune: {generated_ft!r}")
+
+    if "jazz" not in generated_ft.lower():
+        print("Error: Fine-tuned model did not produce the expected phrase.", file=sys.stderr)
+        sys.exit(1)
+
+    print("\nAll integration checks passed!")
 
 if __name__ == "__main__":
     main() 

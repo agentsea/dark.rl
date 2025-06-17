@@ -1,133 +1,50 @@
-from functools import lru_cache
-
+# coding=utf-8
+# Copyright 2025 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import torch
-from torch import nn
 
 
-def apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Applies rotary positional embeddings to an input tensor.
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
-    This function takes a tensor `x` and rotates its components using the
-    pre-computed cosine and sine values. The input tensor is split into two
-    halves, which are then rotated and concatenated back together.
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
-        x: The input tensor to which RoPE will be applied.
-        cos: The cosine components of the rotation.
-        sin: The sine components of the rotation.
-
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
     Returns:
-        The transformed tensor with rotary embeddings applied.
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = cos.unsqueeze(-2)
-    sin = sin.unsqueeze(-2)
-    # The tensor is split into two halves for the rotation operation.
-    x1, x2 = torch.chunk(x.to(torch.float32), 2, dim=-1)
-    # The rotation is applied.
-    y1 = x1 * cos - x2 * sin
-    y2 = x2 * cos + x1 * sin
-    return torch.cat((y1, y2), dim=-1).to(x.dtype)
-
-
-class RotaryEmbedding(nn.Module):
-    """
-    A module that computes and applies Rotary Positional Embeddings (RoPE).
-
-    RoPE encodes absolute position information by rotating chunks of the query
-    and key vectors by an angle that depends on their position. This module
-    pre-computes the sine and cosine values for all possible positions up to
-    `max_position_embeddings` and stores them in a cache for efficient lookup
-    during the forward pass.
-    """
-
-    def __init__(
-        self,
-        head_size: int,
-        rotary_dim: int,
-        max_position_embeddings: int,
-        base: float,
-    ) -> None:
-        super().__init__()
-        self.head_size = head_size
-        self.rotary_dim = rotary_dim
-        assert rotary_dim == head_size
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-
-        # Pre-compute the inverse frequencies for the sinusoidal embeddings.
-        inv_freq = 1.0 / (
-            base
-            ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
-            )
-        )
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
-
-        # Pre-compute and cache the cosine and sine values.
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1)
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
-
-    @torch.compile
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Applies RoPE to the query and key tensors.
-
-        It looks up the pre-computed cosine and sine values from the cache based
-        on the token positions and then applies the rotation.
-
-        Args:
-            positions: A tensor containing the positions of the tokens.
-            query: The query tensor.
-            key: The key tensor.
-
-        Returns:
-            The transformed query and key tensors with RoPE applied.
-        """
-        positions = positions.flatten()
-        # Look up the cos and sin values from the cache for the given positions.
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-
-        # Apply the rotary embeddings to the query tensor.
-        query_shape = query.shape
-        query = query.view(positions.shape[0], -1, self.head_size)
-        query = apply_rotary_emb(query, cos, sin).view(query_shape)
-
-        # Apply the rotary embeddings to the key tensor.
-        key_shape = key.shape
-        key = key.view(positions.shape[0], -1, self.head_size)
-        key = apply_rotary_emb(key, cos, sin).view(key_shape)
-
-        return query, key
-
-
-@lru_cache(1)
-def get_rope(
-    head_size: int,
-    rotary_dim: int,
-    max_position: int,
-    base: float,
-    rope_scaling: dict | None = None,
-):
-    """
-    A factory function to create and cache a RotaryEmbedding instance.
-
-    Uses an LRU cache to ensure that only one instance of the RotaryEmbedding
-    module is created for a given set of parameters, improving efficiency.
-    """
-    assert rope_scaling is None
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    return rotary_emb
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+ 

@@ -1,5 +1,6 @@
 from time import perf_counter
 
+from huggingface_hub import snapshot_download
 from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
@@ -29,15 +30,15 @@ class LLMEngine:
             model: The path to the model or a model identifier from Hugging Face.
             **kwargs: Additional configuration options that will override the defaults.
         """
-        # Initialize configuration from the model path and any provided kwargs.
-        config = Config(model)
+        model_path = snapshot_download(repo_id=model)
+        config = Config(model_path)
         for k, v in kwargs.items():
             if hasattr(config, k):
                 setattr(config, k, v)
         Sequence.block_size = config.kvcache_block_size
 
-        # Load the Hugging Face model config and tokenizer.
-        config.hf_config = AutoConfig.from_pretrained(config.model)
+        # Load the corrected local config file, not the one from the Hub.
+        config.hf_config = AutoConfig.from_pretrained("./corrected_config.json")
         config.max_model_len = min(
             config.max_model_len, config.hf_config.max_position_embeddings
         )
@@ -56,13 +57,14 @@ class LLMEngine:
         """Switches the underlying model to evaluation mode."""
         self.model_runner.eval()
 
-    def forward_train(self, input_ids, positions):
+    def forward_train(self, input_ids):
         """
         Performs a forward pass for training, allowing gradients to be computed.
 
         This is a pass-through to the model runner's training-specific run method.
         """
-        return self.model_runner.run_train_model(input_ids, positions)
+        _, loss = self.model_runner.run_train_model(input_ids, labels=input_ids.clone())
+        return loss
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         """
@@ -90,7 +92,9 @@ class LLMEngine:
             tokens processed in this step.
         """
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.run(seqs, is_prefill)
+        if not seqs:
+            return [], 0
+        token_ids = self.model_runner.run(seqs)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [
             (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
