@@ -75,13 +75,13 @@ class LLMEngine:
         """Switches the underlying model to evaluation mode."""
         self.model_runner.eval()
 
-    def forward_train(self, input_ids):
+    def forward_train(self, input_ids, labels):
         """
         Performs a forward pass for training, allowing gradients to be computed.
 
         This is a pass-through to the model runner's training-specific run method.
         """
-        _, loss = self.model_runner.run_train_model(input_ids, labels=input_ids.clone())
+        _, loss = self.model_runner.run_train_model(input_ids, labels=labels)
         return loss
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
