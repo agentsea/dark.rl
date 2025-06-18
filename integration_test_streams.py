@@ -4,6 +4,7 @@ from typing import Dict, List, Union
 
 import torch
 import bitsandbytes as bnb
+import asyncio
 
 from dark import LLM, SamplingParams
 from dark.engine.sequence import Sequence
@@ -47,8 +48,14 @@ def load_lora_state(model, state: Dict[str, torch.Tensor]):
     print(f"[metric] lora_load_ms={dt_ms:.2f}")
 
 
-def stream_generate(llm: LLM, prompts: List[str], sp: SamplingParams) -> List[str]:
-    """Run generation step-by-step on a batch of prompts."""
+async def stream_generate(
+    llm: LLM,
+    prompts: List[str],
+    sp: SamplingParams,
+    lock: asyncio.Lock,
+    infer_stream: torch.cuda.Stream,
+) -> List[str]:
+    """Run generation step-by-step on a batch of prompts, asynchronously."""
     gen_start = time.perf_counter()
     tokenizer = llm.tokenizer
 
@@ -59,21 +66,29 @@ def stream_generate(llm: LLM, prompts: List[str], sp: SamplingParams) -> List[st
         for _ in range(sp.n):
             seqs.append(Sequence(tokenizer.encode(prompt), sp))
 
-    for seq in seqs:
-        llm.scheduler.add(seq)
+    async with lock:
+        llm.eval()
+        for seq in seqs:
+            llm.scheduler.add(seq)
 
     outs = ["" for _ in seqs]
     emitted = [0 for _ in seqs]
     while any(not seq.is_finished for seq in seqs):
         step_t0 = time.perf_counter()
-        llm.step()
+        async with lock:
+            llm.eval()
+            with torch.cuda.stream(infer_stream):
+                llm.step()
         step_dt_ms = (time.perf_counter() - step_t0) * 1000
         print(f"[metric] llm_step_ms={step_dt_ms:.2f}")
+
         for i, seq in enumerate(seqs):
             while seq.num_completion_tokens > emitted[i]:
                 tid = seq.completion_token_ids[emitted[i]]
                 outs[i] += tokenizer.decode([tid], skip_special_tokens=True)
                 emitted[i] += 1
+        await asyncio.sleep(0)  # Yield to other async tasks
+
     total_gen_ms = (time.perf_counter() - gen_start) * 1000
     num_tokens = sum(s.num_completion_tokens for s in seqs)
     per_tok = total_gen_ms / max(1, num_tokens)
@@ -84,17 +99,21 @@ def stream_generate(llm: LLM, prompts: List[str], sp: SamplingParams) -> List[st
     return outs
 
 
-def fine_tune(llm: LLM, tokenizer, examples: List[Dict[str, str]], steps: int = 5, lr: float = 1e-3, use_adam8bit: bool = USE_ADAM8BIT):
-    """Quick LoRA fine-tune on a batch of prompt/response pairs."""
+async def fine_tune(
+    llm: LLM,
+    tokenizer,
+    examples: List[Dict[str, str]],
+    lock: asyncio.Lock,
+    steps: int = 5,
+    lr: float = 1e-3,
+    use_adam8bit: bool = USE_ADAM8BIT,
+):
+    """Quick LoRA fine-tune on a batch of prompt/response pairs, asynchronously."""
     t_ft_start = time.perf_counter()
 
-    llm.train()
-
+    # Data preparation can happen outside the lock.
     prompts = [ex["prompt"] for ex in examples]
     responses = [ex["response"] for ex in examples]
-
-    # Create combined prompt+response sequences, with EOS at the end of each response.
-    # The tokenizer will handle padding.
     prompt_ids = tokenizer(prompts, padding=False).input_ids
     response_ids = tokenizer(responses, padding=False).input_ids
     
@@ -102,20 +121,15 @@ def fine_tune(llm: LLM, tokenizer, examples: List[Dict[str, str]], steps: int = 
     labels = []
     for i in range(len(prompts)):
         prompt_len = len(prompt_ids[i])
-        # Concatenate prompt and response, and add EOS.
         input_id = prompt_ids[i] + response_ids[i] + [tokenizer.eos_token_id]
-        # Create labels that ignore the prompt part.
         label = [-100] * prompt_len + response_ids[i] + [tokenizer.eos_token_id]
         input_ids.append(torch.tensor(input_id))
         labels.append(torch.tensor(label))
 
-    # Pad batches to the same length.
     input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id).cuda()
     labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100).cuda()
 
-    params_to_tune = [
-        p for n, p in llm.model_runner.model.named_parameters() if "lora_" in n
-    ]
+    params_to_tune = [p for n, p in llm.model_runner.model.named_parameters() if "lora_" in n]
     if use_adam8bit:
         print("        [fine_tune] using Adam 8-bit optimizer")
         optimizer = bnb.optim.Adam8bit(params_to_tune, lr=lr)
@@ -123,55 +137,103 @@ def fine_tune(llm: LLM, tokenizer, examples: List[Dict[str, str]], steps: int = 
         optimizer = torch.optim.Adam(params_to_tune, lr=lr)
     
     for step in range(steps):
-        optimizer.zero_grad()
-        loss = llm.forward_train(input_ids, labels)
-        loss.backward()
+        async with lock:
+            llm.train()
+            optimizer.zero_grad()
+            loss = llm.forward_train(input_ids, labels)
+            loss.backward()
 
-        # Debug gradient norm of the first LoRA parameter to check if training signal flows.
-        for n, p in llm.model_runner.model.named_parameters():
-            if "lora_a" in n:
-                grad_exists = p.grad is not None
-                grad_norm = p.grad.norm().item() if grad_exists else 0.0
-                print(f"            grad_norm({n})={grad_norm:.6f}  grad_exists={grad_exists}")
-                # Also print training flag of the parent layer once.
-                parent_module = llm.model_runner.model
-                rep_layer = None
-                # Try to retrieve module via name split
-                try:
-                    parts = n.split('.')[:-1]  # drop param name
-                    rep_layer = parent_module
-                    for part in parts:
-                        rep_layer = getattr(rep_layer, part)
-                except Exception:
+            # Debug gradient norm
+            for n, p in llm.model_runner.model.named_parameters():
+                if "lora_a" in n:
+                    grad_exists = p.grad is not None
+                    grad_norm = p.grad.norm().item() if grad_exists else 0.0
+                    print(f"            grad_norm({n})={grad_norm:.6f}  grad_exists={grad_exists}")
+                    # Also print training flag of the parent layer once.
+                    parent_module = llm.model_runner.model
                     rep_layer = None
-                if rep_layer is not None:
-                    print(f"            {'.'.join(parts)}.training={rep_layer.training}")
-                break
+                    # Try to retrieve module via name split
+                    try:
+                        parts = n.split('.')[:-1]  # drop param name
+                        rep_layer = parent_module
+                        for part in parts:
+                            rep_layer = getattr(rep_layer, part)
+                    except Exception:
+                        rep_layer = None
+                    if rep_layer is not None:
+                        print(f"            {'.'.join(parts)}.training={rep_layer.training}")
+                    break
+            optimizer.step()
 
-        optimizer.step()
-
-        # Debug print of loss to monitor convergence
         if step == 0 or step == steps - 1 or step % 10 == 0:
             print(f"        [fine_tune] step={step:3d}  loss={loss.item():.4f}")
-        # Record per-step timing.
+
         if step == 0:
             step_t0 = time.perf_counter()
         elif step == 1:
-            # Second iteration gives a more stable per-step time.
             step_dt_ms = (time.perf_counter() - step_t0) * 1000
             print(f"[metric] fine_tune_step_ms≈{step_dt_ms:.2f}")
+        
+        await asyncio.sleep(0)  # Yield to other async tasks
 
-    # Print the norm of LoRA parameters after training for diagnostics
-    with torch.no_grad():
-        norms = {n: p.norm().item() for n, p in llm.model_runner.model.named_parameters() if "lora_" in n}
-        avg_norm = sum(norms.values()) / len(norms) if norms else 0.0
-        print(f"        [fine_tune] average LoRA param norm={avg_norm:.4f}")
-
-    llm.eval()
+    async with lock:
+        llm.eval()
+        with torch.no_grad():
+            norms = {n: p.norm().item() for n, p in llm.model_runner.model.named_parameters() if "lora_" in n}
+            avg_norm = sum(norms.values()) / len(norms) if norms else 0.0
+            print(f"        [fine_tune] average LoRA param norm={avg_norm:.4f}")
 
     total_ft_ms = (time.perf_counter() - t_ft_start) * 1000
     print(f"[metric] fine_tune_total_ms={total_ft_ms:.2f}")
     return optimizer.state_dict()
+
+
+async def run_train_task(
+    lock: asyncio.Lock,
+    infer_stream: torch.cuda.Stream,
+    llm: LLM,
+    tokenizer,
+    msg: Message,
+    lora_states: Dict[str, Dict[str, torch.Tensor]],
+    opt_states: Dict[str, Dict],
+    use_adam8bit: bool,
+):
+    """An async task to run fine-tuning in the background."""
+    lora_name = msg["lora"]
+    print(f"Running fine-tuning for LoRA: {lora_name}")
+
+    async with lock:
+        # Load the current state for this LoRA adapter before training.
+        if lora_name in lora_states:
+            load_lora_state(llm.model_runner.model, lora_states[lora_name])
+
+    # Run the asynchronous fine-tuning function.
+    opt_state = await fine_tune(
+        llm,
+        tokenizer,
+        msg["messages"],
+        lock,
+        steps=3,
+        lr=1e-4,
+        use_adam8bit=use_adam8bit,
+    )
+
+    async with lock:
+        # Save the updated LoRA and optimizer states.
+        lora_states[lora_name] = get_lora_state(
+            llm.model_runner.model, to_cpu=OFFLOAD_LORA_TO_CPU
+        )
+        opt_states[lora_name] = opt_state
+
+    # After training, run an immediate generation for debugging. The lock is
+    # released before this call.
+    prompts_debug = [ex["prompt"] for ex in msg["messages"]]
+    sp_debug = SamplingParams(temperature=0.0, max_tokens=12, n=1)
+    debug_out = await stream_generate(
+        llm, prompts_debug, sp_debug, lock, infer_stream
+    )
+    for prompt, out in zip(prompts_debug, debug_out):
+        print(f"        [post-train] prompt='{prompt}' -> {out}")
 
 
 def build_message_queue() -> List[Message]:
@@ -212,7 +274,7 @@ def build_message_queue() -> List[Message]:
     return msgs
 
 
-def main():
+async def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Run a message queue integration test for LoRA fine-tuning and generation.")
@@ -234,6 +296,9 @@ def main():
 
     lora_states: Dict[str, Dict[str, torch.Tensor]] = {}
     opt_states: Dict[str, Dict] = {}
+    training_tasks: Dict[str, asyncio.Task] = {}
+    lock = asyncio.Lock()
+    infer_stream = torch.cuda.Stream()
 
     msgs = build_message_queue()
     start = time.perf_counter()
@@ -241,49 +306,65 @@ def main():
     for i, msg in enumerate(msgs):
         lora_name = msg["lora"]
 
-        # Load or init LoRA.
-        if lora_name in lora_states:
-            load_lora_state(llm.model_runner.model, lora_states[lora_name])
-        else:
-            # Else: keep the random initialization already present.
-            pass
+        # Before processing a new message for a LoRA, wait for any existing
+        # training task for the same LoRA to complete.
+        if lora_name in training_tasks:
+            await training_tasks.pop(lora_name)
 
         if msg["type"] == "train":
-            print(f"[{i}] TRAIN ({lora_name}): {msg['messages']}")
-            # Use more fine-tuning iterations with a lower learning rate so the LoRA
-            # can reliably memorise the sentence without corrupting the base model.
-            opt_state = fine_tune(llm, tokenizer, msg["messages"], steps=3, lr=1e-4, use_adam8bit=args.use_adam8bit)
-            lora_states[lora_name] = get_lora_state(llm.model_runner.model, to_cpu=OFFLOAD_LORA_TO_CPU)
-            opt_states[lora_name] = opt_state
+            print(f"[{i}] QUEUE TRAIN ({lora_name})")
+            # Create a background task for fine-tuning.
+            task = asyncio.create_task(
+                run_train_task(
+                    lock,
+                    infer_stream,
+                    llm,
+                    tokenizer,
+                    msg,
+                    lora_states,
+                    opt_states,
+                    args.use_adam8bit,
+                )
+            )
+            training_tasks[lora_name] = task
+        else:  # "generate"
+            print(f"[{i}] GEN ({lora_name}):")
+            async with lock:
+                # Load the appropriate LoRA state for generation.
+                if lora_name in lora_states:
+                    load_lora_state(llm.model_runner.model, lora_states[lora_name])
 
-            # After training, run an immediate generation for debugging.
-            prompts_debug = [ex["prompt"] for ex in msg["messages"]]
-            sp_debug = SamplingParams(temperature=0.0, max_tokens=12, n=1)
-            debug_out = stream_generate(llm, prompts_debug, sp_debug)
-            for prompt, out in zip(prompts_debug, debug_out):
-                print(f"        [post-train] prompt='{prompt}' -> {out}")
-        else:
             prompts = msg["prompt"]
             sp.n = msg.get("n", 1)
-            output = stream_generate(llm, prompts, sp)
-            print(f"[{i}] GEN ({lora_name}):")
-            for i in range(len(prompts)):
+            output = await stream_generate(llm, prompts, sp, lock, infer_stream)
+            for i_prompt in range(len(prompts)):
                 for j in range(sp.n):
-                    print(f"  '{prompts[i]}' -> {output[i*sp.n+j]}")
+                    print(f"  '{prompts[i_prompt]}' -> {output[i_prompt*sp.n+j]}")
+
+    # Wait for any remaining background training tasks to complete.
+    await asyncio.gather(*training_tasks.values())
 
     total_time = time.perf_counter() - start
     print(f"Processed {len(msgs)} messages in {total_time:.2f}s (avg {total_time/len(msgs):.3f}s/msg)")
 
     # Simple correctness: final generation from cats should contain opera.
-    load_lora_state(llm.model_runner.model, lora_states["cats"])
-    final_outputs = stream_generate(llm, ["Orange cats are known for"], sp)
+    # The lock is acquired only for loading the state.
+    async with lock:
+        load_lora_state(llm.model_runner.model, lora_states["cats"])
+
+    # Generation is called after the lock is released.
+    final_outputs = await stream_generate(
+        llm, ["Orange cats are known for"], sp, lock, infer_stream
+    )
     final = final_outputs[0]
     print(f"[final check] 'Orange cats are known for' -> {final}")
     if "opera" not in final.lower():
-        print("Error: Expected keyword missing in final generation", file=sys.stderr)
+        print(
+            "Error: Expected keyword missing in final generation", file=sys.stderr
+        )
         sys.exit(1)
     print("\nQueue streaming integration test passed!")
 
 
 if __name__ == "__main__":
-    main() 
+    asyncio.run(main()) 
