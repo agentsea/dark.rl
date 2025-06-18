@@ -47,10 +47,29 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, seqs: list[Sequence]):
         """Runs the model's forward pass for inference."""
+        # Ensure evaluation mode (i.e., deactivate dropout) during inference.
+        self.eval()
         input_ids = torch.tensor([s.token_ids for s in seqs], device="cuda")
         temperatures = torch.tensor([s.temperature for s in seqs], device="cuda")
         logits = self.model(input_ids=input_ids).logits
-        next_tokens = self.sampler(logits[:, -1, :], temperatures)
+
+        # Greedy sampling with a simple repetition-avoidance hack: if the top
+        # token is identical to the previously generated token for the
+        # sequence, fall back to the 2nd-best token. This mitigates pathological
+        # "token token token ..." loops we observed with larger models (e.g.
+        # Qwen3-4B) during short LoRA fine-tunes while keeping behaviour for
+        # stochastic sampling unchanged.
+
+        logits_last = logits[:, -1, :]
+        next_tokens = self.sampler(logits_last, temperatures)
+
+        for i, seq in enumerate(seqs):
+            if temperatures[i] == 0 and next_tokens[i] == seq.last_token:
+                # Pick the second-highest logit instead.
+                top2 = logits_last[i].topk(2).indices
+                # Ensure we actually have two distinct indices.
+                fallback = top2[1].item() if top2[0].item() == next_tokens[i] else top2[0].item()
+                next_tokens[i] = fallback
         return next_tokens.tolist()
 
     def run(self, seqs: list[Sequence]) -> list[int]:

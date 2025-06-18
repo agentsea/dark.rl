@@ -20,7 +20,9 @@ class Scheduler:
         self.eos = config.eos
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.finished: deque[Sequence] = deque()
         self.num_finished = 0
+        self.eos_token_id = config.eos
 
     def is_finished(self):
         """Checks if there are any pending or running sequences."""
@@ -74,9 +76,11 @@ class Scheduler:
         """
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
-            if (
-                not seq.ignore_eos and token_id == self.eos
-            ) or seq.num_completion_tokens == seq.max_tokens:
+            if token_id == self.eos_token_id and not seq.ignore_eos:
                 seq.status = SequenceStatus.FINISHED
+            elif len(seq.completion_token_ids) >= seq.max_tokens:
+                seq.status = SequenceStatus.FINISHED
+            if seq.is_finished:
                 self.running.remove(seq)
+                self.finished.append(seq)
                 self.num_finished += 1

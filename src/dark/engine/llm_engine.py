@@ -1,4 +1,5 @@
 from time import perf_counter
+import os  # Added for optional corrected config handling
 
 from huggingface_hub import snapshot_download
 from tqdm.auto import tqdm
@@ -37,8 +38,25 @@ class LLMEngine:
                 setattr(config, k, v)
         Sequence.block_size = config.kvcache_block_size
 
-        # Load the corrected local config file, not the one from the Hub.
-        config.hf_config = AutoConfig.from_pretrained("./corrected_config.json")
+        # Prefer a locally patched config if it exists *and* matches the model's
+        # dimensionality (e.g. for Qwen3-0.6B), otherwise rely on the model's
+        # own configuration. This prevents shape-mismatch errors when switching
+        # to larger checkpoints such as Qwen3-4B.
+        corrected_cfg_path = "./corrected_config.json"
+        model_cfg = AutoConfig.from_pretrained(config.model, trust_remote_code=True)
+        if os.path.isfile(corrected_cfg_path):
+            try:
+                corrected_cfg = AutoConfig.from_pretrained(corrected_cfg_path)
+                # Use corrected config only if it targets the same hidden size.
+                if corrected_cfg.hidden_size == model_cfg.hidden_size:
+                    config.hf_config = corrected_cfg
+                else:
+                    config.hf_config = model_cfg
+            except Exception:
+                # Fallback robustly on any load error.
+                config.hf_config = model_cfg
+        else:
+            config.hf_config = model_cfg
         config.max_model_len = min(
             config.max_model_len, config.hf_config.max_position_embeddings
         )
