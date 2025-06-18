@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
+import os
 
 from transformers import Qwen3Config
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
@@ -102,15 +103,42 @@ class Qwen3Attention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        attn_output, attn_weights = eager_attention_forward(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            scaling=self.scaling,
-            dropout=0.0,
+        # Decide path based on mode; keep original for training stability.
+        use_flash = (
+            (not self.training)                      # only in eval
+            and os.getenv("ENABLE_FLASH_ATTENTION")  # opt-in via env-var
+            and torch.cuda.is_available()
+            and torch.backends.cuda.flash_sdp_enabled
         )
+
+        # --- Flash attention 2 (PyTorch SDP) -----------------------------
+        # When using MQA/GQA the kv heads are fewer than q heads; repeat to match.
+        if use_flash and (self.num_key_value_heads != self.num_attention_heads):
+            key_states   = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
+            value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
+
+        if use_flash:
+            # Apply 1/sqrt(d_k) scaling explicitly.
+            query_states = query_states * self.scaling
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=True,
+            )
+            attn_weights = None
+        else:
+            attn_output, attn_weights = eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                scaling=self.scaling,
+                dropout=0.0,
+            )
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_attention_heads * self.head_dim).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -240,12 +268,28 @@ class Qwen3Model(Qwen3PreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, seq_len=hidden_states.shape[1])
 
         for decoder_layer in self.layers:
-            layer_outputs = decoder_layer(
-                hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-            )
-            hidden_states = layer_outputs[0]
+            if self.training and self.gradient_checkpointing:
+                # -- selective checkpointing ("unsloth" style) ------------
+                def _ckpt_forward(hs):
+                    return decoder_layer(
+                        hs,
+                        position_embeddings=position_embeddings,
+                        attention_mask=attention_mask,
+                    )[0]
+
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    _ckpt_forward,
+                    hidden_states,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attention_mask,
+                )
+                hidden_states = layer_outputs[0]
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states)
 

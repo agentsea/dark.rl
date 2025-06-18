@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from .fused_lora import fused_lora_linear
 
 
 def divide(numerator, denominator):
@@ -79,19 +80,25 @@ class ReplicatedLinear(LinearBase):
         """
         Performs the forward pass, adding the LoRA path if applicable.
         """
-        # Main linear transformation
-        y = F.linear(x, self.weight, self.bias)
-        # Add the LoRA result if LoRA is enabled
-        if self.lora_rank > 0 and self.training:
+        if self.lora_rank == 0:
+            return F.linear(x, self.weight, self.bias)
+
+        # Training ‑ keep original path for correct gradients.
+        if self.training:
             lora_x = F.linear(x, self.lora_a)
             lora_x = F.linear(lora_x, self.lora_b)
             lora_x = lora_x * self.scaling
-            y = y + lora_x
-        elif self.lora_rank > 0:
-            lora_x = F.linear(x, self.lora_a)
-            lora_x = F.linear(lora_x, self.lora_b)
-            y = y + lora_x * self.scaling
-        return y
+            return F.linear(x, self.weight, self.bias) + lora_x
+
+        # Eval ‑ use fused path (no gradients required for LoRA params).
+        return fused_lora_linear(
+            x,
+            self.weight,
+            self.bias,
+            self.lora_a,
+            self.lora_b,
+            self.scaling,
+        )
 
 
 class ColumnParallelLinear(LinearBase):
@@ -160,12 +167,23 @@ class ColumnParallelLinear(LinearBase):
         """
         Performs the column-parallel forward pass. No communication is needed.
         """
-        y = F.linear(x, self.weight, self.bias)
-        if self.lora_rank > 0:
+        if self.lora_rank == 0:
+            return F.linear(x, self.weight, self.bias)
+
+        if self.training:
+            y = F.linear(x, self.weight, self.bias)
             lora_x = F.linear(x, self.lora_a)
             lora_x = F.linear(lora_x, self.lora_b)
-            y = y + lora_x * self.scaling
-        return y
+            return y + lora_x * self.scaling
+
+        return fused_lora_linear(
+            x,
+            self.weight,
+            self.bias,
+            self.lora_a,
+            self.lora_b,
+            self.scaling,
+        )
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -331,16 +349,28 @@ class RowParallelLinear(LinearBase):
         """
         Performs the row-parallel forward pass, with a final all-reduce.
         """
-        # Each GPU computes a partial result based on its slice of the weights.
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        # Partial dense output first.
+        if self.lora_rank == 0:
+            y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+            if self.tp_size > 1:
+                dist.all_reduce(y)
+            return y
 
-        # The LoRA path is computed before the all-reduce.
-        if self.lora_rank > 0:
+        if self.training:
+            y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
             lora_x = F.linear(x, self.lora_a)
             lora_x = F.linear(lora_x, self.lora_b)
             y = y + lora_x * self.scaling
+        else:
+            y = fused_lora_linear(
+                x,
+                self.weight,
+                self.bias if self.tp_rank == 0 else None,
+                self.lora_a,
+                self.lora_b,
+                self.scaling,
+            )
 
-        # Sum the partial results from all GPUs.
         if self.tp_size > 1:
             dist.all_reduce(y)
 
