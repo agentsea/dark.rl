@@ -105,31 +105,33 @@ class Qwen3Attention(nn.Module):
 
         # Decide path based on mode; keep original for training stability.
         use_flash = (
-            (not self.training)                      # only in eval
-            and os.getenv("ENABLE_FLASH_ATTENTION")  # opt-in via env-var
+            (not self.training)
+            and os.getenv("ENABLE_FLASH_ATTENTION", "0") == "1"
             and torch.cuda.is_available()
             and torch.backends.cuda.flash_sdp_enabled
         )
 
-        # --- Flash attention 2 (PyTorch SDP) -----------------------------
-        # When using MQA/GQA the kv heads are fewer than q heads; repeat to match.
-        if use_flash and (self.num_key_value_heads != self.num_attention_heads):
-            key_states   = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
-            value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
-
         if use_flash:
-            # Apply 1/sqrt(d_k) scaling explicitly.
-            query_states = query_states * self.scaling
+            # --- Flash attention 2 (PyTorch SDP) -----------------------------
+            # For MQA/GQA, explicitly repeat K/V heads to match Q heads.
+            if self.num_key_value_heads != self.num_attention_heads:
+                key_states   = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
+                value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
+
+            # Upcast *all* inputs to float32 for stable SDP calculation.
+            # The kernel handles MQA/GQA broadcasting and scaling internally.
             attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
-                attn_mask=attention_mask,
+                query_states.float(),
+                key_states.float(),
+                value_states.float(),
+                attn_mask=attention_mask.float(),
                 dropout_p=0.0,
-                is_causal=True,
-            )
+                is_causal=False,
+            ).to(hidden_states.dtype)
+            attn_output = attn_output.transpose(1, 2)
             attn_weights = None
         else:
+            # Eager path.
             attn_output, attn_weights = eager_attention_forward(
                 self,
                 query_states,
