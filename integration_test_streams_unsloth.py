@@ -5,6 +5,8 @@ from typing import Dict, List, Union
 import torch
 import bitsandbytes as bnb
 import asyncio
+import os
+import torch.multiprocessing as mp
 
 from dark import LLM, SamplingParams
 from dark.engine.sequence import Sequence
@@ -288,6 +290,25 @@ def build_message_queue() -> List[Message]:
     return msgs
 
 
+def benchmark_worker(q, llm_config, prompt, sp):
+    """A separate process to run a benchmark and put the result in a queue."""
+    # We must import torch inside the worker
+    import torch
+    from dark import LLM
+    
+    # We need to re-create the LLM object to respect the config change
+    llm_bench = LLM(MODEL_PATH, **llm_config)
+    
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    llm_bench.eval()
+    _ = llm_bench.generate([prompt], sp, use_tqdm=False)
+    dt = time.perf_counter() - t0
+    peak = torch.cuda.max_memory_allocated() / 1e6
+    q.put((dt, peak))
+    del llm_bench
+
+
 async def main():
     import argparse
 
@@ -454,17 +475,31 @@ async def main():
 
     # ------------------------------------------------------------------
     # Quick sanity-check for SDP-Flash attention.
+    # We run each path in a separate process to guarantee a clean slate
+    # for GPU memory measurement and avoid OOMs from fragmentation.
     # ------------------------------------------------------------------
     prompt = "Once upon a time " * 512          # 8-k token prompt
     sp = SamplingParams(max_tokens=32, temperature=0.0)
+    
+    # Use spawn context for CUDA safety
+    mp.set_start_method("spawn", force=True)
 
-    for tag, ctx in [("SDP-Flash", llm.eval())]:   # eval() uses the new path
-        torch.cuda.reset_peak_memory_stats()
-        t0 = time.perf_counter()
-        _ = llm.generate([prompt], sp, use_tqdm=False)
-        dt = time.perf_counter() - t0
-        peak = torch.cuda.max_memory_allocated() / 1e6
-        print(f"{tag:10}   {dt:5.2f}s   peak={peak:8.1f} MB")
+    def _run_bench_in_process(tag: str, enable_flash: bool):
+        q = mp.Queue()
+        llm_config = {
+            "enforce_eager": True,
+            "lora_rank": LORA_RANK,
+            "lora_alpha": LORA_ALPHA,
+            "use_flash_attention": enable_flash,
+        }
+        p = mp.Process(target=benchmark_worker, args=(q, llm_config, prompt, sp))
+        p.start()
+        p.join()
+        dt, peak = q.get()
+        print(f"[{tag:12}]   {dt:5.2f}s   peak={peak:8.1f} MB")
+
+    _run_bench_in_process("EagerAttn", enable_flash=False)
+    _run_bench_in_process("FlashAttn", enable_flash=True)
 
 
 if __name__ == "__main__":

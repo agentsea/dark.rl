@@ -1,5 +1,7 @@
 import torch
 from torch import nn
+import os
+import itertools
 
 from dark.config import Config
 from dark.engine.sequence import Sequence
@@ -20,7 +22,7 @@ class ModelRunner:
         torch.set_default_device("cuda")
 
         self.model = Qwen3ForCausalLM(
-            hf_config,
+            config,
             lora_rank=config.lora_rank,
             lora_alpha=config.lora_alpha,
         )
@@ -40,40 +42,58 @@ class ModelRunner:
         self.model.eval()
 
     def run_train_model(self, input_ids: torch.Tensor, labels: torch.Tensor):
-        """Runs a forward pass for training."""
-        outputs = self.model(input_ids=input_ids, labels=labels)
+        """Runs a forward pass for training using variable-length batching."""
+        # This assumes the input_ids and labels are already padded to the same length
+        # We will pack them into a single sequence for varlen attention.
+        bsz, seqlen = input_ids.shape
+        cu_seqlens = torch.arange(0, (bsz + 1) * seqlen, step=seqlen, dtype=torch.int32, device="cuda")
+        max_seqlen = seqlen
+        
+        packed_input_ids = input_ids.view(-1)
+        packed_labels = labels.view(-1)
+
+        outputs = self.model(
+            input_ids=packed_input_ids, 
+            cu_seqlens=cu_seqlens, 
+            max_seqlen=max_seqlen,
+            labels=packed_labels
+        )
         return outputs.logits, outputs.loss
 
     @torch.inference_mode()
     def run_model(self, seqs: list[Sequence]):
-        """Runs the model's forward pass for inference."""
-        # Ensure evaluation mode (i.e., deactivate dropout) during inference.
+        """Runs the model's forward pass for inference using variable-length batching."""
         self.eval()
-        input_ids = torch.tensor([s.token_ids for s in seqs], device="cuda")
+
+        if not seqs:
+            return []
+
+        token_ids_list = [s.token_ids for s in seqs]
+        seq_lens = [len(ids) for ids in token_ids_list]
+        max_seqlen = max(seq_lens) if seq_lens else 0
+
+        packed_input_ids = torch.cat([torch.tensor(ids, dtype=torch.long) for ids in token_ids_list], dim=0).to("cuda")
+        cu_seqlens = torch.tensor([0] + list(itertools.accumulate(seq_lens)), dtype=torch.int32, device="cuda")
+        
+        logits = self.model(
+            input_ids=packed_input_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        ).logits
+
+        last_token_indices = cu_seqlens[1:] - 1
+        logits_last = logits[last_token_indices]
+
         temperatures = torch.tensor([s.temperature for s in seqs], device="cuda")
-        logits = self.model(input_ids=input_ids).logits
-
-        # Greedy sampling with a simple repetition-avoidance hack: if the top
-        # token is identical to the previously generated token for the
-        # sequence, fall back to the 2nd-best token. This mitigates pathological
-        # "token token token ..." loops we observed with larger models (e.g.
-        # Qwen3-4B) during short LoRA fine-tunes while keeping behaviour for
-        # stochastic sampling unchanged.
-
-        logits_last = logits[:, -1, :]
         next_tokens = self.sampler(logits_last, temperatures)
 
         for i, seq in enumerate(seqs):
             if temperatures[i] == 0 and next_tokens[i] == seq.last_token:
-                # Pick the second-highest logit instead.
                 top2 = logits_last[i].topk(2).indices
-                # Ensure we actually have two distinct indices.
                 fallback = top2[1].item() if top2[0].item() == next_tokens[i] else top2[0].item()
                 next_tokens[i] = fallback
         return next_tokens.tolist()
 
     def run(self, seqs: list[Sequence]) -> list[int]:
-        """
-        The main run method that orchestrates a single generation step.
-        """
+        """The main run method, dispatching to the varlen model runner."""
         return self.run_model(seqs)
