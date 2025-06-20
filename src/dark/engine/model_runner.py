@@ -7,6 +7,7 @@ from dark.config import Config
 from dark.engine.sequence import Sequence
 from dark.layers.sampler import Sampler
 from dark.models.qwen3 import Qwen3ForCausalLM
+from dark.models.qwen2_5_vl import Qwen2_5_VLForCausalLM
 from dark.utils.loader import load_model
 
 
@@ -21,7 +22,16 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
 
-        self.model = Qwen3ForCausalLM(
+        model_class = None
+        if hf_config.model_type == 'qwen2_5_vl':
+            model_class = Qwen2_5_VLForCausalLM
+        elif hf_config.model_type == 'qwen2':
+            model_class = Qwen3ForCausalLM
+        else:
+            # Fallback for other qwen models that were previously supported.
+            model_class = Qwen3ForCausalLM
+
+        self.model = model_class(
             config,
             lora_rank=config.lora_rank,
             lora_alpha=config.lora_alpha,
@@ -51,12 +61,14 @@ class ModelRunner:
         
         packed_input_ids = input_ids.view(-1)
         packed_labels = labels.view(-1)
+        position_ids = torch.cat([torch.arange(0, end - start, device=input_ids.device) for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])])
 
         outputs = self.model(
             input_ids=packed_input_ids, 
             cu_seqlens=cu_seqlens, 
             max_seqlen=max_seqlen,
-            labels=packed_labels
+            labels=packed_labels,
+            position_ids=position_ids,
         )
         return outputs.logits, outputs.loss
 
@@ -74,12 +86,14 @@ class ModelRunner:
 
         packed_input_ids = torch.cat([torch.tensor(ids, dtype=torch.long) for ids in token_ids_list], dim=0).to("cuda")
         cu_seqlens = torch.tensor([0] + list(itertools.accumulate(seq_lens)), dtype=torch.int32, device="cuda")
+        position_ids = torch.cat([torch.arange(0, end - start, device=packed_input_ids.device) for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])])
         
-        logits = self.model(
+        logits, _ = self.model(
             input_ids=packed_input_ids,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
-        ).logits
+            position_ids=position_ids,
+        )
 
         last_token_indices = cu_seqlens[1:] - 1
         logits_last = logits[last_token_indices]

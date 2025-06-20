@@ -309,6 +309,48 @@ def benchmark_worker(q, llm_config, prompt, sp):
     del llm_bench
 
 
+def qwen2_5_vl_test_worker(q):
+    """A separate process to run a Qwen2.5-VL test."""
+    import sys
+    from dark import LLM, SamplingParams
+
+    VL_MODEL_PATH = "Qwen/Qwen2.5-VL-7B-Instruct"
+    print("\n\n--- Testing Qwen2.5-VL (text generation) ---")
+
+    try:
+        # Note: LoRA is enabled here for testing the pipeline, even if not
+        # strictly needed for a simple generation test.
+        llm_vl = LLM(VL_MODEL_PATH, enforce_eager=True, lora_rank=LORA_RANK, lora_alpha=LORA_ALPHA)
+    except Exception as e:
+        print(f"Failed to load Qwen2.5-VL model: {e}", file=sys.stderr)
+        print("Skipping Qwen2.5-VL test.", file=sys.stderr)
+        q.put("skipped")
+        return
+
+    prompt = "San Francisco is a"
+    sp = SamplingParams(temperature=0.0, max_tokens=16)
+
+    print(f"Prompt: '{prompt}'")
+    # This assumes `generate` returns a list of SequenceGroup objects,
+    # and we're interested in the first completion of the first prompt.
+    outputs = llm_vl.generate([prompt], sp, use_tqdm=False)
+    
+    # The output of generate is a list of SequenceGroup objects.
+    # Each SequenceGroup contains a list of completion sequences.
+    output_ids = outputs[0].outputs[0].completion_token_ids
+    output_text = llm_vl.tokenizer.decode(output_ids, skip_special_tokens=True)
+    
+    print(f"Generated: '{output_text}'")
+
+    if not output_text.strip():
+        print("Error: Qwen2.5-VL generation was empty!", file=sys.stderr)
+        q.put("failed")
+    else:
+        print("Qwen2.5-VL text generation test passed!")
+        q.put("passed")
+    del llm_vl
+
+
 async def main():
     import argparse
 
@@ -500,6 +542,25 @@ async def main():
 
     _run_bench_in_process("EagerAttn", enable_flash=False)
     _run_bench_in_process("FlashAttn", enable_flash=True)
+
+    # ------------------------------------------------------------------
+    # Test for Qwen2.5-VL text generation
+    # ------------------------------------------------------------------
+    def _run_vl_test_in_process():
+        q = mp.Queue()
+        p = mp.Process(target=qwen2_5_vl_test_worker, args=(q,))
+        p.start()
+        p.join()
+        result = q.get()
+        if result == "failed":
+            print("Qwen2.5-VL test FAILED", file=sys.stderr)
+            sys.exit(1)
+        elif result == "skipped":
+            print("Qwen2.5-VL test SKIPPED")
+        else:
+            print("Qwen2.5-VL test PASSED")
+
+    _run_vl_test_in_process()
 
 
 if __name__ == "__main__":

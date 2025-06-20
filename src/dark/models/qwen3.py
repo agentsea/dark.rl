@@ -176,9 +176,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.gradient_checkpointing = False
         self.post_init()
 
-    def forward(self, input_ids: torch.LongTensor, cu_seqlens: torch.Tensor, max_seqlen: int) -> BaseModelOutputWithPast:
+    def forward(self, input_ids: torch.LongTensor, cu_seqlens: torch.Tensor, max_seqlen: int, position_ids: Optional[torch.LongTensor] = None) -> BaseModelOutputWithPast:
         hidden_states = self.embed_tokens(input_ids)
-        position_ids = torch.cat([torch.arange(0, end - start, device=input_ids.device) for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])])
+        if position_ids is None:
+            position_ids = torch.cat([torch.arange(0, end - start, device=input_ids.device) for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])])
         position_embeddings = self.rotary_emb(hidden_states, seq_len=max_seqlen)
 
         for decoder_layer in self.layers:
@@ -205,8 +206,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel):
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.post_init()
 
-    def forward(self, input_ids: torch.LongTensor, cu_seqlens: torch.Tensor, max_seqlen: int, labels: Optional[torch.LongTensor] = None) -> CausalLMOutputWithPast:
-        outputs = self.model(input_ids=input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    def forward(self, input_ids: torch.LongTensor, cu_seqlens: torch.Tensor, max_seqlen: int, labels: Optional[torch.LongTensor] = None, position_ids: Optional[torch.LongTensor] = None) -> CausalLMOutputWithPast:
+        outputs = self.model(input_ids=input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, position_ids=position_ids)
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
         loss = None
