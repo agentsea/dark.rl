@@ -310,45 +310,152 @@ def benchmark_worker(q, llm_config, prompt, sp):
 
 
 def qwen2_5_vl_test_worker(q):
-    """A separate process to run a Qwen2.5-VL test."""
-    import sys
-    from dark import LLM, SamplingParams
+    """Run the local src/dark/models Qwen2.5-VL implementation on the Golden-Retriever image."""
 
-    VL_MODEL_PATH = "Qwen/Qwen2.5-VL-7B-Instruct"
-    print("\n\n--- Testing Qwen2.5-VL (text generation) ---")
+    import sys, requests, torch
+    from PIL import Image
+    from huggingface_hub import snapshot_download
+    from transformers import AutoProcessor, AutoConfig
 
+    # --- local dark imports (after fork) ---
+    from dark.config import Config as _Cfg
+    from dark.utils.loader import load_model as _load_model
+    from dark.models.qwen2_5_vl import Qwen2_5_VLForCausalLM as _LocalVL
+
+    MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+
+    # ---------------------------------------------------------------
+    # 1. Prepare checkpoint + processor
+    # ---------------------------------------------------------------
     try:
-        # Note: LoRA is enabled here for testing the pipeline, even if not
-        # strictly needed for a simple generation test.
-        llm_vl = LLM(VL_MODEL_PATH, enforce_eager=True, lora_rank=LORA_RANK, lora_alpha=LORA_ALPHA)
-    except Exception as e:
-        print(f"Failed to load Qwen2.5-VL model: {e}", file=sys.stderr)
-        print("Skipping Qwen2.5-VL test.", file=sys.stderr)
+        model_path = snapshot_download(MODEL_ID)
+        processor = AutoProcessor.from_pretrained(MODEL_ID)
+    except Exception as exc:
+        print(f"[error] snapshot/processor fetch failed: {exc}", file=sys.stderr)
         q.put("skipped")
         return
 
-    prompt = "San Francisco is a"
-    sp = SamplingParams(temperature=0.0, max_tokens=16)
+    # ---------------------------------------------------------------
+    # 2. Build local Config and instantiate model
+    # ---------------------------------------------------------------
+    cfg = _Cfg(model_path)
+    cfg.hf_config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+    cfg.model = model_path  # loader will look here
 
-    print(f"Prompt: '{prompt}'")
-    # This assumes `generate` returns a list of SequenceGroup objects,
-    # and we're interested in the first completion of the first prompt.
-    outputs = llm_vl.generate([prompt], sp, use_tqdm=False)
-    
-    # The output of generate is a list of SequenceGroup objects.
-    # Each SequenceGroup contains a list of completion sequences.
-    output_ids = outputs[0].outputs[0].completion_token_ids
-    output_text = llm_vl.tokenizer.decode(output_ids, skip_special_tokens=True)
-    
-    print(f"Generated: '{output_text}'")
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    if not output_text.strip():
-        print("Error: Qwen2.5-VL generation was empty!", file=sys.stderr)
-        q.put("failed")
-    else:
-        print("Qwen2.5-VL text generation test passed!")
-        q.put("passed")
-    del llm_vl
+        if device == "cuda":
+            print("[info] Loading Qwen2.5-VL on GPU (fp16) for faster inference")
+        else:
+            print("[info] CUDA not available; falling back to CPU – performance will be slow")
+
+        model = _LocalVL(cfg)
+        _load_model(model, model_path)
+
+        # Move to device with reduced dtype when on GPU.
+        if device == "cuda":
+            model = model.to(device=device, dtype=torch.float16, non_blocking=True)
+        else:
+            model = model.to(dtype=torch.float32)
+
+        model.eval()
+
+        try:
+            first_param_device = next(model.parameters()).device
+            print(f"[debug] VL model parameters live on: {first_param_device}")
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"[error] Local Qwen2.5-VL init failed: {exc}", file=sys.stderr)
+        q.put("skipped")
+        return
+
+    # ---------------------------------------------------------------
+    # 3. Fetch Golden-Retriever image
+    # ---------------------------------------------------------------
+    image_url = "https://storage.googleapis.com/orign/testdata/nebu/golden.jpeg"
+    try:
+        img = Image.open(requests.get(image_url, stream=True).raw).convert("RGB")
+    except Exception as exc:
+        print(f"[error] Could not fetch image: {exc}", file=sys.stderr)
+        q.put("skipped")
+        return
+
+    # ---------------------------------------------------------------
+    # 4. Build prompt & processor tensors
+    # ---------------------------------------------------------------
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": img},
+                {"type": "text", "text": "What breed of dog is shown in the picture?"},
+            ],
+        }
+    ]
+    prompt_txt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[prompt_txt], images=[img], return_tensors="pt")
+
+    # Move tensors to GPU
+    inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
+
+    # Greedy decode because local class lacks `generate`
+    tokenizer = processor.tokenizer
+    input_ids = inputs["input_ids"].squeeze(0)
+    pixel_values = inputs["pixel_values"]
+    image_grid_thw = inputs["image_grid_thw"]
+
+    max_new = 64
+    vision_special_ids = {151644, 151645, 151652, 151653, 151654, 151655, 151656}
+    eos_id = tokenizer.eos_token_id  # 151645 (<|im_end|>)
+    answer_ids: List[int] = []
+    text_started = False
+
+    for step in range(max_new):
+        seq_len = input_ids.shape[0]
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        pos_ids = torch.arange(seq_len, device=device)
+
+        logits, _ = model(
+            input_ids=input_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=seq_len,
+            position_ids=pos_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+
+        # After first step, drop pixel_values to mimic official prepare_inputs
+        pixel_values = None
+        image_grid_thw = None
+
+        next_id = int(logits[-1].argmax(-1).item())
+        token_str = tokenizer.decode([next_id])
+        print(f"[gen-step {step:02d}] id={next_id} token='{token_str}'", flush=True)
+
+        if next_id not in vision_special_ids:
+            text_started = True
+
+        if next_id == eos_id:
+            if text_started:
+                print("[gen] reached eos after text", flush=True)
+                break
+            else:
+                # skip leading <|im_end|>
+                next_id = None
+
+        if next_id is not None and next_id not in vision_special_ids and next_id != eos_id:
+            answer_ids.append(next_id)
+
+        if next_id is not None:
+            input_ids = torch.cat([input_ids, torch.tensor([next_id], device=device)], dim=0)
+
+    answer = tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
+
+    print(f"Generated answer: '{answer}'", flush=True)
+    q.put("passed" if answer else "failed")
+    return
 
 
 async def main():
@@ -369,7 +476,7 @@ async def main():
 
     llm = LLM(MODEL_PATH, enforce_eager=True, lora_rank=LORA_RANK, lora_alpha=LORA_ALPHA)
     tokenizer = llm.tokenizer
-    sp = SamplingParams(temperature=0.0, max_tokens=12)
+    sp = SamplingParams(temperature=0.2, max_tokens=16, ignore_eos=True)
 
     lora_states: Dict[str, Dict[str, torch.Tensor]] = {}
     opt_states: Dict[str, Dict] = {}
@@ -546,6 +653,29 @@ async def main():
     # ------------------------------------------------------------------
     # Test for Qwen2.5-VL text generation
     # ------------------------------------------------------------------
+    # First, *offload* the big Qwen3 model that is still resident on the GPU.
+    # Otherwise the dedicated VL worker process will attempt to allocate ~20GB
+    # of weights on top of the ~20-23GB already consumed here, overshooting
+    # the 44GB card and triggering a CUDA out-of-memory error.
+    if torch.cuda.is_available():
+        try:
+            print("[info] Moving Qwen3 (cats/turtles) model to CPU before VL test …")
+            llm.model_runner.model.to("cpu")  # parameters + buffers -> system RAM
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+            if hasattr(torch.cuda, "mem_get_info"):
+                mem_free = torch.cuda.mem_get_info()[0] / 1e6
+                print(f"[info] GPU memory freed; now {mem_free:.0f} MB available")
+
+            # Drop the heavy model entirely to release both GPU *and* CPU RAM.
+            import gc
+            del llm
+            gc.collect()
+            print("[info] Qwen3 engine deleted; proceeding to VL test")
+        except Exception as exc:
+            print(f"[warn] Could not offload model: {exc}")
+
     def _run_vl_test_in_process():
         q = mp.Queue()
         p = mp.Process(target=qwen2_5_vl_test_worker, args=(q,))

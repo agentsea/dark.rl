@@ -5,3 +5,4 @@
 
 from dark.llm import LLM
 from dark.sampling_params import SamplingParams
+from dark.online_llm import OnlineLLM

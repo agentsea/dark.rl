@@ -21,11 +21,31 @@ def load_model(model: nn.Module, path: str):
                         param_name = weight_name.replace(k, v)
                         param = model.get_parameter(param_name)
                         weight_loader = getattr(param, "weight_loader")
-                        weight_loader(param, f.get_tensor(weight_name), shard_id)
+                        tensor = f.get_tensor(weight_name)
+                        # --- DEBUG -------------------------------------------------------------
+                        try:
+                            rms = tensor.float().pow(2).mean().sqrt().item()
+                        except Exception:
+                            rms = float('nan')
+                        print(
+                            f"[load] {weight_name:>60} -> {param.shape}  rms={rms:.6f}",
+                            flush=True,
+                        )
+                        # ----------------------------------------------------------------------
+                        weight_loader(param, tensor, shard_id)
                         break
                 else:
                     param = model.get_parameter(weight_name)
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    weight_loader(param, f.get_tensor(weight_name))
+                    tensor = f.get_tensor(weight_name)
+                    try:
+                        rms = tensor.float().pow(2).mean().sqrt().item()
+                    except Exception:
+                        rms = float('nan')
+                    print(
+                        f"[load] {weight_name:>60} -> {param.shape}  rms={rms:.6f}",
+                        flush=True,
+                    )
+                    weight_loader(param, tensor)

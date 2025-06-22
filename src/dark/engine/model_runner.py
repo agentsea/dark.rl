@@ -63,14 +63,36 @@ class ModelRunner:
         packed_labels = labels.view(-1)
         position_ids = torch.cat([torch.arange(0, end - start, device=input_ids.device) for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])])
 
-        outputs = self.model(
-            input_ids=packed_input_ids, 
-            cu_seqlens=cu_seqlens, 
-            max_seqlen=max_seqlen,
-            labels=packed_labels,
-            position_ids=position_ids,
-        )
-        return outputs.logits, outputs.loss
+        try:
+            outputs = self.model(
+                input_ids=packed_input_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                labels=packed_labels,
+                position_ids=position_ids,
+                return_dict=True,
+            )
+            if hasattr(outputs, "logits"):
+                logits = outputs.logits
+                loss = outputs.loss if hasattr(outputs, "loss") else None
+            else:
+                logits, loss = outputs  # assume tuple
+        except TypeError:
+            # Fallback for models that don't accept return_dict (e.g., Qwen3)
+            outputs = self.model(
+                input_ids=packed_input_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                labels=packed_labels,
+                position_ids=position_ids,
+            )
+            # Expect outputs as (logits, loss)
+            if hasattr(outputs, "logits"):
+                logits = outputs.logits
+                loss = outputs.loss if hasattr(outputs, "loss") else None
+            else:
+                logits, loss = outputs  # assume tuple
+        return logits, loss
 
     @torch.inference_mode()
     def run_model(self, seqs: list[Sequence]):
@@ -88,12 +110,30 @@ class ModelRunner:
         cu_seqlens = torch.tensor([0] + list(itertools.accumulate(seq_lens)), dtype=torch.int32, device="cuda")
         position_ids = torch.cat([torch.arange(0, end - start, device=packed_input_ids.device) for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])])
         
-        logits, _ = self.model(
-            input_ids=packed_input_ids,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            position_ids=position_ids,
-        )
+        try:
+            outputs = self.model(
+                input_ids=packed_input_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_ids=position_ids,
+                return_dict=True,
+            )
+            if hasattr(outputs, "logits"):
+                logits = outputs.logits
+            else:
+                logits = outputs[0] if isinstance(outputs, tuple) else outputs
+        except TypeError:
+            outputs = self.model(
+                input_ids=packed_input_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_ids=position_ids,
+            )
+            # outputs may be tensor logits or tuple
+            if hasattr(outputs, "logits"):
+                logits = outputs.logits
+            else:
+                logits = outputs[0] if isinstance(outputs, tuple) else outputs
 
         last_token_indices = cu_seqlens[1:] - 1
         logits_last = logits[last_token_indices]

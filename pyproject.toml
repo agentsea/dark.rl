@@ -19,6 +19,9 @@ dependencies = [
     "bitsandbytes>=0.43.0",
     "nvidia-ml-py",
     "xxhash",
+    "json-repair>=0.47.1",
+    "pillow>=11.2.1",
+    "torchvision>=0.22.1",
 ]
 
 [project.optional-dependencies]
