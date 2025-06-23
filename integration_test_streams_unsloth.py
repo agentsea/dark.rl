@@ -464,8 +464,35 @@ async def main():
     parser = argparse.ArgumentParser(description="Run a message queue integration test for LoRA fine-tuning and generation.")
     parser.add_argument('--use-adam8bit', dest='use_adam8bit', action='store_true', help="Use 8-bit Adam optimizer.")
     parser.add_argument('--no-use-adam8bit', dest='use_adam8bit', action='store_false', help="Do not use 8-bit Adam optimizer.")
+    parser.add_argument('--vision-only', action='store_true', help='Skip all LoRA queue tests and run only the Qwen-VL sanity test.')
     parser.set_defaults(use_adam8bit=USE_ADAM8BIT)
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Fast path: run only the Qwen-VL test and exit.
+    # ------------------------------------------------------------------
+    if args.vision_only:
+        print("[mode] --vision-only ⇒ skipping LoRA queue test; will run VL worker only")
+
+        # Ensure we have a proper multiprocessing start-method for CUDA.
+        mp.set_start_method("spawn", force=True)
+
+        def _run_vl_only():
+            q = mp.Queue()
+            p = mp.Process(target=qwen2_5_vl_test_worker, args=(q,))
+            p.start()
+            p.join()
+            result = q.get()
+            if result == "failed":
+                print("Qwen2.5-VL test FAILED", file=sys.stderr)
+                sys.exit(1)
+            elif result == "skipped":
+                print("Qwen2.5-VL test SKIPPED")
+            else:
+                print("Qwen2.5-VL test PASSED")
+
+        _run_vl_only()
+        return  # early exit – skip all remaining queue/benchmark code
 
     print(f"Using Adam 8-bit optimizer: {args.use_adam8bit}")
 

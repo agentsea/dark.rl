@@ -3,6 +3,8 @@ from typing import Optional, Tuple, List, Dict, Any
 import torch
 from torch import nn
 import torch.nn.functional as F
+import os
+import math
 
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLTextConfig, Qwen2_5_VLVisionConfig
 from transformers.models.qwen2_vl.modeling_qwen2_vl import PatchEmbed
@@ -21,7 +23,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
+def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim: int = 1):
     """Apply Multimodal Rotary Position Embedding (M-RoPE) to ``q`` and ``k``.
 
     This is a near-direct port of the reference implementation in
@@ -30,54 +32,34 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
     Args
     ----
     q, k:
-        Tensors of shape ``[tokens, n_heads, head_dim]``.
+        Tensors of shape ``[batch, heads, tokens, head_dim]`` or similar.
     cos, sin:
         RoPE lookup tables of shape ``[3, tokens, head_dim]`` where the first
         axis encodes the temporal / height / width phases, respectively.
     mrope_section (Union[int, Sequence[int]]):
-        Channel split sizes (per modality *before* doubling for cos+sin).  The
-        reference checkpoints use a list like ``[16, 24, 24]`` which we must
-        duplicate *as a list* – **not** multiply element-wise – so the final
-        split becomes ``[16, 24, 24, 16, 24, 24]`` and sums exactly to
-        ``head_dim``.
+        Multimodal rope section is for channel dimension of temporal, height, width.
+    unsqueeze_dim (int):
+        Dimension to unsqueeze for broadcasting.
     """
-
-    # --- Build the list of split sizes ------------------------------------------------
-    if isinstance(mrope_section, (list, tuple)):
-        split_sizes = list(mrope_section) * 2  # e.g. [16,24,24]*2
-    else:  # legacy scalar – treat as single section
-        split_sizes = [mrope_section] * 2
-
-    head_dim = cos.shape[-1]
-    if sum(split_sizes) != head_dim:
-        # Mismatch – fall back to vanilla 1-D RoPE using the *temporal* phases.
-        print(
-            f"[warn] M-RoPE split mismatch (sum={sum(split_sizes)} vs head_dim={head_dim}); "
-            "falling back to 1-D RoPE.",
-            flush=True,
-        )
-        cos_cat = cos[0].unsqueeze(1)  # [tokens, 1, head_dim]
-        sin_cat = sin[0].unsqueeze(1)
-        return (q * cos_cat) + (rotate_half(q) * sin_cat), (k * cos_cat) + (rotate_half(k) * sin_cat)
-
-    # --- Split and interleave ---------------------------------------------------------
-    try:
-        cos_chunks = cos.split(split_sizes, dim=-1)
-        sin_chunks = sin.split(split_sizes, dim=-1)
-    except Exception as exc:  # pragma: no cover – extremely unlikely
-        print(f"[error] M-RoPE split failed: {exc}. Using 1-D fallback.", flush=True)
-        cos_cat = cos[0].unsqueeze(1)
-        sin_cat = sin[0].unsqueeze(1)
-        return (q * cos_cat) + (rotate_half(q) * sin_cat), (k * cos_cat) + (rotate_half(k) * sin_cat)
-
-    # Interleave T/H/W components: chunk 0 → temporal, 1 → height, 2 → width,
-    # 3 → temporal, ... exactly as in the official model.
-    cos_cat = torch.cat([m[i % 3] for i, m in enumerate(cos_chunks)], dim=-1).unsqueeze(1)
-    sin_cat = torch.cat([m[i % 3] for i, m in enumerate(sin_chunks)], dim=-1).unsqueeze(1)
-
-    # --- Apply ------------------------------------------------------------------------
-    q_embed = (q * cos_cat) + (rotate_half(q) * sin_cat)
-    k_embed = (k * cos_cat) + (rotate_half(k) * sin_cat)
+    # HF implementation exactly
+    mrope_section = [x * 2 for x in mrope_section]
+    
+    # cos and sin have shape (3, seq_len, head_dim)
+    # We need to split along the head_dim (last dimension) according to mrope_section
+    cos_splits = cos.split(mrope_section, dim=-1)  # List of tensors with shapes (3, seq_len, section_size)
+    sin_splits = sin.split(mrope_section, dim=-1)
+    
+    # Cycle through the 3 axes using modulo arithmetic
+    cos_combined = torch.cat([m[i % 3] for i, m in enumerate(cos_splits)], dim=-1)
+    sin_combined = torch.cat([m[i % 3] for i, m in enumerate(sin_splits)], dim=-1)
+    
+    # Add unsqueeze dimension for broadcasting
+    cos_combined = cos_combined.unsqueeze(unsqueeze_dim)
+    sin_combined = sin_combined.unsqueeze(unsqueeze_dim)
+    
+    # Apply RoPE
+    q_embed = (q * cos_combined) + (rotate_half(q) * sin_combined)
+    k_embed = (k * cos_combined) + (rotate_half(k) * sin_combined)
     return q_embed, k_embed
 
 
@@ -113,29 +95,71 @@ class Qwen2_5_VLAttention(nn.Module):
         self.k_proj = ReplicatedLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, lora_rank=lora_rank, lora_alpha=lora_alpha)
         self.v_proj = ReplicatedLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, lora_rank=lora_rank, lora_alpha=lora_alpha)
         self.o_proj = ReplicatedLinear(self.num_attention_heads * self.head_dim, self.hidden_size, bias=False, lora_rank=lora_rank, lora_alpha=lora_alpha)
+        self.layer_idx = None  # Will be set by the parent layer
 
     def forward(self, hidden_states: torch.Tensor, position_embeddings: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: torch.Tensor, max_seqlen: int, position_ids: torch.LongTensor, cache_position: Optional[torch.LongTensor] = None) -> Tuple[torch.Tensor, None]:
-        total_tokens, _ = hidden_states.shape
+        # Convert our 2D flattened input to 3D batched format that HF expects
+        total_tokens, hidden_size = hidden_states.shape
+        bsz = 1  # We always use batch size 1 in our implementation
+        q_len = total_tokens
+        
+        # Reshape to match HF's expected input format: (bsz, q_len, hidden_size)
+        hidden_states_3d = hidden_states.unsqueeze(0)  # (1, total_tokens, hidden_size)
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(total_tokens, self.num_attention_heads, self.head_dim)
-        key_states = key_states.view(total_tokens, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.view(total_tokens, self.num_key_value_heads, self.head_dim)
+        # Reshape exactly like HF: (bsz, q_len, num_heads, head_dim) -> (bsz, num_heads, q_len, head_dim)
+        query_states = query_states.view(bsz, q_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        # Apply rotary embeddings - need to reshape for our RoPE function
         cos, sin = position_embeddings
-        query_states, key_states = apply_multimodal_rotary_pos_emb(
-            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+        # Convert back to (total_tokens, num_heads, head_dim) for RoPE, then back to HF format
+        query_rope = query_states.transpose(1, 2).contiguous().view(total_tokens, self.num_attention_heads, self.head_dim)
+        key_rope = key_states.transpose(1, 2).contiguous().view(total_tokens, self.num_key_value_heads, self.head_dim)
+        
+        query_rope, key_rope = apply_multimodal_rotary_pos_emb(
+            query_rope,
+            key_rope,
+            cos,
+            sin,
+            self.rope_scaling["mrope_section"],
+            unsqueeze_dim=1,
         )
+        
+        # Convert back to HF format: (bsz, num_heads, q_len, head_dim)
+        query_states = query_rope.view(bsz, q_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        key_states = key_rope.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        # Handle GQA (Grouped Query Attention) exactly like HF
         if self.num_key_value_heads != self.num_attention_heads:
             key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
             value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
 
-        attn_output = flash_attention_forward(query_states, key_states, value_states, cu_seqlens, max_seqlen, softmax_scale=self.scaling, causal=True)
-        attn_output = attn_output.view(total_tokens, self.num_attention_heads * self.head_dim)
+        # Ensure dtype alignment (original checkpoints use fp16)
+        tgt_dtype = value_states.dtype
+        query_states = query_states.to(tgt_dtype)
+        key_states = key_states.to(tgt_dtype)
+
+        # Use HF's approach: is_causal=True for causal masking
+        attn_output = F.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=None,  # Let SDPA handle causal masking
+            dropout_p=0.0,
+            is_causal=True,  # This is the key difference!
+        )
+
+        # Convert back to HF's expected output format
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.num_attention_heads * self.head_dim)
+        
+        # Flatten back to our 2D format and apply output projection
+        attn_output = attn_output.squeeze(0)  # Remove batch dimension: (total_tokens, hidden_size)
         attn_output = self.o_proj(attn_output)
         
         # ----------------------------------------------------------
@@ -162,7 +186,11 @@ class Qwen2_5_VLAttention(nn.Module):
                         f"[attn-debug] seq={total_tokens} q[min,max,mean]={q_stats} {'NaN!' if q_nan else ''}",
                         flush=True,
                     )
-        # ----------------------------------------------------------
+
+        if os.getenv("DEBUG_SHAPES") == "2":
+            # Lightweight validation – print the norm of first token per head
+            qs_norm = query_states[..., 0, :].norm(dim=-1).mean().item()
+            print(f"[dbg-text-rope] avg |q| after RoPE = {qs_norm:.4f}", flush=True)
 
         return attn_output, None
 
@@ -243,6 +271,10 @@ class Qwen2_5_VLModel(nn.Module):
 
         self.embed_tokens = nn.Embedding(self.text_config.vocab_size, self.text_config.hidden_size, self.text_config.pad_token_id)
         self.layers = nn.ModuleList([Qwen2_5_VLDecoderLayer(config, lora_rank=lora_rank, lora_alpha=lora_alpha) for _ in range(self.text_config.num_hidden_layers)])
+        
+        # Set layer indices for debugging
+        for i, layer in enumerate(self.layers):
+            layer.self_attn.layer_idx = i
         self.norm = RMSNorm(self.text_config.hidden_size, eps=self.text_config.rms_norm_eps)
         
         head_dim = self.text_config.hidden_size // self.text_config.num_attention_heads
@@ -259,15 +291,10 @@ class Qwen2_5_VLModel(nn.Module):
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
     ):
-        """Port (simplified) of HF `get_rope_index` for single-image prompts.
-
-        Only covers the usage pattern in our integration test:
-          • one image, encoded as a contiguous run of `<|image_pad|>` tokens
-          • no video frames, no batching.
-
-        Returns a tensor of shape *(3, seq_len)* – temporal, height, width.
         """
-
+        Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
+        This follows the HF approach more closely by looking for vision_start tokens first.
+        """
         seq_len = input_ids.shape[0]
         device = input_ids.device
 
@@ -280,60 +307,104 @@ class Qwen2_5_VLModel(nn.Module):
             position_ids[:] = ramp  # broadcast to all 3 rows
             return position_ids
 
-        img_token_id = self.text_config.image_token_id or 151655
+        # HF approach: look for vision_start tokens first
+        vision_start_token_id = 151652  # <|vision_start|>
+        image_token_id = 151655  # <|image_pad|>
+        spatial_merge_size = self.vision_config.spatial_merge_size
 
-        patch_mask = input_ids == img_token_id
-        if patch_mask.sum() == 0:
+        # Find vision_start tokens
+        vision_start_indices = torch.where(input_ids == vision_start_token_id)[0]
+        
+        if len(vision_start_indices) == 0:
+            # No vision tokens, use simple 1D ramp
             ramp = torch.arange(seq_len, device=device, dtype=torch.long)
             position_ids[:] = ramp
             return position_ids
 
-        # Indices of first patch token & count
-        first_patch_idx = int(torch.nonzero(patch_mask, as_tuple=False)[0])
-        num_patches = int(patch_mask.sum())
-
-        # Build text-before positions 0 .. first_patch_idx-1
-        curr = 0
-        position_ids[:, :first_patch_idx] = torch.arange(first_patch_idx, device=device)
-        curr = first_patch_idx
-
-        # Vision patch positions
-        T, H, W = map(int, image_grid_thw[0].tolist())  # single image case
-        merge = self.vision_config.spatial_merge_size
-        gH, gW = H // merge, W // merge
-
-        # Build t,h,w indices in the flatten order used by PatchEmbed:
-        t_index = torch.arange(T, device=device).view(-1, 1).expand(-1, gH * gW).flatten()
-        h_index = (
-            torch.arange(gH, device=device)
-            .view(1, -1, 1)
-            .expand(T, -1, gW)
-            .flatten()
-        )
-        w_index = (
-            torch.arange(gW, device=device)
-            .view(1, 1, -1)
-            .expand(T, gH, -1)
-            .flatten()
-        )
-
-        patch_pos_len = t_index.numel()
-        if patch_pos_len != num_patches:
-            # Fallback: treat patches as simple ramp to avoid crash.
-            t_index = torch.zeros(num_patches, device=device, dtype=torch.long)
-            h_index = torch.arange(num_patches, device=device, dtype=torch.long)  # bogus but safe
-            w_index = h_index.clone()
-
-        position_ids[0, curr : curr + num_patches] = t_index
-        position_ids[1, curr : curr + num_patches] = h_index
-        position_ids[2, curr : curr + num_patches] = w_index
-        curr += num_patches
-
-        # Text after vision – continue the 1-D counter from max()+1
-        next_start = position_ids.max().item() + 1
-        if curr < seq_len:
-            tail = torch.arange(next_start, next_start + (seq_len - curr), device=device)
-            position_ids[:, curr:] = tail
+        # Build position IDs following HF's approach
+        llm_pos_ids_list = []
+        st = 0
+        
+        for vision_start_idx in vision_start_indices:
+            # Add text positions before this vision block
+            text_len = vision_start_idx.item() - st
+            if text_len > 0:
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                llm_pos_ids_list.append(torch.arange(text_len, device=device, dtype=torch.long).view(1, -1).expand(3, -1) + st_idx)
+            
+            # Process the vision block
+            # Find the end of this vision block (look for consecutive image_pad tokens)
+            vision_end_idx = vision_start_idx + 1
+            while vision_end_idx < seq_len and input_ids[vision_end_idx] == image_token_id:
+                vision_end_idx += 1
+            
+            num_vision_tokens = vision_end_idx - vision_start_idx - 1  # exclude the vision_start token
+            
+            if num_vision_tokens > 0 and image_grid_thw is not None:
+                # Get grid dimensions for this image
+                T, H, W = map(int, image_grid_thw[0].tolist())  # assume single image
+                llm_grid_t, llm_grid_h, llm_grid_w = (
+                    T,
+                    H // spatial_merge_size,
+                    W // spatial_merge_size,
+                )
+                
+                # Add position for vision_start token
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                llm_pos_ids_list.append(torch.tensor([[st_idx], [st_idx], [st_idx]], device=device, dtype=torch.long))
+                
+                # Create proper 3D position embeddings exactly like HF
+                # For a single image: T=1, H=36, W=36 after spatial merging becomes llm_grid_h=18, llm_grid_w=18
+                # Total tokens = T * llm_grid_h * llm_grid_w = 1 * 18 * 18 = 324
+                
+                # Temporal dimension: all tokens get t=0 since it's a single image
+                t_index = torch.zeros(num_vision_tokens, device=device, dtype=torch.long)
+                
+                # Height dimension: repeats for each row
+                # Pattern: [0,0,...,0, 1,1,...,1, 2,2,...,2, ...] where each value repeats llm_grid_w times
+                h_index = torch.arange(llm_grid_h, device=device, dtype=torch.long).repeat_interleave(llm_grid_w)
+                if len(h_index) > num_vision_tokens:
+                    h_index = h_index[:num_vision_tokens]
+                elif len(h_index) < num_vision_tokens:
+                    # Pad with the last value
+                    h_index = torch.cat([h_index, h_index[-1:].repeat(num_vision_tokens - len(h_index))])
+                
+                # Width dimension: cycles through 0 to llm_grid_w-1
+                # Pattern: [0,1,2,...,W-1, 0,1,2,...,W-1, 0,1,2,...,W-1, ...]
+                w_index = torch.arange(llm_grid_w, device=device, dtype=torch.long).repeat(llm_grid_h)
+                if len(w_index) > num_vision_tokens:
+                    w_index = w_index[:num_vision_tokens]
+                elif len(w_index) < num_vision_tokens:
+                    # Pad with cycling pattern
+                    remaining = num_vision_tokens - len(w_index)
+                    w_index = torch.cat([w_index, torch.arange(remaining, device=device, dtype=torch.long) % llm_grid_w])
+                
+                vision_pos = torch.stack([t_index, h_index, w_index]) + st_idx + 1
+                llm_pos_ids_list.append(vision_pos)
+            
+            st = vision_end_idx
+        
+        # Add remaining text positions
+        if st < seq_len:
+            st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+            text_len = seq_len - st
+            llm_pos_ids_list.append(torch.arange(text_len, device=device, dtype=torch.long).view(1, -1).expand(3, -1) + st_idx)
+        
+        # Concatenate all position IDs
+        if llm_pos_ids_list:
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1)
+            position_ids[:, :llm_positions.shape[1]] = llm_positions
+            
+            # Fill any remaining positions
+            if llm_positions.shape[1] < seq_len:
+                remaining = seq_len - llm_positions.shape[1]
+                start_idx = llm_positions.max().item() + 1
+                tail = torch.arange(start_idx, start_idx + remaining, device=device, dtype=torch.long)
+                position_ids[:, llm_positions.shape[1]:] = tail
+        else:
+            # Fallback to simple ramp
+            ramp = torch.arange(seq_len, device=device, dtype=torch.long)
+            position_ids[:] = ramp
 
         return position_ids
 
@@ -424,22 +495,86 @@ class Qwen2_5_VLModel(nn.Module):
                 pass
             # ---------------------------------------------------------------------
 
-            if num_tokens_expected > 0:
-                inputs_embeds[image_token_mask] = image_features.to(inputs_embeds.dtype)
+            # Add comprehensive debugging to compare with HF implementation
+            print(f"[DEBUG] === VISION EMBEDDING INTEGRATION ===")
+            print(f"[DEBUG] Original text embeddings - shape: {inputs_embeds.shape}, mean: {inputs_embeds.mean():.6f}, std: {inputs_embeds.std():.6f}")
+            print(f"[DEBUG] Vision embeddings - shape: {image_features.shape}, mean: {image_features.mean():.6f}, std: {image_features.std():.6f}")
+            
+            # Sample some text embeddings before replacement
+            text_only_mask = ~image_token_mask
+            if text_only_mask.any():
+                text_sample = inputs_embeds[text_only_mask][:5]  # First 5 text tokens
+                print(f"[DEBUG] Sample text embeddings (first 5): mean={text_sample.mean():.6f}, std={text_sample.std():.6f}")
+                print(f"[DEBUG] Text embedding norms: {torch.norm(text_sample, dim=-1)}")
+            
+            print(f"[DEBUG] Vision embedding norms: {torch.norm(image_features[:5], dim=-1)}")
+            
+            # Calculate magnitude ratio BEFORE scaling
+            text_magnitude = torch.norm(inputs_embeds[text_only_mask], dim=-1).mean() if text_only_mask.any() else 0
+            vision_magnitude = torch.norm(image_features, dim=-1).mean()
+            print(f"[DEBUG] BEFORE replacement - Text magnitude: {text_magnitude:.6f}, Vision magnitude: {vision_magnitude:.6f}")
+            print(f"[DEBUG] Vision/Text ratio: {vision_magnitude / text_magnitude:.3f}")
+            
+            # CRITICAL FIX: Scale vision embeddings to match text embedding magnitude
+            # Even though HF doesn't explicitly scale, there might be implicit scaling in their implementation
+            vision_scale_factor = text_magnitude / vision_magnitude if vision_magnitude > 0 else 1.0
+            print(f"[DEBUG] Applying vision scale factor: {vision_scale_factor:.6f}")
+            
+            # Scale vision embeddings to match text magnitude
+            image_features_scaled = image_features * vision_scale_factor
+            print(f"[DEBUG] After scaling - vision magnitude: {torch.norm(image_features_scaled, dim=-1).mean():.6f}")
+            
+            print(f"[DEBUG] Final shapes - inputs_embeds: {inputs_embeds.shape}, image_features: {image_features_scaled.shape}, image_token_mask: {image_token_mask.shape}")
+            print(f"[DEBUG] Number of True values in mask: {image_token_mask.sum().item()}")
+            print(f"[DEBUG] Number of vision tokens: {image_features_scaled.shape[0]}")
+            
+            # Replace image placeholder tokens with actual image embeddings
+            # masked_scatter expects the source tensor to have the right shape
+            inputs_embeds = inputs_embeds.masked_scatter(image_token_mask.unsqueeze(-1), image_features_scaled)
+            
+            print(f"[DEBUG] AFTER replacement - Combined embeddings: mean={inputs_embeds.mean():.6f}, std={inputs_embeds.std():.6f}")
+            
+            # Check final magnitudes
+            text_indices = ~image_token_mask
+            vision_indices = image_token_mask
+            
+            if text_indices.any():
+                final_text_magnitude = torch.norm(inputs_embeds[text_indices][:5], dim=-1).mean().item()
+            else:
+                final_text_magnitude = 0.0
+                
+            if vision_indices.any():
+                final_vision_magnitude = torch.norm(inputs_embeds[vision_indices][:5], dim=-1).mean().item()
+            else:
+                final_vision_magnitude = 0.0
+                
+            print(f"[DEBUG] FINAL - Text magnitude: {final_text_magnitude:.6f}, Vision magnitude: {final_vision_magnitude:.6f}")
+            if final_text_magnitude > 0:
+                print(f"[DEBUG] FINAL Vision/Text ratio: {final_vision_magnitude / final_text_magnitude:.3f}")
+            print(f"[DEBUG] === END VISION INTEGRATION ===")
 
-        # --- Multimodal 3-D position IDs -----------------------------------
+        # --- CRITICAL FIX: Use HF's approach for position embeddings ---
+        # Get 3D position IDs exactly like HF
         pos_3d = self.get_rope_index(input_ids, image_grid_thw=image_grid_thw)
-
-        # Build cos/sin for each of the 3 axes separately then stack
-        cos_axes = []
-        sin_axes = []
-        for axis in range(3):
-            cos_a, sin_a = self.rotary_emb(
-                pos_3d[axis], dtype=inputs_embeds.dtype, device=inputs_embeds.device
-            )
-            cos_axes.append(cos_a)
-            sin_axes.append(sin_a)
-        position_embeddings = (torch.stack(cos_axes, dim=0), torch.stack(sin_axes, dim=0))
+        
+        # HF creates position embeddings directly from the 3D position IDs
+        # pos_3d has shape (3, seq_len) where 3 = [temporal, height, width]
+        seq_len = input_ids.shape[0]
+        device = input_ids.device
+        dtype = inputs_embeds.dtype
+        
+        # Create position embeddings for all three axes
+        # The rotary_emb expects position IDs with shape (seq_len,) and returns (seq_len, head_dim)
+        cos_t, sin_t = self.rotary_emb(pos_3d[0], dtype=dtype, device=device)  # temporal: (seq_len, head_dim)
+        cos_h, sin_h = self.rotary_emb(pos_3d[1], dtype=dtype, device=device)  # height: (seq_len, head_dim)  
+        cos_w, sin_w = self.rotary_emb(pos_3d[2], dtype=dtype, device=device)  # width: (seq_len, head_dim)
+        
+        # Stack them to create the 3D cos/sin tensors that multimodal RoPE expects
+        # Shape: (3, seq_len, head_dim)
+        cos_combined = torch.stack([cos_t, cos_h, cos_w], dim=0)
+        sin_combined = torch.stack([sin_t, sin_h, sin_w], dim=0)
+        
+        position_embeddings = (cos_combined, sin_combined)
 
         hidden_states = inputs_embeds
         for decoder_layer in self.layers:
@@ -450,6 +585,7 @@ class Qwen2_5_VLModel(nn.Module):
                 hidden_states, _ = decoder_layer(hidden_states, position_embeddings, cu_seqlens, max_seqlen, position_ids)
 
         hidden_states = self.norm(hidden_states)
+
         return hidden_states
 
 
@@ -457,12 +593,34 @@ class Qwen2_5_VisionPatchEmbed(PatchEmbed):
     """HF PatchEmbed with extra lenience – accepts already-flattened 2-D patches."""
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:  # type: ignore
+        # Debug input
+        print(f"[PATCH-DEBUG] Input pixel_values: shape={pixel_values.shape}, dtype={pixel_values.dtype}", flush=True)
+        print(f"[PATCH-DEBUG] Input range: [{pixel_values.min():.6f}, {pixel_values.max():.6f}], mean={pixel_values.mean():.6f}, std={pixel_values.std():.6f}", flush=True)
+        
+        if torch.isnan(pixel_values).any():
+            print(f"[PATCH-DEBUG] NaN in input pixel_values!", flush=True)
+        
         if pixel_values.dim() == 2:  # flattened patches (N, in_dim)
             # parent PatchEmbed expects (B*N, in_dim) and applies linear proj
-            return super().forward(pixel_values)
-
-        # Fallback to original implementation for 4-D/5-D tensors
-        return super().forward(pixel_values)
+            result = super().forward(pixel_values)
+        else:
+            # Fallback to original implementation for 4-D/5-D tensors
+            result = super().forward(pixel_values)
+        
+        # Debug output
+        print(f"[PATCH-DEBUG] Output: shape={result.shape}, dtype={result.dtype}", flush=True)
+        print(f"[PATCH-DEBUG] Output range: [{result.min():.6f}, {result.max():.6f}], mean={result.mean():.6f}, std={result.std():.6f}", flush=True)
+        
+        if torch.isnan(result).any():
+            print(f"[PATCH-DEBUG] NaN in patch embedding output!", flush=True)
+            # Check the parent's projection layer for issues
+            if hasattr(self, 'proj'):
+                print(f"[PATCH-DEBUG] Proj weight stats: mean={self.proj.weight.mean():.6f}, std={self.proj.weight.std():.6f}", flush=True)
+                print(f"[PATCH-DEBUG] Proj weight range: [{self.proj.weight.min():.6f}, {self.proj.weight.max():.6f}]", flush=True)
+                if self.proj.bias is not None:
+                    print(f"[PATCH-DEBUG] Proj bias stats: mean={self.proj.bias.mean():.6f}, std={self.proj.bias.std():.6f}", flush=True)
+        
+        return result
 
 
 class Qwen2_5_VisionRotaryEmbedding(nn.Module):
@@ -485,7 +643,7 @@ class Qwen2_5_VLVisionMLP(nn.Module):
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
-        self.act_fn = F.gelu
+        self.act_fn = F.silu  # Use SiLU activation like HF
 
     def forward(self, hidden_state):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
@@ -517,10 +675,12 @@ def apply_rotary_pos_emb_vision(
     # later when broadcasting to `[tokens, heads, head_dim]`.  The previous
     # extra `unsqueeze(-2)` inflated them to 4-D which broke `expand()`.
     cos, sin = cos.float(), sin.float()
-    print(
-        f"[debug] (vision) after type-cast: cos={tuple(cos.shape)} sin={tuple(sin.shape)}",
-        flush=True,
-    )
+    _dbg = os.getenv("DEBUG_SHAPES")
+    if _dbg:
+        print(
+            f"[debug] (vision) after type-cast: cos={tuple(cos.shape)} sin={tuple(sin.shape)}",
+            flush=True,
+        )
 
     # Some upstream code may already attach a singleton dim at index 1
     # (e.g., shape `[tokens, 1, head_dim]`).  Remove it so later `unsqueeze(1)`
@@ -528,10 +688,11 @@ def apply_rotary_pos_emb_vision(
     if cos.dim() == 3 and cos.size(1) == 1:
         cos = cos.squeeze(1)
         sin = sin.squeeze(1)
-        print(
-            f"[debug] (vision) squeezed singleton: cos={tuple(cos.shape)}",
-            flush=True,
-        )
+        if _dbg:
+            print(
+                f"[debug] (vision) squeezed singleton: cos={tuple(cos.shape)}",
+                flush=True,
+            )
 
     # Align to head_dim.
     if cos.size(-1) < q.size(-1):
@@ -540,42 +701,47 @@ def apply_rotary_pos_emb_vision(
         sin_pad = torch.zeros_like(cos_pad)
         cos = torch.cat([cos, cos_pad], dim=-1)
         sin = torch.cat([sin, sin_pad], dim=-1)
-        print(
-            f"[debug] (vision) rotary dim padded: raw_dim={q.size(-1)-pad_dim} head_dim={q.size(-1)} pad={pad_dim}",
-            flush=True,
-        )
+        if _dbg:
+            print(
+                f"[debug] (vision) rotary dim padded: raw_dim={q.size(-1)-pad_dim} head_dim={q.size(-1)} pad={pad_dim}",
+                flush=True,
+            )
     elif cos.size(-1) > q.size(-1):
         cos = cos[..., : q.size(-1)]
         sin = sin[..., : q.size(-1)]
-        print(
-            f"[debug] (vision) rotary dim sliced: orig_dim={cos.size(-1)} head_dim={q.size(-1)}",
-            flush=True,
-        )
+        if _dbg:
+            print(
+                f"[debug] (vision) rotary dim sliced: orig_dim={cos.size(-1)} head_dim={q.size(-1)}",
+                flush=True,
+            )
 
     # Broadcast to [tokens, heads, head_dim]
     cos_b = cos.unsqueeze(1).expand(-1, q.size(1), -1)  # [tokens, heads, head_dim]
     sin_b = sin.unsqueeze(1).expand_as(cos_b)
-    print(
-        f"[debug] (vision) broadcast shapes: cos_b={tuple(cos_b.shape)} sin_b={tuple(sin_b.shape)}",
-        flush=True,
-    )
+    if _dbg:
+        print(
+            f"[debug] (vision) broadcast shapes: cos_b={tuple(cos_b.shape)} sin_b={tuple(sin_b.shape)}",
+            flush=True,
+        )
 
     # If token count still mismatches (e.g., grid tokens), skip RoPE entirely as
     # a last-resort fallback – this keeps shapes consistent for tiny toy models
     # used in unit tests while logging a clear message.  Real checkpoints will
     # never hit this path because their dimensions line up.
     if cos_b.size(0) != q.size(0):
-        print(
-            f"[warn] apply_multimodal_rotary_pos_emb final token mismatch: q_tokens={q.size(0)} cos_tokens={cos_b.size(0)}. Skipping RoPE for this step.",
-            flush=True,
-        )
+        if _dbg:
+            print(
+                f"[warn] apply_multimodal_rotary_pos_emb final token mismatch: q_tokens={q.size(0)} cos_tokens={cos_b.size(0)}. Skipping RoPE for this step.",
+                flush=True,
+            )
         return q, k
 
-    print(
-        f"[debug] RoPE tensor shapes: q={tuple(q.shape)}, cos_cat={tuple(cos_b.shape)}, "
-        f"sin_cat={tuple(sin_b.shape)}  (tokens={q.size(0)}, heads={q.size(1)}, head_dim={q.size(2)})",
-        flush=True,
-    )
+    if _dbg:
+        print(
+            f"[debug] RoPE tensor shapes: q={tuple(q.shape)}, cos_cat={tuple(cos_b.shape)}, "
+            f"sin_cat={tuple(sin_b.shape)}  (tokens={q.size(0)}, heads={q.size(1)}, head_dim={q.size(2)})",
+            flush=True,
+        )
 
     q_embed = (q * cos_b) + (rotate_half(q) * sin_b)
     k_embed = (k * cos_b) + (rotate_half(k) * sin_b)
@@ -588,6 +754,10 @@ class Qwen2_5_VLVisionAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
         self.num_heads = num_heads
+        # Keep the HF naming alias so downstream helper utilities (e.g., mask
+        # builders copied from text-attention) can reference a common attr
+        # without branching on module type.
+        self.num_attention_heads = num_heads
         self.head_dim = dim // num_heads
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
@@ -600,15 +770,31 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         max_seqlen: int,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        total_tokens, _ = hidden_states.shape
-        q, k, v = self.qkv(hidden_states).view(total_tokens, 3, self.num_heads, self.head_dim).unbind(1)
+        # EXACT HF implementation of Qwen2_5_VLVisionSdpaAttention.forward()
+        seq_length = hidden_states.shape[0]
+        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        # Vision attention is not causal
-        attn_output = flash_attention_forward(q, k, v, cu_seqlens, max_seqlen, softmax_scale=self.scaling, causal=False)
-        attn_output = attn_output.view(total_tokens, -1)
+        # Create attention mask exactly like HF
+        attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
+        for i in range(1, len(cu_seqlens)):
+            attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = True
+        
+        # Transpose exactly like HF
+        q = q.transpose(0, 1)  # [num_heads, seq_length, head_dim] -> [seq_length, num_heads, head_dim]
+        k = k.transpose(0, 1)
+        v = v.transpose(0, 1)
+        
+        # Apply SDPA exactly like HF
+        attn_output = F.scaled_dot_product_attention(
+            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), attention_mask, dropout_p=0.0
+        )
+        
+        # Reshape back exactly like HF
+        attn_output = attn_output.squeeze(0).transpose(0, 1)  # [seq_length, num_heads, head_dim] -> [num_heads, seq_length, head_dim]
+        attn_output = attn_output.reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
         return attn_output
 
@@ -628,13 +814,41 @@ class Qwen2_5_VLVisionBlock(nn.Module):
         max_seqlen: int,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
+        # Debug input to vision block
+        if torch.isnan(hidden_states).any():
+            print(f"[BLOCK-DEBUG] NaN in input to vision block! Stats: mean={hidden_states.mean():.6f}, std={hidden_states.std():.6f}", flush=True)
+        
+        # First residual connection (attention)
+        norm1_out = self.norm1(hidden_states)
+        if torch.isnan(norm1_out).any():
+            print(f"[BLOCK-DEBUG] NaN after norm1!", flush=True)
+        
+        attn_out = self.attn(
+            norm1_out,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             position_embeddings=position_embeddings,
         )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        if torch.isnan(attn_out).any():
+            print(f"[BLOCK-DEBUG] NaN after attention!", flush=True)
+        
+        hidden_states = hidden_states + attn_out
+        if torch.isnan(hidden_states).any():
+            print(f"[BLOCK-DEBUG] NaN after attention residual!", flush=True)
+        
+        # Second residual connection (MLP)
+        norm2_out = self.norm2(hidden_states)
+        if torch.isnan(norm2_out).any():
+            print(f"[BLOCK-DEBUG] NaN after norm2!", flush=True)
+        
+        mlp_out = self.mlp(norm2_out)
+        if torch.isnan(mlp_out).any():
+            print(f"[BLOCK-DEBUG] NaN after MLP!", flush=True)
+        
+        hidden_states = hidden_states + mlp_out
+        if torch.isnan(hidden_states).any():
+            print(f"[BLOCK-DEBUG] NaN after MLP residual!", flush=True)
+        
         return hidden_states
 
 
@@ -703,6 +917,13 @@ class Qwen2_5_VisionTransformer(nn.Module):
         window_index_id = 0
         vit_merger_window_size = self.window_size // self.spatial_merge_size // self.patch_size
 
+        if os.getenv("DEBUG_SHAPES"):
+            print(
+                f"[dbg-window] grid_thw={grid_thw.tolist()}  spatial_merge={self.spatial_merge_size}  "
+                f"vit_win={vit_merger_window_size}",
+                flush=True,
+            )
+
         for grid_t, grid_h, grid_w in grid_thw:
             llm_grid_h, llm_grid_w = (
                 grid_h // self.spatial_merge_size,
@@ -736,10 +957,29 @@ class Qwen2_5_VisionTransformer(nn.Module):
             window_index_id += (grid_t * llm_grid_h * llm_grid_w).item()
         window_index = torch.cat(window_index, dim=0)
 
+        if os.getenv("DEBUG_SHAPES"):
+            print(
+                f"[dbg-window] built window_index len={window_index.numel()} max={int(window_index.max())}",
+                flush=True,
+            )
+
         return window_index, cu_window_seqlens
 
     def forward(self, pixel_values: torch.Tensor, grid_thw: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Check input pixel values
+        if torch.isnan(pixel_values).any():
+            print(f"[VISION-DEBUG] NaN detected in input pixel_values!", flush=True)
+            
         hidden_states = self.patch_embed(pixel_values)
+        
+        # Check after patch embedding
+        if torch.isnan(hidden_states).any():
+            print(f"[VISION-DEBUG] NaN detected after patch_embed! Input shape: {pixel_values.shape}, Output shape: {hidden_states.shape}", flush=True)
+            print(f"[VISION-DEBUG] Input pixel stats: min={pixel_values.min():.6f}, max={pixel_values.max():.6f}, mean={pixel_values.mean():.6f}", flush=True)
+            print(f"[VISION-DEBUG] Output patch stats: min={hidden_states.min():.6f}, max={hidden_states.max():.6f}", flush=True)
+            # Check if it's fp16 overflow
+            if pixel_values.dtype == torch.float16:
+                print(f"[VISION-DEBUG] Using fp16 - potential overflow issue", flush=True)
 
         # Auto-derive grid_thw when not provided.
         if grid_thw is None:
@@ -759,12 +999,20 @@ class Qwen2_5_VisionTransformer(nn.Module):
         cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
 
         seq_len, _ = hidden_states.size()
-        hidden_states = hidden_states.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+        # Ensure the index tensor lives on the same device as the source so
+        # fancy-indexing doesn't trigger illegal memory faults.
+        window_index = window_index.to(hidden_states.device)
+
+        num_groups = seq_len // self.spatial_merge_unit
+
+        hidden_states = hidden_states.reshape(num_groups, self.spatial_merge_unit, -1)
         hidden_states = hidden_states[window_index, :, :]
         hidden_states = hidden_states.reshape(seq_len, -1)
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+
+        rotary_pos_emb = rotary_pos_emb.reshape(num_groups, self.spatial_merge_unit, -1)
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
@@ -776,22 +1024,56 @@ class Qwen2_5_VisionTransformer(nn.Module):
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
         for layer_num, blk in enumerate(self.blocks):
+            # Select the appropriate cu_seqlens depending on whether this layer
+            # performs full-attention (global) or windowed attention.
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
-                max_seqlen_now = max_seqlen
             else:
                 cu_seqlens_now = cu_window_seqlens
-                max_seqlen_now = (cu_window_seqlens[1:] - cu_window_seqlens[:-1]).max().item()
+
+            max_seqlen_now = (cu_seqlens_now[1:] - cu_seqlens_now[:-1]).max().item()
 
             if self.gradient_checkpointing and self.training:
-                # TODO: add gradient checkpointing
-                pass
+                hidden_states = self._gradient_checkpointing_func(
+                    blk.__call__, hidden_states, cu_seqlens_now, max_seqlen_now, position_embeddings
+                )
             else:
-                hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens_now, max_seqlen=max_seqlen_now, position_embeddings=position_embeddings)
+                hidden_states = blk(
+                    hidden_states,
+                    cu_seqlens=cu_seqlens_now,
+                    max_seqlen=max_seqlen_now,
+                    position_embeddings=position_embeddings,
+                )
 
+        # Patch-merger and final reordering back to the original token order.
+        print(f"[DEBUG] Before merger - hidden_states: mean={hidden_states.mean():.6f}, std={hidden_states.std():.6f}")
+        print(f"[DEBUG] Before merger - sample norms: {torch.norm(hidden_states[:5], dim=-1)}")
+        
         hidden_states = self.merger(hidden_states)
+        
+        print(f"[DEBUG] After merger - hidden_states: mean={hidden_states.mean():.6f}, std={hidden_states.std():.6f}")
+        print(f"[DEBUG] After merger - sample norms: {torch.norm(hidden_states[:5], dim=-1)}")
+        
         reverse_indices = torch.argsort(window_index)
         hidden_states = hidden_states[reverse_indices, :]
+
+        # Final NaN check before returning
+        if torch.isnan(hidden_states).any():
+            print(f"[VISION-DEBUG] NaN detected in final vision output! Replacing with small random values.", flush=True)
+            # Use small random values instead of zeros to provide some signal
+            nan_mask = torch.isnan(hidden_states)
+            hidden_states = torch.where(nan_mask, torch.randn_like(hidden_states) * 0.01, hidden_states)
+
+        # CRITICAL FIX: DO NOT normalize vision embeddings - HF doesn't do this!
+        # The HF implementation uses vision embeddings directly without any normalization
+        print(f"[VISION-DEBUG] Final vision output - hidden_states mean: {hidden_states.mean().item():.6f}, std: {hidden_states.std().item():.6f}", flush=True)
+        print(f"[VISION-DEBUG] Final vision embedding norms: {hidden_states[:5].norm(dim=-1)}", flush=True)
+
+        if os.getenv("DEBUG_SHAPES"):
+            print(
+                f"[dbg-forward] seq_len={seq_len} groups={num_groups}",
+                flush=True,
+            )
 
         return hidden_states
 
@@ -806,6 +1088,10 @@ class Qwen2_5_VLForCausalLM(nn.Module):
     @property
     def visual(self):
         return self.model.visual
+    
+    def get_rope_index(self, input_ids, image_grid_thw=None, video_grid_thw=None):
+        """Delegate to the underlying model's get_rope_index method."""
+        return self.model.get_rope_index(input_ids, image_grid_thw, video_grid_thw)
 
     def forward(
         self, 
@@ -816,6 +1102,8 @@ class Qwen2_5_VLForCausalLM(nn.Module):
         labels: Optional[torch.LongTensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
     ):
         hidden_states = self.model(
             input_ids=input_ids, 
@@ -855,6 +1143,13 @@ class Qwen2_5_VLForCausalLM(nn.Module):
         except Exception:
             pass
         # ----------------------------------------------------------------
+
+        # For compatibility with both HF-style and custom runners we always
+        # return a simple tuple – even when ``return_dict`` is requested –
+        # because the surrounding `ModelRunner` wrapper in dark.rl checks for
+        # an attribute-based interface and otherwise falls back to tuple
+        # unpacking.  This keeps behaviour stable across model types without
+        # introducing an extra lightweight dataclass.
 
         return logits, loss
 

@@ -113,5 +113,15 @@ for task in tasks:
         response = llm.generate(verify_ctx)
         print(f"Outcome: {outcome}")
 
+        comment = None
+        feedback = input("Press 'a' to approve, 'r' to reject, 'c' to comment")
+        if feedback == 'a':
+            print("Approved")
+        elif feedback == 'r':
+            print("Rejected")
+        elif feedback == 'c':
+            comment = input("Enter your comment: ")
+            print(f"Comment: {comment}")
+
 
 
