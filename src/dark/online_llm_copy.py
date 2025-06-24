@@ -7,13 +7,6 @@ import bitsandbytes as bnb
 from dark import LLM, SamplingParams
 from dark.engine.sequence import Sequence
 
-# Add import for HF wrapper
-try:
-    from dark.models.hf_qwen2_5_vl import load_hf_qwen2_5_vl_model
-    HF_WRAPPER_AVAILABLE = True
-except ImportError:
-    HF_WRAPPER_AVAILABLE = False
-
 
 SUPPORTED_MODELS = [
     "Qwen/Qwen2.5-VL-3B-Instruct",
@@ -56,7 +49,6 @@ class OnlineLLM:
         offload_lora_to_cpu: bool = True,
         use_adam8bit: bool = True,
         enforce_eager: bool = True,
-        use_hf_implementation: bool = True,  # New parameter to choose implementation
     ):
         if model not in SUPPORTED_MODELS:
             raise ValueError(f"Model {model} not supported. Supported models: {SUPPORTED_MODELS}")
@@ -68,33 +60,15 @@ class OnlineLLM:
         self.lora_alpha = lora_alpha
         self.offload_lora_to_cpu = offload_lora_to_cpu
         self.use_adam8bit = use_adam8bit
-        self.use_hf_implementation = use_hf_implementation
 
-        # Choose implementation
-        if use_hf_implementation:
-            if not HF_WRAPPER_AVAILABLE:
-                raise ImportError("HF wrapper not available. Please ensure src.dark.models.hf_qwen2_5_vl is properly installed.")
-            
-            print(f"Using HuggingFace implementation for {model}")
-            # Initialize the HF wrapper
-            self.hf_model = load_hf_qwen2_5_vl_model(
-                model,
-                lora_rank=lora_rank,
-                lora_alpha=lora_alpha
-            )
-            self.tokenizer = self.hf_model.processor.tokenizer
-            self.llm = None  # Not using the custom LLM
-        else:
-            print(f"Using custom implementation for {model}")
-            # Initialize the underlying LLM with LoRA support
-            self.llm = LLM(
-                model,
-                enforce_eager=enforce_eager,
-                lora_rank=lora_rank,
-                lora_alpha=lora_alpha
-            )
-            self.tokenizer = self.llm.tokenizer
-            self.hf_model = None  # Not using HF wrapper
+        # Initialize the underlying LLM with LoRA support
+        self.llm = LLM(
+            model,
+            enforce_eager=enforce_eager,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha
+        )
+        self.tokenizer = self.llm.tokenizer
 
         # LoRA adapter management
         self.lora_states: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -122,18 +96,11 @@ class OnlineLLM:
         if to_cpu is None:
             to_cpu = self.offload_lora_to_cpu
         
-        if self.use_hf_implementation:
-            return {
-                n: p.detach().clone().to("cpu" if to_cpu else p.device) 
-                for n, p in self.hf_model.named_parameters() 
-                if "lora_" in n
-            }
-        else:
-            return {
-                n: p.detach().clone().to("cpu" if to_cpu else p.device) 
-                for n, p in self.llm.model_runner.model.named_parameters() 
-                if "lora_" in n
-            }
+        return {
+            n: p.detach().clone().to("cpu" if to_cpu else p.device) 
+            for n, p in self.llm.model_runner.model.named_parameters() 
+            if "lora_" in n
+        }
 
     def load_lora_state(self, state: Dict[str, torch.Tensor]):
         """Load LoRA tensors into the model (in-place).
@@ -147,14 +114,9 @@ class OnlineLLM:
             return
         
         with torch.no_grad():
-            if self.use_hf_implementation:
-                for n, p in self.hf_model.named_parameters():
-                    if "lora_" in n and n in state:
-                        p.copy_(state[n])
-            else:
-                for n, p in self.llm.model_runner.model.named_parameters():
-                    if "lora_" in n and n in state:
-                        p.copy_(state[n])
+            for n, p in self.llm.model_runner.model.named_parameters():
+                if "lora_" in n and n in state:
+                    p.copy_(state[n])
         
         dt_ms = (time.perf_counter() - t0) * 1000
         print(f"[metric] lora_load_ms={dt_ms:.2f}")
@@ -176,73 +138,45 @@ class OnlineLLM:
             async with self.lock:
                 self.load_lora_state(self.lora_states[lora_adapter])
 
-        if self.use_hf_implementation:
-            # Use HF implementation for generation
-            outputs = []
-            async with self.lock:
-                self.hf_model.eval()
-                for prompt in prompts:
-                    # Tokenize the prompt
-                    inputs = self.tokenizer(prompt, return_tensors="pt").to(self.hf_model.device)
-                    
-                    with torch.cuda.stream(self.infer_stream):
-                        generated_ids = self.hf_model.generate(
-                            **inputs,
-                            max_new_tokens=sampling_params.max_tokens,
-                            do_sample=sampling_params.temperature > 0,
-                            temperature=sampling_params.temperature if sampling_params.temperature > 0 else None,
-                            pad_token_id=self.tokenizer.eos_token_id
-                        )
-                    
-                    # Decode only the new tokens
-                    new_tokens = generated_ids[0][inputs['input_ids'].shape[1]:]
-                    output = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-                    outputs.append(output)
-            
-            total_gen_ms = (time.perf_counter() - gen_start) * 1000
-            print(f"[metric] generate_total_ms={total_gen_ms:.2f}")
-            return outputs
-        else:
-            # Use custom implementation
-            seqs = []
-            for prompt in prompts:
-                # For each prompt, create `sampling_params.n` sequences
-                for _ in range(sampling_params.n):
-                    seqs.append(Sequence(self.tokenizer.encode(prompt), sampling_params))
+        seqs = []
+        for prompt in prompts:
+            # For each prompt, create `sampling_params.n` sequences
+            for _ in range(sampling_params.n):
+                seqs.append(Sequence(self.tokenizer.encode(prompt), sampling_params))
 
+        async with self.lock:
+            self.llm.eval()
+            for seq in seqs:
+                self.llm.scheduler.add(seq)
+
+        outs = ["" for _ in seqs]
+        emitted = [0 for _ in seqs]
+        
+        while any(not seq.is_finished for seq in seqs):
+            step_t0 = time.perf_counter()
             async with self.lock:
                 self.llm.eval()
-                for seq in seqs:
-                    self.llm.scheduler.add(seq)
+                with torch.cuda.stream(self.infer_stream):
+                    self.llm.step()
+            step_dt_ms = (time.perf_counter() - step_t0) * 1000
+            print(f"[metric] llm_step_ms={step_dt_ms:.2f}")
 
-            outs = ["" for _ in seqs]
-            emitted = [0 for _ in seqs]
+            for i, seq in enumerate(seqs):
+                while seq.num_completion_tokens > emitted[i]:
+                    tid = seq.completion_token_ids[emitted[i]]
+                    outs[i] += self.tokenizer.decode([tid], skip_special_tokens=True)
+                    emitted[i] += 1
             
-            while any(not seq.is_finished for seq in seqs):
-                step_t0 = time.perf_counter()
-                async with self.lock:
-                    self.llm.eval()
-                    with torch.cuda.stream(self.infer_stream):
-                        self.llm.step()
-                step_dt_ms = (time.perf_counter() - step_t0) * 1000
-                print(f"[metric] llm_step_ms={step_dt_ms:.2f}")
+            await asyncio.sleep(0)  # Yield to other async tasks
 
-                for i, seq in enumerate(seqs):
-                    while seq.num_completion_tokens > emitted[i]:
-                        tid = seq.completion_token_ids[emitted[i]]
-                        outs[i] += self.tokenizer.decode([tid], skip_special_tokens=True)
-                        emitted[i] += 1
-                
-                await asyncio.sleep(0)  # Yield to other async tasks
-
-            total_gen_ms = (time.perf_counter() - gen_start) * 1000
-            num_tokens = sum(s.num_completion_tokens for s in seqs)
-            per_tok = total_gen_ms / max(1, num_tokens)
-            print(
-                f"[metric] generate_total_ms={total_gen_ms:.2f}  "
-                f"generate_per_token_ms={per_tok:.2f}"
-            )
-            return outs
+        total_gen_ms = (time.perf_counter() - gen_start) * 1000
+        num_tokens = sum(s.num_completion_tokens for s in seqs)
+        per_tok = total_gen_ms / max(1, num_tokens)
+        print(
+            f"[metric] generate_total_ms={total_gen_ms:.2f}  "
+            f"generate_per_token_ms={per_tok:.2f}"
+        )
+        return outs
 
     async def fine_tune(
         self,
@@ -269,27 +203,18 @@ class OnlineLLM:
             input_ids.append(torch.tensor(input_id))
             labels.append(torch.tensor(label))
 
-        device = self.hf_model.device if self.use_hf_implementation else "cuda"
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
-        ).to(device)
+        ).cuda()
         labels = torch.nn.utils.rnn.pad_sequence(
             labels, batch_first=True, padding_value=-100
-        ).to(device)
+        ).cuda()
 
         # Setup optimizer
-        if self.use_hf_implementation:
-            params_to_tune = [
-                p for n, p in self.hf_model.named_parameters() 
-                if "lora_" in n or p.requires_grad
-            ]
-            model_for_training = self.hf_model
-        else:
-            params_to_tune = [
-                p for n, p in self.llm.model_runner.model.named_parameters() 
-                if "lora_" in n
-            ]
-            model_for_training = self.llm.model_runner.model
+        params_to_tune = [
+            p for n, p in self.llm.model_runner.model.named_parameters() 
+            if "lora_" in n
+        ]
         
         if self.use_adam8bit:
             print(f"        [fine_tune] using Adam 8-bit optimizer for {lora_adapter}")
@@ -298,9 +223,9 @@ class OnlineLLM:
                 from bitsandbytes.optim import GlobalOptimManager
                 gopm = GlobalOptimManager.get_instance()
                 if hasattr(gopm, "register_model"):
-                    gopm.register_model(model_for_training)
+                    gopm.register_model(self.llm.model_runner.model)
                 if hasattr(gopm, "freeze_non_trainable_params"):
-                    gopm.freeze_non_trainable_params(model_for_training)
+                    gopm.freeze_non_trainable_params(self.llm.model_runner.model)
             except Exception as exc:
                 print(f"[warn] paging setup failed: {exc}")
         else:
@@ -309,23 +234,13 @@ class OnlineLLM:
         # Training loop
         for step in range(steps):
             async with self.lock:
-                if self.use_hf_implementation:
-                    self.hf_model.train()
-                    optimizer.zero_grad()
-                    torch.cuda.reset_peak_memory_stats()
-                    t0 = time.perf_counter()
-                    outputs = self.hf_model(input_ids=input_ids, labels=labels)
-                    loss = outputs.loss
-                    loss.backward()
-                    optimizer.step()
-                else:
-                    self.llm.train()
-                    optimizer.zero_grad()
-                    torch.cuda.reset_peak_memory_stats()
-                    t0 = time.perf_counter()
-                    loss = self.llm.forward_train(input_ids, labels)
-                    loss.backward()
-                    optimizer.step()
+                self.llm.train()
+                optimizer.zero_grad()
+                torch.cuda.reset_peak_memory_stats()
+                t0 = time.perf_counter()
+                loss = self.llm.forward_train(input_ids, labels)
+                loss.backward()
+                optimizer.step()
 
             if step == 0 or step == steps - 1 or step % 10 == 0:
                 print(f"        [fine_tune] {lora_adapter} step={step:3d}  loss={loss.item():.4f}")
@@ -340,26 +255,15 @@ class OnlineLLM:
 
         # Final evaluation
         async with self.lock:
-            if self.use_hf_implementation:
-                self.hf_model.eval()
-                with torch.no_grad():
-                    norms = {
-                        n: p.norm().item() 
-                        for n, p in self.hf_model.named_parameters() 
-                        if "lora_" in n or p.requires_grad
-                    }
-                    avg_norm = sum(norms.values()) / len(norms) if norms else 0.0
-                    print(f"        [fine_tune] {lora_adapter} average LoRA param norm={avg_norm:.4f}")
-            else:
-                self.llm.eval()
-                with torch.no_grad():
-                    norms = {
-                        n: p.norm().item() 
-                        for n, p in self.llm.model_runner.model.named_parameters() 
-                        if "lora_" in n
-                    }
-                    avg_norm = sum(norms.values()) / len(norms) if norms else 0.0
-                    print(f"        [fine_tune] {lora_adapter} average LoRA param norm={avg_norm:.4f}")
+            self.llm.eval()
+            with torch.no_grad():
+                norms = {
+                    n: p.norm().item() 
+                    for n, p in self.llm.model_runner.model.named_parameters() 
+                    if "lora_" in n
+                }
+                avg_norm = sum(norms.values()) / len(norms) if norms else 0.0
+                print(f"        [fine_tune] {lora_adapter} average LoRA param norm={avg_norm:.4f}")
 
         total_ft_ms = (time.perf_counter() - t_ft_start) * 1000
         print(f"[metric] fine_tune_total_ms={total_ft_ms:.2f}")

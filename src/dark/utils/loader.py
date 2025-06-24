@@ -35,7 +35,30 @@ def load_model(model: nn.Module, path: str):
                         weight_loader(param, tensor, shard_id)
                         break
                 else:
-                    param = model.get_parameter(weight_name)
+                    # Handle model prefix mismatch - strip "model." prefix if needed
+                    param_name = weight_name
+                    
+                    # Handle language_model structure mapping
+                    if weight_name.startswith("model."):
+                        # For weights like "model.layers.X", map to "model.language_model.layers.X"
+                        checkpoint_name = weight_name[6:]  # Remove "model." prefix
+                        if checkpoint_name.startswith(("layers.", "norm.", "embed_tokens.")):
+                            param_name = f"model.language_model.{checkpoint_name}"
+                        else:
+                            param_name = weight_name  # Keep original for other weights like lm_head
+                    
+                    try:
+                        param = model.get_parameter(param_name)
+                    except AttributeError:
+                        try:
+                            # If parameter not found with modified name, try original name
+                            param = model.get_parameter(weight_name)
+                            param_name = weight_name
+                        except AttributeError:
+                            # Parameter doesn't exist in our model, skip it
+                            print(f"[skip] {weight_name:>60} -> Not found in model")
+                            continue
+                    
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
@@ -45,7 +68,7 @@ def load_model(model: nn.Module, path: str):
                     except Exception:
                         rms = float('nan')
                     print(
-                        f"[load] {weight_name:>60} -> {param.shape}  rms={rms:.6f}",
+                        f"[load] {weight_name:>60} -> {param_name} -> {param.shape}  rms={rms:.6f}",
                         flush=True,
                     )
                     weight_loader(param, tensor)

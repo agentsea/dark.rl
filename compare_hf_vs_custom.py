@@ -118,16 +118,18 @@ def main():
         input_ids = inputs["input_ids"].squeeze(0)  # Remove batch dim
         image_grid_thw = inputs["image_grid_thw"]
         
-        # Call our custom get_rope_index method
-        custom_position_ids = custom_model.get_rope_index(
+        # Call our custom get_rope_index method - now returns tuple
+        custom_position_result = custom_model.get_rope_index(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
             video_grid_thw=None
         )
+        custom_position_ids, custom_rope_deltas = custom_position_result
         
         print(f"Custom position_ids shape: {custom_position_ids.shape}")
         print(f"Custom position_ids dtype: {custom_position_ids.dtype}")
         print(f"Custom position_ids device: {custom_position_ids.device}")
+        print(f"Custom rope_deltas: {custom_rope_deltas}")
         
         # Analyze the token sequence
         print(f"\nToken sequence analysis:")
@@ -152,44 +154,44 @@ def main():
         print(f"\nPosition IDs analysis:")
         print(f"First 20 positions across all dims:")
         for dim in range(3):
-            print(f"  Dim {dim}: {custom_position_ids[dim, :20].tolist()}")
+            print(f"  Dim {dim}: {custom_position_ids[dim, 0, :20].tolist()}")
         
         if len(vision_start_positions) > 0:
             vs_pos = vision_start_positions[0].item()
             print(f"\nAround <|vision_start|> at position {vs_pos}:")
             start_idx = max(0, vs_pos - 3)
-            end_idx = min(custom_position_ids.shape[1], vs_pos + 15)
+            end_idx = min(custom_position_ids.shape[2], vs_pos + 15)
             for dim in range(3):
-                print(f"  Dim {dim} [{start_idx}:{end_idx}]: {custom_position_ids[dim, start_idx:end_idx].tolist()}")
+                print(f"  Dim {dim} [{start_idx}:{end_idx}]: {custom_position_ids[dim, 0, start_idx:end_idx].tolist()}")
         
         if len(vision_end_positions) > 0:
             ve_pos = vision_end_positions[0].item()
             print(f"\nAround <|vision_end|> at position {ve_pos}:")
             start_idx = max(0, ve_pos - 5)
-            end_idx = min(custom_position_ids.shape[1], ve_pos + 5)
+            end_idx = min(custom_position_ids.shape[2], ve_pos + 5)
             for dim in range(3):
-                print(f"  Dim {dim} [{start_idx}:{end_idx}]: {custom_position_ids[dim, start_idx:end_idx].tolist()}")
+                print(f"  Dim {dim} [{start_idx}:{end_idx}]: {custom_position_ids[dim, 0, start_idx:end_idx].tolist()}")
     
     # --- Custom Forward Pass ---
     print("\n--- Custom Forward Pass ---")
     try:
         with torch.no_grad():
-            # Prepare inputs for custom model
-            seq_len = input_ids.shape[0]
-            cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
-            position_ids = torch.arange(seq_len, device=device)
-            
-            custom_logits, _ = custom_model(
-                input_ids=input_ids,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=seq_len,
-                position_ids=position_ids,
+            # Use HF's standard interface now
+            custom_outputs = custom_model(
+                input_ids=inputs["input_ids"],  # Use batched input_ids
                 pixel_values=inputs["pixel_values"],
                 image_grid_thw=inputs["image_grid_thw"],
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True
             )
             
+            # Get logits from lm_head
+            custom_logits = custom_outputs.logits
+            
             print(f"Custom logits shape: {custom_logits.shape}")
-            custom_last_token_logits = custom_logits[-1, :]
+            custom_last_token_logits = custom_logits[0, -1, :]  # Batch dimension
             print(f"Custom last token logits stats: min={custom_last_token_logits.min():.4f}, max={custom_last_token_logits.max():.4f}, mean={custom_last_token_logits.mean():.4f}")
             
             # Get top 5 predictions
@@ -198,6 +200,8 @@ def main():
             
     except Exception as e:
         print(f"ERROR in custom forward pass: {e}")
+        import traceback
+        traceback.print_exc()
         custom_logits = None
         custom_last_token_logits = None
         custom_top5_indices = None
@@ -206,59 +210,20 @@ def main():
     print("\n--- Custom Generation ---")
     try:
         with torch.no_grad():
-            # Simple greedy generation
-            input_ids_gen = inputs["input_ids"].squeeze(0).clone()
-            pixel_values = inputs["pixel_values"]
-            image_grid_thw = inputs["image_grid_thw"]
-            
-            max_new = 32
-            vision_special_ids = {151644, 151645, 151652, 151653, 151654, 151655, 151656}
-            eos_id = processor.tokenizer.eos_token_id
-            answer_ids = []
-            text_started = False
-            
-            for step in range(max_new):
-                seq_len = input_ids_gen.shape[0]
-                cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
-                pos_ids = torch.arange(seq_len, device=device)
-                
-                logits, _ = custom_model(
-                    input_ids=input_ids_gen,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=seq_len,
-                    position_ids=pos_ids,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
-                )
-                
-                # After first step, drop pixel_values
-                pixel_values = None
-                image_grid_thw = None
-                
-                next_id = int(logits[-1].argmax(-1).item())
-                token_str = processor.tokenizer.decode([next_id])
-                print(f"Step {step:02d}: id={next_id}, token='{token_str}'")
-                
-                if next_id not in vision_special_ids:
-                    text_started = True
-                
-                if next_id == eos_id:
-                    if text_started:
-                        break
-                    else:
-                        next_id = None
-                
-                if next_id is not None and next_id not in vision_special_ids and next_id != eos_id:
-                    answer_ids.append(next_id)
-                
-                if next_id is not None:
-                    input_ids_gen = torch.cat([input_ids_gen, torch.tensor([next_id], device=device)], dim=0)
-            
-            custom_response = processor.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
+            # Use HF's standard interface for generation
+            custom_generated_ids = custom_model.generate(
+                **inputs,
+                max_new_tokens=64,
+                do_sample=False,
+                temperature=0.0
+            )
+            custom_response = processor.batch_decode(custom_generated_ids, skip_special_tokens=False)[0]
             print(f"Custom Response: {custom_response}")
             
     except Exception as e:
         print(f"ERROR in custom generation: {e}")
+        import traceback
+        traceback.print_exc()
         custom_response = "ERROR"
     
     # ---------------------------------------------------------------
@@ -271,11 +236,15 @@ def main():
     # --- Logits Comparison ---
     if custom_logits is not None:
         print("\n--- Logits Comparison ---")
-        logits_diff = torch.abs(hf_logits.squeeze(0) - custom_logits).float()
+        # Both should now have batch dimension
+        logits_diff = torch.abs(hf_logits - custom_logits).float()
         print(f"Logits max diff: {logits_diff.max():.6f}")
         print(f"Logits mean diff: {logits_diff.mean():.6f}")
         
-        last_token_diff = torch.abs(last_token_logits - custom_last_token_logits).float()
+        # Compare last token logits  
+        hf_last_token = hf_logits[0, -1, :]
+        custom_last_token = custom_logits[0, -1, :]
+        last_token_diff = torch.abs(hf_last_token - custom_last_token).float()
         print(f"Last token logits max diff: {last_token_diff.max():.6f}")
         print(f"Last token logits mean diff: {last_token_diff.mean():.6f}")
     else:
@@ -300,6 +269,154 @@ def main():
     print("The key issue is likely in our position ID calculation.")
     print("HF uses a sophisticated 3D position embedding system that we need to match exactly.")
     print("Our current implementation may be too simplified.")
+
+def test_text_only():
+    """Test text-only functionality"""
+    try:
+        print("\n" + "="*60)
+        print("TEXT-ONLY TEST")
+        print("="*60)
+        
+        # Create text-only inputs with proper format
+        seq_len = 31
+        input_ids = torch.randint(100, 1000, (1, seq_len), device=device, dtype=torch.long)
+        
+        # Create basic inputs for both models  
+        print("Testing text-only forward pass...")
+        print(f"Input IDs shape: {input_ids.shape}")
+        
+        with torch.no_grad():
+            # HF forward pass
+            hf_outputs = hf_model(
+                input_ids=input_ids,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True
+            )
+            hf_logits = hf_outputs.logits
+            print(f"HF logits shape: {hf_logits.shape}")
+            
+            # Custom forward pass - now using HF interface
+            custom_outputs = custom_model(
+                input_ids=input_ids,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True
+            )
+            custom_logits = custom_outputs.last_hidden_state
+            print(f"Custom hidden states shape: {custom_logits.shape}")
+            
+        # Compare text embeddings
+        max_diff = torch.max(torch.abs(hf_logits - custom_logits)).item()
+        mean_diff = torch.mean(torch.abs(hf_logits - custom_logits)).item()
+        print(f"Text logits difference - Max: {max_diff:.6f}, Mean: {mean_diff:.6f}")
+        
+        success = max_diff < 0.1 
+        print(f"Text-only test: {'✅ PASS' if success else '❌ FAIL'}")
+        return success
+    
+    except Exception as e:
+        print(f"❌ ERROR in text-only test: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def test_vision_multimodal():
+    """Test multimodal (vision + text) functionality"""
+    try:
+        print("\n" + "="*60)
+        print("VISION + TEXT MULTIMODAL TEST")
+        print("="*60)
+        
+        # Create inputs similar to compare_hf_vs_custom.py
+        messages = [
+            {
+                "role": "user", 
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "What breed is this dog?"},
+                ],
+            }
+        ]
+        
+        # Load a test image
+        image_url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
+        image = Image.open(requests.get(image_url, stream=True).raw)
+        
+        # Process inputs
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=text, images=image, return_tensors="pt").to(device)
+        
+        print(f"Input shape: {inputs['input_ids'].shape}")
+        print(f"Image token count: {(inputs['input_ids'] == processor.image_token_id).sum().item()}")
+        
+        with torch.no_grad():
+            # HF forward pass
+            hf_outputs = hf_model(
+                input_ids=inputs['input_ids'],
+                pixel_values=inputs['pixel_values'],
+                image_grid_thw=inputs['image_grid_thw'],
+                attention_mask=inputs.get('attention_mask'),
+            )
+            hf_logits = hf_outputs.logits
+            
+            # Custom forward pass - now using HF interface  
+            custom_outputs = custom_model(
+                input_ids=inputs['input_ids'],
+                pixel_values=inputs['pixel_values'],
+                image_grid_thw=inputs['image_grid_thw'],
+                attention_mask=inputs.get('attention_mask'),
+            )
+            custom_logits = custom_outputs.last_hidden_state
+            
+        print(f"HF logits shape: {hf_logits.shape}")
+        print(f"Custom hidden states shape: {custom_logits.shape}")
+        
+        # Compare final outputs
+        max_diff = torch.max(torch.abs(hf_logits - custom_logits)).item()
+        mean_diff = torch.mean(torch.abs(hf_logits - custom_logits)).item()
+        print(f"Vision logits difference - Max: {max_diff:.6f}, Mean: {mean_diff:.6f}")
+        
+        # Test generation
+        print("\n" + "="*40)
+        print("GENERATION COMPARISON")
+        print("="*40)
+        
+        # HF generation
+        with torch.no_grad():
+            hf_generate_ids = hf_model.generate(
+                input_ids=inputs['input_ids'],
+                pixel_values=inputs['pixel_values'],
+                image_grid_thw=inputs['image_grid_thw'],
+                attention_mask=inputs.get('attention_mask'),
+                max_new_tokens=10,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+            )
+        hf_response = processor.batch_decode(hf_generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        print(f"HF Response: {hf_response}")
+        
+        # Custom generation (simple greedy)
+        print("Custom generation...")
+        # TODO: Implement proper generation for custom model
+        # For now, just get next token prediction
+        next_token_logits = custom_logits[0, -1, :]  # Last token predictions
+        next_token_id = torch.argmax(next_token_logits, dim=-1)
+        next_token = processor.decode([next_token_id], skip_special_tokens=True)
+        print(f"Custom next token: '{next_token}'")
+        
+        success = max_diff < 5.0  # More lenient for multimodal
+        print(f"Vision test: {'✅ PASS' if success else '❌ FAIL'}")
+        return success
+        
+    except Exception as e:
+        print(f"❌ ERROR in vision test: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 if __name__ == "__main__":
     main() 

@@ -62,6 +62,17 @@ def verify_ctx(task: str, history: str, action: str, response: str):
     """
     return verify_ctx
 
+def critique_ctx(task: str, history: str, action: str, response: str):
+    critique_ctx = f"""You are tasked with determining if an action taken by an agent to accomplish a task is correct.
+    You will be given the task, the history of actions and responses, the action taken, and the response.
+    The task is: {task}
+    The history of actions and responses is: {history}
+    The action was: {action}
+    The response was: {response}
+    Please output a critique of the action and response.
+    """
+    return critique_ctx
+
 tasks = [
     {"description": "Add all the numbers on line 5 in every even numbered file", "expected_output": "4"}, # 2, 1, 1
     {"description": "Add all the numbers on line 6 in every odd numbered file", "expected_output": "18"}, # 9, 4, 5
@@ -71,7 +82,7 @@ tasks = [
     {"description": "Multiply all the numbers on line 4 in every file then subtract line 5 in file 2", "expected_output": "15"}, # 3, 1, 8, 1, 4, 0 - 2
 ]
 
-llm = OnlineLM(model="Qwen/Qwen2.5-VL-7B-Instruct", temperature=0.2, max_tokens=1000)
+llm = OnlineLM(model="Qwen/Qwen3-8B", temperature=0.2, max_tokens=1000)
 
 for task in tasks:
     print(f"\n\n====\nTask: {task['description']}\n")
@@ -82,11 +93,11 @@ for task in tasks:
     for step in range(10):
         print(f"\nStep {step}")
 
-        try 
-            response = llm.generate(ctx)
-            print(f"Response: {response}")
+        try:
+            act_response = llm.generate(ctx)
+            print(f"Response: {act_response}")
 
-            action = json_repair.loads(response)
+            action = json_repair.loads(act_response)
             print(f"Action: {action}")
         except Exception as e:
             print(f"Error: {e}")
@@ -107,21 +118,36 @@ for task in tasks:
         print("Action taken")
         print(f"Response: {response}")
 
-        ctx += f"<response>{response}</response>"
+        final_ctx = ctx + f"<response>{response}</response>"
 
         verify_ctx = verify_ctx(task['description'], action, task['expected_output'])
         response = llm.generate(verify_ctx)
         print(f"Outcome: {outcome}")
 
         comment = None
-        feedback = input("Press 'a' to approve, 'r' to reject, 'c' to comment")
+        feedback = input("Press 'a' to approve, 'r' to reject, 'c' to comment, 's' to skip")
         if feedback == 'a':
             print("Approved")
+            print(f"Learning: {ctx} -> \n{response}")
+            llm.learn(ctx, response)
+
         elif feedback == 'r':
             print("Rejected")
+
         elif feedback == 'c':
             comment = input("Enter your comment: ")
             print(f"Comment: {comment}")
+            critique_ctx = critique_ctx(task['description'], ctx, action, response)
+
+            print("Learning: {critique_ctx} -> \n{comment}")
+            llm.learn(critique_ctx, comment)
+
+        elif feedback == 's':
+            print("Skipping")
+        else:
+            print("Invalid feedback")
+
+        ctx = final_ctx
         
 
 
