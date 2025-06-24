@@ -1,3 +1,4 @@
+import logging
 import torch
 from torch import nn
 
@@ -117,10 +118,9 @@ class Sampler(nn.Module):
                 else:
                     chosen_repr = f"{chosen_id}{chosen_mark}"
 
-                print(
+                logging.debug(
                     f"[sampler-debug] seq={i} temp={temperatures[i].item():.2f} "
-                    f"chosen={chosen_repr} top{topk_tokens}={pairs}",
-                    flush=True,
+                    f"chosen={chosen_repr} top{topk_tokens}={pairs}"
                 )
         # ------------------------------------------------
 

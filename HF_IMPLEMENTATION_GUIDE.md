@@ -50,14 +50,44 @@ The previous issues with:
 ```python
 from src.dark.online_llm import OnlineLLM
 
-# Initialize with HF implementation (default)
+# Initialize with HF implementation (Flash Attention 2 is now the default!)
 llm = OnlineLLM(
     model="Qwen/Qwen2.5-VL-7B-Instruct",
-    use_hf_implementation=True  # This is now the default
+    use_hf_implementation=True,        # This is the default
+    # attn_implementation="flash_attention_2"  # 🚀 This is now the DEFAULT!
 )
 
 # Generate text
 response = await llm.generate_async("What are the benefits of exercise?")
+```
+
+### 🔥 Flash Attention 2 Support
+
+The HF implementation now supports **Flash Attention 2** for significant performance improvements:
+
+```python
+# Available attention implementations:
+llm = OnlineLLM(
+    model="Qwen/Qwen2.5-VL-7B-Instruct",
+    # attn_implementation="flash_attention_2",  # 🥇 Fastest (DEFAULT!)
+    # attn_implementation="sdpa",             # 🥈 Good balance 
+    # attn_implementation="eager",            # 🥉 Most compatible
+    use_hf_implementation=True
+)
+```
+
+**Performance Results:**
+- **Flash Attention 2**: 78.30 ms forward pass (**1.65x faster**)
+- **SDPA**: 103.93 ms forward pass (1.24x faster)  
+- **Eager**: 129.30 ms forward pass (baseline)
+
+**Usage Examples:**
+```bash
+# Compare all attention implementations
+uv run python test_flash_attention.py
+
+# Demo Flash Attention 2 usage
+uv run python flash_attention_usage.py
 ```
 
 ### Vision-Language Tasks

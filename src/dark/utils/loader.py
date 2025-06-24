@@ -1,3 +1,4 @@
+import logging
 import os
 from glob import glob
 import torch
@@ -27,9 +28,8 @@ def load_model(model: nn.Module, path: str):
                             rms = tensor.float().pow(2).mean().sqrt().item()
                         except Exception:
                             rms = float('nan')
-                        print(
-                            f"[load] {weight_name:>60} -> {param.shape}  rms={rms:.6f}",
-                            flush=True,
+                        logging.debug(
+                            f"[load] {weight_name:>60} -> {param.shape}  rms={rms:.6f}"
                         )
                         # ----------------------------------------------------------------------
                         weight_loader(param, tensor, shard_id)
@@ -56,7 +56,7 @@ def load_model(model: nn.Module, path: str):
                             param_name = weight_name
                         except AttributeError:
                             # Parameter doesn't exist in our model, skip it
-                            print(f"[skip] {weight_name:>60} -> Not found in model")
+                            logging.debug(f"[skip] {weight_name:>60} -> Not found in model")
                             continue
                     
                     weight_loader = getattr(
@@ -67,8 +67,7 @@ def load_model(model: nn.Module, path: str):
                         rms = tensor.float().pow(2).mean().sqrt().item()
                     except Exception:
                         rms = float('nan')
-                    print(
-                        f"[load] {weight_name:>60} -> {param_name} -> {param.shape}  rms={rms:.6f}",
-                        flush=True,
+                    logging.debug(
+                        f"[load] {weight_name:>60} -> {param_name} -> {param.shape}  rms={rms:.6f}"
                     )
                     weight_loader(param, tensor)

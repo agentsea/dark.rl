@@ -18,18 +18,21 @@ class HFQwen2_5_VLForCausalLM(nn.Module):
     with our existing interface and online_llm.py
     """
     
-    def __init__(self, config: Config, lora_rank=0, lora_alpha=1.0):
+    def __init__(self, config: Config, lora_rank=0, lora_alpha=1.0, attn_implementation="flash_attention_2"):
         super().__init__()
         self.config = config
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        self.attn_implementation = attn_implementation
         
         # Load the exact HF implementation
+        print(f"Loading model with attention implementation: {attn_implementation}")
         self.hf_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             config.model,
             torch_dtype=torch.float16,
             device_map="auto",
-            trust_remote_code=True
+            trust_remote_code=True,
+            attn_implementation=attn_implementation
         )
         
         # Store reference to the processor for compatibility
@@ -174,9 +177,14 @@ class HFQwen2_5_VLForCausalLM(nn.Module):
         return next(self.hf_model.parameters()).dtype
 
 
-def load_hf_qwen2_5_vl_model(model_path: str, **kwargs) -> HFQwen2_5_VLForCausalLM:
+def load_hf_qwen2_5_vl_model(model_path: str, attn_implementation="flash_attention_2", **kwargs) -> HFQwen2_5_VLForCausalLM:
     """
     Load HF Qwen2.5-VL model with our config wrapper
+    
+    Args:
+        model_path: Path to the model
+        attn_implementation: Attention implementation ("eager", "flash_attention_2", "sdpa")
+        **kwargs: Additional arguments passed to the model
     """
     # Create a compatible config
     class CompatConfig:
@@ -185,4 +193,4 @@ def load_hf_qwen2_5_vl_model(model_path: str, **kwargs) -> HFQwen2_5_VLForCausal
             self.hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     
     config = CompatConfig(model_path)
-    return HFQwen2_5_VLForCausalLM(config, **kwargs) 
+    return HFQwen2_5_VLForCausalLM(config, attn_implementation=attn_implementation, **kwargs) 

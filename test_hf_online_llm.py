@@ -14,12 +14,13 @@ async def test_hf_online_llm():
     
     print("🚀 Testing OnlineLLM with HuggingFace implementation...")
     
-    # Initialize OnlineLLM with HF implementation
+    # Initialize OnlineLLM with HF implementation and Flash Attention 2
     llm = OnlineLLM(
         model="Qwen/Qwen2.5-VL-7B-Instruct",
         temperature=0.7,
         max_tokens=50,
-        use_hf_implementation=True,  # Use HF implementation
+        architecture="hf",  # Use HF implementation
+        attn_implementation="flash_attention_2",  # Use Flash Attention 2 for speed
         lora_rank=8,
         lora_alpha=32
     )
@@ -91,7 +92,7 @@ def test_hf_vs_custom_comparison():
         model="Qwen/Qwen2.5-VL-7B-Instruct",
         temperature=0.0,  # Deterministic
         max_tokens=20,
-        use_hf_implementation=True
+        architecture="hf"
     )
     
     # Test with custom implementation (if available)
@@ -101,7 +102,7 @@ def test_hf_vs_custom_comparison():
             model="Qwen/Qwen2.5-VL-7B-Instruct", 
             temperature=0.0,  # Deterministic
             max_tokens=20,
-            use_hf_implementation=False
+            architecture="dark"
         )
         print("✅ Both implementations loaded successfully")
         
