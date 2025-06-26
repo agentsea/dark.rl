@@ -28,7 +28,7 @@ class ModelREPL:
     def __init__(self):
         self.llm: Optional[OnlineLLM] = None
         self.current_model = None
-        self.current_architecture = None
+        self.current_engine = None
         self.conversation_history = []
         self.streaming_enabled = True
         
@@ -252,16 +252,16 @@ class ModelREPL:
             return
         
         model_short = self.current_model.split('/')[-1]
-        arch_name = "HuggingFace" if self.current_architecture == "hf" else "Custom Dark.RL"
+        arch_name = "HuggingFace" if self.current_engine == "hf" else "Custom Dark.RL"
         
         print(f"\n🔍 Current Model Info:")
         print(f"  • Model: {model_short}")
-        print(f"  • Architecture: {self.current_architecture} ({arch_name})")
+        print(f"  • Engine: {self.current_engine} ({arch_name})")
         print(f"  • Temperature: {self.llm.temperature} (use /temp to change)")
         print(f"  • Max Tokens: {self.llm.max_tokens} (use /max to change)")
         
-        # Architecture-specific info
-        if self.current_architecture == "hf":
+        # Engine-specific info
+        if self.current_engine == "hf":
             print(f"  🚀 HF Features:")
             print(f"    - Flash Attention 2: ✅")
             print(f"    - Optimized inference: ✅")
@@ -375,22 +375,22 @@ class ModelREPL:
             print("🧹 Unloading current model and cleaning VRAM...")
             self.cleanup_model()
             self.current_model = None
-            self.current_architecture = None
+            self.current_engine = None
             print("✅ Model unloaded. Use /load <model> to load a new model.")
 
-    async def load_model(self, model_name: str, architecture: str = None):
-        """Load a specific model with given architecture"""
+    async def load_model(self, model_name: str, engine: str = None):
+        """Load a specific model with given engine"""
         try:
             # Clean up previous model first
             if self.llm is not None:
                 self.cleanup_model()
             
-            print(f"🔄 Loading {model_name} with {architecture or 'default'} architecture...")
+            print(f"🔄 Loading {model_name} with {engine or 'default'} engine...")
             start_time = time.time()
             
             # Smart defaults
-            if architecture is None:
-                architecture = "hf" if "VL" in model_name else "dark"
+            if engine is None:
+                engine = "hf" if "VL" in model_name else "dark"
             
             # Use pending settings if available, otherwise defaults
             temperature = self._pending_temperature if self._pending_temperature is not None else 0.7
@@ -400,12 +400,12 @@ class ModelREPL:
                 model=model_name,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                architecture=architecture
+                engine=engine
             )
             
             load_time = time.time() - start_time
             self.current_model = model_name
-            self.current_architecture = architecture
+            self.current_engine = engine
             
             print(f"✅ Model loaded successfully in {load_time:.2f}s")
             

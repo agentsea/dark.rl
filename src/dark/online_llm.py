@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 import warnings
-from typing import List, Dict, Any, Generator, Optional, Union
+from typing import List, Dict, Any, Generator, Optional, Union, AsyncGenerator
 import torch
 import bitsandbytes as bnb
 
@@ -21,6 +21,13 @@ except ImportError:
 from dark.llm import LLM
 from dark.sampling_params import SamplingParams
 from dark.engine.sequence import Sequence
+
+# Import KTO trainer
+try:
+    from dark.trainers.kto import KTOTrainer
+    KTO_AVAILABLE = True
+except ImportError:
+    KTO_AVAILABLE = False
 
 # Add import for HF wrapper
 try:
@@ -70,11 +77,15 @@ class OnlineLLM:
     - Multiple LoRA adapter management
     - 8-bit Adam optimizer support
     - Support for both HuggingFace and custom Dark implementations
+    - Thinking mode for supported models (Qwen3)
     
     Args:
         model: The model name/path to load
-        architecture: Implementation to use - "hf" for HuggingFace, "dark" for custom
-                     Defaults to "hf" for VL models, "dark" for text-only models
+        engine: Implementation to use - "hf" for HuggingFace, "dark" for custom
+                Defaults to "hf" for VL models, "dark" for text-only models
+        thinking_mode: Enable thinking mode for supported models (Qwen3). When enabled,
+                      the model can use thinking tokens (<think></think>) to reason
+                      step-by-step before providing answers. Default: True
     """
 
     def __init__(
@@ -87,8 +98,9 @@ class OnlineLLM:
         offload_lora_to_cpu: bool = True,
         use_adam8bit: bool = True,
         enforce_eager: bool = True,
-        architecture: str = None,  # "hf" for HuggingFace, "dark" for custom implementation
+        engine: str = None,  # "hf" for HuggingFace, "dark" for custom implementation
         attn_implementation: str = "flash_attention_2",  # Attention implementation for HF models (default: Flash Attention 2)
+        thinking_mode: bool = True,  # Enable thinking mode for supported models (Qwen3)
     ):
         if model not in SUPPORTED_MODELS:
             raise ValueError(f"Model {model} not supported. Supported models: {SUPPORTED_MODELS}")
@@ -100,35 +112,36 @@ class OnlineLLM:
         self.lora_alpha = lora_alpha
         self.offload_lora_to_cpu = offload_lora_to_cpu
         self.use_adam8bit = use_adam8bit
+        self.thinking_mode = thinking_mode
 
-        # Handle architecture parameter with smart defaults
+        # Handle engine parameter with smart defaults
         is_vl_model = "VL" in model
         is_moe_model = "MoE" in model
         
-        # Set default architecture based on model type
-        if architecture is None:
+        # Set default engine based on model type
+        if engine is None:
             if is_vl_model:
-                architecture = "hf"  # VL models default to HF (no custom implementation available)
+                engine = "hf"  # VL models default to HF (no custom implementation available)
             elif is_moe_model:
-                architecture = "dark"  # MoE models default to custom Dark implementation
+                engine = "dark"  # MoE models default to custom Dark implementation
             else:
-                architecture = "dark"  # Text models default to custom Dark implementation
+                engine = "dark"  # Text models default to custom Dark implementation
         
-        # Validate architecture parameter
-        if architecture not in ["hf", "dark"]:
-            raise ValueError(f"architecture must be 'hf' or 'dark', got '{architecture}'")
+        # Validate engine parameter
+        if engine not in ["hf", "dark"]:
+            raise ValueError(f"engine must be 'hf' or 'dark', got '{engine}'")
         
-        self.architecture = architecture
-        self.using_hf = (architecture == "hf")
+        self.engine = engine
+        self.using_hf = (engine == "hf")
         
-        if architecture == "hf":
+        if engine == "hf":
             # Use HF implementation
             if is_vl_model:
                 # VL models use the VL wrapper
                 if not HF_WRAPPER_AVAILABLE:
                     raise ImportError("HF wrapper not available. Please ensure src.dark.models.hf_qwen2_5_vl is properly installed.")
                 
-                logging.debug(f"Using HuggingFace VL implementation for {model} with {attn_implementation} attention")
+                logging.debug(f"Using HuggingFace VL engine for {model} with {attn_implementation} attention")
                 # Initialize the HF VL wrapper
                 self.hf_model = load_hf_qwen2_5_vl_model(
                     model,
@@ -145,7 +158,7 @@ class OnlineLLM:
                     from dark.models.qwen3_hf import create_qwen3_hf_model
                     from dark.config import Config
                     
-                    logging.debug(f"Using HuggingFace text implementation for {model} with {attn_implementation} attention")
+                    logging.debug(f"Using HuggingFace text engine for {model} with {attn_implementation} attention")
                     
                     # Create config for HF model
                     config = Config(model=model)
@@ -153,14 +166,15 @@ class OnlineLLM:
                     self.hf_model = create_qwen3_hf_model(
                         config,
                         lora_rank=lora_rank,
-                        lora_alpha=lora_alpha
+                        lora_alpha=lora_alpha,
+                        thinking_mode=thinking_mode
                     )
                     self.tokenizer = self.hf_model.tokenizer
                     self.llm = None
                     self.using_hf = True
                     
                 except ImportError as e:
-                    logging.warning(f"HF text implementation not available ({e}), falling back to custom implementation")
+                    logging.warning(f"HF text engine not available ({e}), falling back to custom engine")
                     # Fallback to custom implementation
                     self.llm = LLM(
                         model,
@@ -172,13 +186,13 @@ class OnlineLLM:
                     self.hf_model = None
                     self.using_hf = False
         else:
-            # Use custom Dark implementation
+            # Use custom Dark engine
             if is_moe_model:
                 # Use Qwen3MoE implementation
                 if not QWEN3_MOE_AVAILABLE:
-                    raise ImportError("Qwen3MoE implementation not available. Please ensure src.dark.models.qwen3_moe is properly installed.")
+                    raise ImportError("Qwen3MoE engine not available. Please ensure src.dark.models.qwen3_moe is properly installed.")
                 
-                logging.debug(f"Using custom Dark MoE implementation for {model}")
+                logging.debug(f"Using custom Dark MoE engine for {model}")
                 from dark.config import Config
                 
                 # Create config for MoE model
@@ -205,7 +219,7 @@ class OnlineLLM:
                 self.llm = None
                 self.using_hf = True  # We treat MoE as HF-like for interface purposes
             else:
-                logging.debug(f"Using custom Dark implementation for {model}")
+                logging.debug(f"Using custom Dark engine for {model}")
                 self.llm = LLM(
                     model,
                     enforce_eager=enforce_eager,
@@ -255,7 +269,7 @@ class OnlineLLM:
                 if "lora_" in n
             }
 
-    def load_lora_state(self, state: Dict[str, torch.Tensor]):
+    def load_lora_state(self, state: Dict[str, torch.Tensor]) -> None:
         """Load LoRA tensors into the model (in-place).
 
         If `state` is empty, we leave the existing randomly-initialized LoRA weights
@@ -283,7 +297,7 @@ class OnlineLLM:
         self,
         prompts: List[str],
         sampling_params: Optional[SamplingParams] = None,
-        lora_adapter: Optional[str] = None,
+        adapter: Optional[str] = None,
         images: Optional[List[List[Any]]] = None,  # Support multiple images per prompt
     ) -> List[str]:
         """Run generation step-by-step on a batch of prompts, asynchronously."""
@@ -293,9 +307,9 @@ class OnlineLLM:
         gen_start = time.perf_counter()
         
         # Load the appropriate LoRA adapter if specified
-        if lora_adapter and lora_adapter in self.lora_states:
+        if adapter and adapter in self.lora_states:
             async with self.lock:
-                self.load_lora_state(self.lora_states[lora_adapter])
+                self.load_lora_state(self.lora_states[adapter])
 
         if self.using_hf:
             # Use HF implementation for generation with vision support
@@ -441,10 +455,11 @@ class OnlineLLM:
     async def fine_tune(
         self,
         examples: List[Dict[str, Union[str, Any]]],  # Updated to support images
-        lora_adapter: str,
+        adapter: str,
         steps: int = 5,
         lr: float = 1e-4,
         is_moe_model: bool = False,
+        trainer: Optional[Any] = None,  # KTO trainer or other trainers
     ) -> Dict:
         """Fine-tune the model on a batch of prompt/response pairs using LoRA."""
         t_ft_start = time.perf_counter()
@@ -570,7 +585,7 @@ class OnlineLLM:
             model_for_training = self.llm.model_runner.model
         
         if self.use_adam8bit:
-            logging.debug(f"        [fine_tune] using Adam 8-bit optimizer for {lora_adapter}")
+            logging.debug(f"        [fine_tune] using Adam 8-bit optimizer for {adapter}")
             optimizer = bnb.optim.Adam8bit(params_to_tune, lr=lr)
             try:
                 from bitsandbytes.optim import GlobalOptimManager
@@ -584,10 +599,58 @@ class OnlineLLM:
         else:
             optimizer = torch.optim.Adam(params_to_tune, lr=lr)
         
+        # Check if KTO training is requested
+        is_kto_training = (trainer is not None and 
+                          KTO_AVAILABLE and 
+                          isinstance(trainer, KTOTrainer))
+        
+        # Prepare KTO-specific data if needed
+        if is_kto_training:
+            # Extract preference labels from examples (1 for desirable, 0 for undesirable)
+            preference_labels = []
+            for ex in examples:
+                # Default to desirable (1) if not specified
+                pref_label = ex.get("desirable", ex.get("preference", 1))
+                preference_labels.append(pref_label)
+            
+            preference_labels = torch.tensor(preference_labels, device=device)
+            
+            # Create reference model if needed and not reference-free
+            reference_model = None
+            if not trainer.reference_free:
+                # For simplicity, we'll use the current model state as reference
+                # In practice, you might want to load a separate reference model
+                reference_model = model_for_training
+                logging.debug(f"[KTO] Using current model as reference (reference_free={trainer.reference_free})")
+        
         # Training loop
         for step in range(steps):
             async with self.lock:
-                if self.using_hf:
+                if is_kto_training:
+                    # KTO training step
+                    batch = {
+                        'input_ids': input_ids,
+                        'attention_mask': torch.ones_like(input_ids),
+                        'labels': labels,
+                        'preference_labels': preference_labels
+                    }
+                    
+                    metrics = trainer.train_step(
+                        model_for_training,
+                        reference_model,
+                        batch,
+                        optimizer
+                    )
+                    
+                    loss_value = metrics['loss']
+                    logging.debug(f"        [KTO] {adapter} step={step:3d}  loss={loss_value:.4f}")
+                    if 'chosen_rewards' in metrics:
+                        logging.debug(f"        [KTO] chosen_rewards={metrics['chosen_rewards']:.4f}")
+                    if 'rejected_rewards' in metrics:
+                        logging.debug(f"        [KTO] rejected_rewards={metrics['rejected_rewards']:.4f}")
+                        
+                elif self.using_hf:
+                    # Standard HF training
                     self.hf_model.train()
                     optimizer.zero_grad()
                     torch.cuda.reset_peak_memory_stats()
@@ -617,6 +680,7 @@ class OnlineLLM:
                     loss.backward()
                     optimizer.step()
                 else:
+                    # Standard custom training
                     self.llm.train()
                     optimizer.zero_grad()
                     torch.cuda.reset_peak_memory_stats()
@@ -626,7 +690,8 @@ class OnlineLLM:
                     optimizer.step()
 
             if step == 0 or step == steps - 1 or step % 10 == 0:
-                logging.debug(f"        [fine_tune] {lora_adapter} step={step:3d}  loss={loss.item():.4f}")
+                if not is_kto_training:  # KTO logging is handled above
+                    logging.debug(f"        [fine_tune] {adapter} step={step:3d}  loss={loss.item():.4f}")
 
             if step == 0:
                 step_t0 = time.perf_counter()
@@ -647,7 +712,7 @@ class OnlineLLM:
                         if "lora_" in n or p.requires_grad
                     }
                     avg_norm = sum(norms.values()) / len(norms) if norms else 0.0
-                    logging.debug(f"        [fine_tune] {lora_adapter} average LoRA param norm={avg_norm:.4f}")
+                    logging.debug(f"        [fine_tune] {adapter} average LoRA param norm={avg_norm:.4f}")
             else:
                 self.llm.eval()
                 with torch.no_grad():
@@ -657,72 +722,16 @@ class OnlineLLM:
                         if "lora_" in n
                     }
                     avg_norm = sum(norms.values()) / len(norms) if norms else 0.0
-                    logging.debug(f"        [fine_tune] {lora_adapter} average LoRA param norm={avg_norm:.4f}")
+                    logging.debug(f"        [fine_tune] {adapter} average LoRA param norm={avg_norm:.4f}")
 
         total_ft_ms = (time.perf_counter() - t_ft_start) * 1000
         logging.debug(f"[metric] fine_tune_total_ms={total_ft_ms:.2f}")
         return optimizer.state_dict()
 
-    async def learn_async(
-        self,
-        prompt: str,
-        response: str,
-        lora_adapter: str = "default",
-        steps: int = 3,
-        lr: float = 1e-4,
-        images: Optional[List[Any]] = None,  # Support multiple images
-    ):
-        """Asynchronously learn from a single prompt-response pair."""
-        # Wait for any existing training task for this adapter
-        if lora_adapter in self.training_tasks:
-            await self.training_tasks.pop(lora_adapter)
 
-        # Load existing state for this adapter
-        async with self.lock:
-            if lora_adapter in self.lora_states:
-                self.load_lora_state(self.lora_states[lora_adapter])
-
-        # Run fine-tuning
-        example = {"prompt": prompt, "response": response}
-        if images is not None and len(images) > 0:
-            example["images"] = images
-        examples = [example]
-        is_moe_model = "MoE" in self.model_path
-        opt_state = await self.fine_tune(examples, lora_adapter, steps, lr, is_moe_model)
-
-        # Save updated states
-        async with self.lock:
-            self.lora_states[lora_adapter] = self.get_lora_state()
-            self.opt_states[lora_adapter] = opt_state
-
-    async def generate_async(
-        self,
-        prompt: str,
-        lora_adapter: Optional[str] = None,
-        sampling_params: Optional[SamplingParams] = None,
-        images: Optional[List[Any]] = None,  # Support multiple images
-    ) -> str:
-        """Asynchronously generate text from a prompt."""
-        images_list = [images] if images is not None else None
-        results = await self.stream_generate([prompt], sampling_params, lora_adapter, images_list)
-        return results[0]
-
-    async def stream_async(
-        self,
-        prompt: str,
-        lora_adapter: Optional[str] = None,
-        sampling_params: Optional[SamplingParams] = None,
-    ) -> Generator[str, None, None]:
-        """Asynchronously stream text generation."""
-        # This is a simplified streaming implementation
-        # In practice, you'd want to yield tokens as they're generated
-        result = await self.generate_async(prompt, lora_adapter, sampling_params)
-        for char in result:
-            yield char
-            await asyncio.sleep(0.01)  # Small delay for streaming effect
 
     # Synchronous wrapper methods for backward compatibility
-    def generate(self, prompt: str, lora_adapter: Optional[str] = None) -> str:
+    def generate(self, prompt: str, adapter: Optional[str] = None) -> str:
         """Generate text from a prompt (synchronous wrapper)."""
         try:
             asyncio.get_running_loop()
@@ -735,62 +744,100 @@ class OnlineLLM:
             if "async context" in str(e):
                 raise e
             # No event loop running, safe to use asyncio.run()
-            return asyncio.run(self.generate_async(prompt, lora_adapter))
+            return asyncio.run(self.generate_async(prompt, adapter))
 
-    def stream(self, prompt: str, lora_adapter: Optional[str] = None) -> Generator[str, None, None]:
+    def stream(self, prompt: str, adapter: Optional[str] = None) -> Generator[str, None, None]:
         """Stream text generation (synchronous wrapper)."""
-        result = self.generate(prompt, lora_adapter)
+        result = self.generate(prompt, adapter)
         for char in result:
             yield char
 
-    def learn(self, prompt: str, response: str, lora_adapter: str = "default"):
-        """Learn from a prompt-response pair (synchronous wrapper)."""
+    def learn(self, msgs: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]], adapter: str = "default", trainer: Optional[Any] = None) -> None:
+        """Learn from conversation messages (positive/desirable examples) (synchronous wrapper)."""
         try:
             asyncio.get_running_loop()
             # If we're in an async context, raise an error with helpful message
             raise RuntimeError(
                 "Cannot use sync learn() method from within async context. "
-                "Use learn_async() instead."
+                "Use AsyncOnlineLLM.learn() instead."
             )
         except RuntimeError as e:
             if "async context" in str(e):
                 raise e
-            # No event loop running, safe to use asyncio.run()
-            asyncio.run(self.learn_async(prompt, response, lora_adapter))
+            # No event loop running, create temp async instance
+            async_instance = AsyncOnlineLLM(
+                model=self.model_path,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                lora_rank=self.lora_rank,
+                lora_alpha=self.lora_alpha,
+                offload_lora_to_cpu=self.offload_lora_to_cpu,
+                use_adam8bit=self.use_adam8bit,
+                engine=self.engine if hasattr(self, 'engine') else None
+            )
+            # Copy state
+            async_instance.lora_states = self.lora_states.copy()
+            async_instance.opt_states = self.opt_states.copy()
+            
+            async def _run_learn():
+                await async_instance.learn(msgs, adapter, trainer=trainer)
+                # Copy state back
+                self.lora_states.update(async_instance.lora_states)
+                self.opt_states.update(async_instance.opt_states)
+            
+            asyncio.run(_run_learn())
+    
+    def unlearn(self, msgs: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]], adapter: str = "default", trainer: Optional[Any] = None) -> None:
+        """Unlearn from conversation messages (negative/undesirable examples) (synchronous wrapper)."""
+        try:
+            asyncio.get_running_loop()
+            # If we're in an async context, raise an error with helpful message
+            raise RuntimeError(
+                "Cannot use sync unlearn() method from within async context. "
+                "Use AsyncOnlineLLM.unlearn() instead."
+            )
+        except RuntimeError as e:
+            if "async context" in str(e):
+                raise e
+            # No event loop running, create temp async instance
+            async_instance = AsyncOnlineLLM(
+                model=self.model_path,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                lora_rank=self.lora_rank,
+                lora_alpha=self.lora_alpha,
+                offload_lora_to_cpu=self.offload_lora_to_cpu,
+                use_adam8bit=self.use_adam8bit,
+                engine=self.engine if hasattr(self, 'engine') else None
+            )
+            # Copy state
+            async_instance.lora_states = self.lora_states.copy()
+            async_instance.opt_states = self.opt_states.copy()
+            
+            async def _run_unlearn():
+                await async_instance.unlearn(msgs, adapter, trainer=trainer)
+                # Copy state back
+                self.lora_states.update(async_instance.lora_states)
+                self.opt_states.update(async_instance.opt_states)
+            
+            asyncio.run(_run_unlearn())
 
-    def chat(self, msgs: List[Dict[str, Any]], lora_adapter: Optional[str] = None) -> str:
+
+
+    def chat(self, msgs: List[Dict[str, Any]], adapter: Optional[str] = None) -> str:
         """Chat with the model using a list of messages."""
         # Convert messages to a single prompt (simplified)
         prompt = self._messages_to_prompt(msgs)
-        return self.generate(prompt, lora_adapter)
+        return self.generate(prompt, adapter)
 
-    async def chat_async(self, msgs: List[Dict[str, Any]], lora_adapter: Optional[str] = None) -> str:
-        """Chat with the model using a list of messages (async version)."""
-        # Convert messages to a single prompt (simplified)
-        prompt = self._messages_to_prompt(msgs)
-        return await self.generate_async(prompt, lora_adapter)
 
-    def chat_stream(self, msgs: List[Dict[str, Any]], lora_adapter: Optional[str] = None) -> Generator[str, None, None]:
+
+    def chat_stream(self, msgs: List[Dict[str, Any]], adapter: Optional[str] = None) -> Generator[str, None, None]:
         """Stream chat with the model using a list of messages."""
         prompt = self._messages_to_prompt(msgs)
-        return self.stream(prompt, lora_adapter)
+        return self.stream(prompt, adapter)
 
-    def learn_chat(self, msgs: List[Dict[str, Any]], lora_adapter: str = "default"):
-        """Learn from a conversation (simplified implementation)."""
-        # Extract the last user message and assistant response
-        if len(msgs) >= 2:
-            user_msg = None
-            assistant_msg = None
-            for msg in reversed(msgs):
-                if msg.get("role") == "assistant" and assistant_msg is None:
-                    assistant_msg = msg.get("content", "")
-                elif msg.get("role") == "user" and user_msg is None:
-                    user_msg = msg.get("content", "")
-                if user_msg and assistant_msg:
-                    break
-            
-            if user_msg and assistant_msg:
-                self.learn(user_msg, assistant_msg, lora_adapter)
+
 
     def _messages_to_prompt(self, msgs: List[Dict[str, Any]]) -> str:
         """Convert a list of messages to a single prompt string."""
@@ -811,24 +858,385 @@ class OnlineLLM:
         """List all available LoRA adapters."""
         return list(self.lora_states.keys())
 
-    def delete_adapter(self, lora_adapter: str):
+    def set_thinking_mode(self, enabled: bool) -> None:
+        """Enable or disable thinking mode for supported models (Qwen3)."""
+        self.thinking_mode = enabled
+        if self.using_hf and hasattr(self.hf_model, 'enable_thinking'):
+            self.hf_model.enable_thinking = enabled
+
+    def get_thinking_mode(self) -> bool:
+        """Get current thinking mode status."""
+        if self.using_hf and hasattr(self.hf_model, 'enable_thinking'):
+            return self.hf_model.enable_thinking
+        return self.thinking_mode
+
+    def delete_adapter(self, adapter: str) -> None:
         """Delete a LoRA adapter and its associated states."""
-        if lora_adapter in self.lora_states:
-            del self.lora_states[lora_adapter]
-        if lora_adapter in self.opt_states:
-            del self.opt_states[lora_adapter]
-        if lora_adapter in self.training_tasks:
+        if adapter in self.lora_states:
+            del self.lora_states[adapter]
+        if adapter in self.opt_states:
+            del self.opt_states[adapter]
+        if adapter in self.training_tasks:
             # Cancel the task if it's still running
-            task = self.training_tasks.pop(lora_adapter)
+            task = self.training_tasks.pop(adapter)
             if not task.done():
                 task.cancel()
 
-    async def wait_for_training(self, lora_adapter: Optional[str] = None):
+    async def wait_for_training(self, adapter: Optional[str] = None) -> None:
         """Wait for training tasks to complete."""
-        if lora_adapter:
-            if lora_adapter in self.training_tasks:
-                await self.training_tasks[lora_adapter]
+        if adapter:
+            if adapter in self.training_tasks:
+                await self.training_tasks[adapter]
         else:
             # Wait for all training tasks
             if self.training_tasks:
                 await asyncio.gather(*self.training_tasks.values())
+
+
+class AsyncOnlineLLM(OnlineLLM):
+    """
+    Async version of OnlineLLM with batch learning capabilities for KTO training.
+    
+    This class extends OnlineLLM with async methods and proper batch handling
+    for KTO training which requires batch sizes >= 4.
+    """
+    
+    def __init__(self, *args: Any, train_every: int = 10, default_trainer: Optional[Any] = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Batch accumulation for KTO training
+        self.pending_learn_examples: Dict[str, List[Dict]] = {}
+        self.pending_unlearn_examples: Dict[str, List[Dict]] = {}
+        self.min_batch_size = 4  # KTO requirement
+        self.train_every = train_every  # Train every N examples
+        self.example_counts: Dict[str, int] = {}  # Track total examples per adapter
+        self.default_trainer = default_trainer  # Default trainer to use if none specified
+    
+
+    
+    def _should_train(self, adapter: str) -> bool:
+        """Check if we should trigger training based on train_every threshold."""
+        total_examples = self.example_counts.get(adapter, 0)
+        return total_examples > 0 and total_examples % self.train_every == 0
+    
+    def _extract_prompt_response_from_conversation(self, conversation: List[Dict[str, Any]]) -> tuple[str, str]:
+        """Extract prompt and response from a conversation in OpenAI format."""
+        if len(conversation) < 2:
+            raise ValueError("Conversation must have at least 2 messages (user and assistant)")
+        
+        # Find the last user message and subsequent assistant message
+        prompt_content = ""
+        response_content = ""
+        
+        # Simple approach: concatenate all user messages as prompt, last assistant message as response
+        user_messages = []
+        assistant_messages = []
+        
+        for msg in conversation:
+            if msg.get("role") == "user":
+                user_messages.append(msg.get("content", ""))
+            elif msg.get("role") == "assistant":
+                assistant_messages.append(msg.get("content", ""))
+        
+        if not user_messages:
+            raise ValueError("Conversation must contain at least one user message")
+        if not assistant_messages:
+            raise ValueError("Conversation must contain at least one assistant message")
+        
+        # Use the full conversation as context, but for training we'll focus on the last exchange
+        prompt_content = " ".join(user_messages)
+        response_content = assistant_messages[-1]  # Use the last assistant response
+        
+        return prompt_content, response_content
+    
+    async def learn(
+        self,
+        msgs: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]],  # Single conversation or list of conversations
+        adapter: str = "default",
+        steps: int = 3,
+        lr: float = 1e-4,
+        trainer: Optional[Any] = None,
+    ) -> None:
+        """Learn from conversation messages (positive/desirable examples).
+        
+        Args:
+            msgs: Either a single conversation (list of messages) or multiple conversations (list of list of messages).
+                  Each message should be in OpenAI format: {"role": "user/assistant", "content": "..."}
+            adapter: LoRA adapter name
+            steps: Training steps
+            lr: Learning rate  
+            trainer: Optional trainer (e.g., KTOTrainer). If None, uses default_trainer.
+        
+        Examples:
+            # Single conversation
+            await llm.learn([
+                {"role": "user", "content": "What is water?"},
+                {"role": "assistant", "content": "Water is H2O."}
+            ])
+            
+            # Multiple conversations
+            await llm.learn([
+                [{"role": "user", "content": "What is water?"}, {"role": "assistant", "content": "Water is H2O."}],
+                [{"role": "user", "content": "What is fire?"}, {"role": "assistant", "content": "Fire is combustion."}]
+            ])
+        """
+        # Use default trainer if none provided
+        if trainer is None:
+            trainer = self.default_trainer
+            
+        # Normalize input to list of conversations
+        if isinstance(msgs[0], dict):
+            # Single conversation (list of messages)
+            conversations = [msgs]
+        else:
+            # Multiple conversations (list of list of messages)
+            conversations = msgs
+        
+        # Process each conversation
+        processed_examples = []
+        for conversation in conversations:
+            # Extract prompt and response from conversation
+            prompt_content, response_content = self._extract_prompt_response_from_conversation(conversation)
+            
+            example = {
+                "prompt": prompt_content,
+                "response": response_content,
+                "conversation": conversation,
+                "desirable": 1  # Learn method always treats examples as desirable
+            }
+            processed_examples.append(example)
+        
+        # For KTO training, accumulate examples and train based on train_every
+        if trainer is not None and KTO_AVAILABLE and isinstance(trainer, KTOTrainer):
+            # Add to pending learn examples (always desirable)
+            if adapter not in self.pending_learn_examples:
+                self.pending_learn_examples[adapter] = []
+            self.pending_learn_examples[adapter].extend(processed_examples)
+            
+            # Update example count
+            self.example_counts[adapter] = self.example_counts.get(adapter, 0) + len(processed_examples)
+            
+            # Check if we should train now
+            if self._should_train(adapter):
+                await self._train_accumulated_examples(adapter, steps, lr, trainer)
+            return
+        
+        # For non-KTO training, train immediately
+        await self._train_batch(processed_examples, adapter, steps, lr, trainer)
+    
+    async def unlearn(
+        self,
+        msgs: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]],  # Single conversation or list of conversations
+        adapter: str = "default",
+        steps: int = 3,
+        lr: float = 1e-4,
+        trainer: Optional[Any] = None,
+    ) -> None:
+        """Unlearn from conversation messages (negative/undesirable examples).
+        
+        Args:
+            msgs: Either a single conversation (list of messages) or multiple conversations (list of list of messages).
+                  Each message should be in OpenAI format: {"role": "user/assistant", "content": "..."}
+            adapter: LoRA adapter name
+            steps: Training steps
+            lr: Learning rate  
+            trainer: Optional trainer (e.g., KTOTrainer). If None, uses default_trainer.
+        
+        Examples:
+            # Single conversation
+            await llm.unlearn([
+                {"role": "user", "content": "What is water?"},
+                {"role": "assistant", "content": "Water is mud."}  # Wrong answer to discourage
+            ])
+            
+            # Multiple conversations
+            await llm.unlearn([
+                [{"role": "user", "content": "What is water?"}, {"role": "assistant", "content": "Water is mud."}],
+                [{"role": "user", "content": "What is fire?"}, {"role": "assistant", "content": "Fire is ice."}]
+            ])
+        """
+        # Use default trainer if none provided
+        if trainer is None:
+            trainer = self.default_trainer
+            
+        # Normalize input to list of conversations
+        if isinstance(msgs[0], dict):
+            # Single conversation (list of messages)
+            conversations = [msgs]
+        else:
+            # Multiple conversations (list of list of messages)
+            conversations = msgs
+        
+        # Process each conversation
+        processed_examples = []
+        for conversation in conversations:
+            # Extract prompt and response from conversation
+            prompt_content, response_content = self._extract_prompt_response_from_conversation(conversation)
+            
+            example = {
+                "prompt": prompt_content,
+                "response": response_content,
+                "conversation": conversation,
+                "desirable": 0  # Unlearn method always treats examples as undesirable
+            }
+            processed_examples.append(example)
+        
+        # For KTO training, accumulate examples and train based on train_every
+        if trainer is not None and KTO_AVAILABLE and isinstance(trainer, KTOTrainer):
+            # Add to pending unlearn examples (always undesirable)
+            if adapter not in self.pending_unlearn_examples:
+                self.pending_unlearn_examples[adapter] = []
+            self.pending_unlearn_examples[adapter].extend(processed_examples)
+            
+            # Update example count
+            self.example_counts[adapter] = self.example_counts.get(adapter, 0) + len(processed_examples)
+            
+            # Check if we should train now
+            if self._should_train(adapter):
+                await self._train_accumulated_examples(adapter, steps, lr, trainer)
+            return
+        
+        # For non-KTO training, train immediately
+        await self._train_batch(processed_examples, adapter, steps, lr, trainer)
+    
+
+    
+    
+    
+    async def _train_accumulated_examples(
+        self, 
+        adapter: str, 
+        steps: int, 
+        lr: float, 
+        trainer: Optional[Any]
+    ) -> None:
+        """Train on all accumulated examples for the given adapter."""
+        pending_learn = self.pending_learn_examples.get(adapter, [])
+        pending_unlearn = self.pending_unlearn_examples.get(adapter, [])
+        
+        if pending_learn or pending_unlearn:
+            all_examples = pending_learn + pending_unlearn
+            
+            # Ensure minimum batch size for KTO
+            if trainer is not None and KTO_AVAILABLE and isinstance(trainer, KTOTrainer):
+                if len(all_examples) < self.min_batch_size:
+                    logging.debug(f"Accumulated {len(all_examples)} examples for {adapter}, "
+                                f"waiting for minimum batch size of {self.min_batch_size}")
+                    return
+            
+            logging.info(f"Training on {len(all_examples)} accumulated examples for {adapter} "
+                        f"({len(pending_learn)} learn, {len(pending_unlearn)} unlearn)")
+            
+            await self._train_batch(all_examples, adapter, steps, lr, trainer)
+            
+            # Clear accumulated examples after training
+            self.pending_learn_examples[adapter] = []
+            self.pending_unlearn_examples[adapter] = []
+
+    async def flush_pending_examples(self, adapter: str, trainer: Optional[Any] = None) -> None:
+        """Force training on any pending examples for the given adapter."""
+        pending_learn = self.pending_learn_examples.get(adapter, [])
+        pending_unlearn = self.pending_unlearn_examples.get(adapter, [])
+        
+        if pending_learn or pending_unlearn:
+            all_examples = pending_learn + pending_unlearn
+            if len(all_examples) >= 2:  # Relaxed minimum for flushing
+                await self._train_batch(all_examples, adapter, steps=3, lr=1e-4, trainer=trainer)
+                self.pending_learn_examples[adapter] = []
+                self.pending_unlearn_examples[adapter] = []
+                logging.info(f"Flushed {len(all_examples)} pending examples for {adapter}")
+    
+    async def _train_batch(
+        self,
+        examples: List[Dict[str, Union[str, Any]]],
+        adapter: str,
+        steps: int,
+        lr: float,
+        trainer: Optional[Any],
+    ) -> None:
+        """Internal method to train on a batch of examples."""
+        # Wait for any existing training task for this adapter
+        if adapter in self.training_tasks:
+            await self.training_tasks.pop(adapter)
+
+        # Load existing state for this adapter
+        async with self.lock:
+            if adapter in self.lora_states:
+                self.load_lora_state(self.lora_states[adapter])
+
+        # Run fine-tuning
+        is_moe_model = "MoE" in self.model_path
+        opt_state = await self.fine_tune(examples, adapter, steps, lr, is_moe_model, trainer)
+
+        # Save updated states
+        async with self.lock:
+            self.lora_states[adapter] = self.get_lora_state()
+            self.opt_states[adapter] = opt_state
+    
+
+    
+    async def generate(
+        self,
+        prompt: str,
+        adapter: Optional[str] = None,
+        sampling_params: Optional[SamplingParams] = None,
+        images: Optional[List[Any]] = None,  # Support multiple images
+    ) -> str:
+        """Generate text from a prompt."""
+        images_list = [images] if images is not None else None
+        results = await self.stream_generate([prompt], sampling_params, adapter, images_list)
+        return results[0]
+
+    async def stream(
+        self,
+        prompt: str,
+        adapter: Optional[str] = None,
+        sampling_params: Optional[SamplingParams] = None,
+    ) -> AsyncGenerator[str, None]:
+        """Stream text generation."""
+        if sampling_params is None:
+            sampling_params = self.default_sampling_params
+
+        # Load the appropriate LoRA adapter if specified
+        if adapter and adapter in self.lora_states:
+            async with self.lock:
+                self.load_lora_state(self.lora_states[adapter])
+
+        if self.using_hf:
+            # For HuggingFace, we don't have true streaming yet, so simulate it
+            # by generating and then streaming character by character
+            result = await self.generate(prompt, adapter, sampling_params)
+            for char in result:
+                yield char
+                await asyncio.sleep(0.01)  # Small delay for streaming effect
+        else:
+            # For custom implementation, do real token-by-token streaming
+            from dark.engine.sequence import Sequence
+            
+            seq = Sequence(self.tokenizer.encode(prompt), sampling_params)
+            
+            async with self.lock:
+                self.llm.eval()
+                self.llm.scheduler.add(seq)
+
+            emitted = 0
+            
+            while not seq.is_finished:
+                async with self.lock:
+                    self.llm.eval()
+                    with torch.cuda.stream(self.infer_stream):
+                        self.llm.step()
+                
+                # Emit new tokens as they're generated
+                while seq.num_completion_tokens > emitted:
+                    tid = seq.completion_token_ids[emitted]
+                    token_text = self.tokenizer.decode([tid], skip_special_tokens=True)
+                    yield token_text
+                    emitted += 1
+                
+                await asyncio.sleep(0)  # Yield to other async tasks
+
+    async def chat(self, msgs: List[Dict[str, Any]], adapter: Optional[str] = None) -> str:
+        """Chat with the model using a list of messages."""
+        # Convert messages to a single prompt (simplified)
+        prompt = self._messages_to_prompt(msgs)
+        return await self.generate(prompt, adapter)

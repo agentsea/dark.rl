@@ -10,6 +10,9 @@ from dark.online_llm import OnlineLLM
 from dark.sampling_params import SamplingParams
 
 MAX_STEPS = 10  # Define the maximum number of steps
+BASE_TEMPERATURE = 0.1  # Base temperature
+MAX_TEMPERATURE = 1.0   # Maximum temperature
+TEMPERATURE_INCREMENT = 0.2  # How much to increase temperature per repetition
 
 mcp_config = {
   "mcpServers": {
@@ -32,7 +35,7 @@ class Action(BaseModel):
     action: str
     parameters: dict
 
-def act_ctx(task: str, tool_descriptions: list, history: str = "") -> str:
+def act_ctx(task: str, tool_descriptions: list) -> str:
 
     # The output of the action will be returned in the following format:
     # <response>I have navigated to the flights page</response>
@@ -42,16 +45,19 @@ Please help complete the task '{task}' with the available tools: {tool_descripti
 
 For example if the task was to "Find a flight to Paris" you would output something like this depending on the state:
 
-    <action>{{
+    <tool_call>{{
         "action": "browser_navigate",
         "parameters": {{
             "url": "https://flights.google.com"
         }}
-    }}</action>
+    }}</tool_call>
 
 When the task is complete, return the `end` action, but not till you are absolutely sure!
 
 Please now review the history of actions and responses and output a new action.
+Please survey the environment before taking an action. Use the tools available to you to survey the environment.
+Please think before acting but don't think too long, bias towards action and observation when in doubt.
+BEGIN:
     """
     return act_context
 
@@ -65,16 +71,17 @@ Please help complete the task '{task}' with the available tools: {tool_descripti
 
 For example if the task was to "Find a flight to Paris" you would output something like this depending on the state:
 
-    <action>{{
+    <tool_call>{{
         "action": "browser_navigate",
         "parameters": {{
             "url": "https://flights.google.com"
         }}
-    }}</action>
+    }}</tool_call>
 
 When the task is complete, return the `end` action, but not till you are absolutely sure!
 
 Please now review the history of actions and responses and output a new action.
+Please survey the environment before taking an action. Use the tools available to you to survey the environment.
     """
     return act_context
 
@@ -165,7 +172,7 @@ async def main():
     
     # Load the LLM model (logging is now handled by logging.debug)
     print("Loading LLM model...")
-    llm = OnlineLLM(model="Qwen/Qwen3-8B", temperature=0.2, max_tokens=3000, architecture="hf")
+    llm = OnlineLLM(model="Qwen/Qwen3-8B", temperature=0.2, max_tokens=10000, engine="hf", thinking_mode=False)
     print("✓ LLM model loaded successfully!")
 
     try:
@@ -174,32 +181,39 @@ async def main():
             print(f"Expected output: {task['expected_output']}\n")
 
             history = ""  # Initialize history for each task
+            previous_actions = []  # Track previous actions for repetition detection
+            current_temperature = BASE_TEMPERATURE  # Current temperature for this task
 
+            ctx = act_ctx(task['description'], tool_descriptions)
             for step in range(MAX_STEPS):
-                input("Press Enter to continue")
+                input("\nPress Enter to continue to the next step")
                 print(f"\nStep {step}")
-                ctx = act_ctx(task['description'], tool_descriptions, history)
                 
-                # Create sampling params with shorter generation
+                # Create sampling params with dynamic temperature
                 sampling_params = SamplingParams(
-                    temperature=0.1,
-                    max_tokens=500,
+                    temperature=current_temperature,
+                    max_tokens=3000,  # Reduced from 5000 for faster generation
                     n=1,
-                    presence_penalty=0.0,
+                    presence_penalty=0.1,  # Slight penalty to avoid repetition
                     ignore_eos=False
                 )
                 
+                print(f"Using temperature: {current_temperature}")
+                
                 try:
-                    # Generate the response
-                    print(f"Context: {ctx}\n")
-                    print("Generating response...")
-                    act_response = await llm.generate_async(ctx, sampling_params=sampling_params)
-                    print(f"Response: {act_response}")
+                    # Stream the response
+                    print(f"\n====Context====\n {ctx}\n=====END CONTEXT====\n")
+                    act_response = ""
+                    print("Response: ", end="", flush=True)
+                    async for chunk in llm.stream_async(ctx, sampling_params=sampling_params):
+                        print(chunk, end="", flush=True)
+                        act_response += chunk
+                    print()  # New line after streaming
                     
                     # Extract action from response
-                    if "<action>" in act_response and "</action>" in act_response:
-                        action_start = act_response.find("<action>") + 8
-                        action_end = act_response.find("</action>")
+                    if "<tool_call>" in act_response and "</tool_call>" in act_response:
+                        action_start = act_response.find("<tool_call>") + 8
+                        action_end = act_response.find("</tool_call>")
                         action_str = act_response[action_start:action_end].strip()
                     else:
                         print("No valid action found in response")
@@ -208,9 +222,30 @@ async def main():
                     
                     action_dict = json_repair.loads(action_str)
                     print(f"Action: {action_dict}")
+                    
+                    # Check for action repetition and adjust temperature
+                    action_signature = (action_dict.get('action'), str(action_dict.get('parameters', {})))
+                    
+                    if action_signature in previous_actions:
+                        # Action is repeated, increase temperature
+                        current_temperature = min(current_temperature + TEMPERATURE_INCREMENT, MAX_TEMPERATURE)
+                        print(f"🔄 Action repetition detected! Increasing temperature to {current_temperature}")
+                    else:
+                        # New action, reset temperature to base
+                        if current_temperature > BASE_TEMPERATURE:
+                            print(f"✅ New action detected! Resetting temperature to {BASE_TEMPERATURE}")
+                        current_temperature = BASE_TEMPERATURE
+                    
+                    # Add current action to history (keep last 3 actions to detect patterns)
+                    previous_actions.append(action_signature)
+                    if len(previous_actions) > 3:
+                        previous_actions.pop(0)
+                    
                 except Exception as e:
                     print(f"Error parsing response: {e}")
                     continue
+
+                ctx += act_response
 
                 action = Action.model_validate(action_dict)
                 if action.action == "end":
@@ -220,45 +255,60 @@ async def main():
                 # Take mcp action
                 print(f"Taking action: {action.action} with parameters: {action.parameters}")
                 try:
-                    response = await session.connector.call_tool(action.action, action.parameters)
-                    print(f"Tool response: {response}")
+                    tool_response = await session.connector.call_tool(action.action, action.parameters)
+                    print(f"Tool response: {tool_response}")
+                    print("Type of tool response: ", type(tool_response))
+                    print("Tool response content: ", tool_response.content)
+                    tool_response_json = tool_response.model_dump_json()
                 except Exception as e:
                     print(f"Error taking action: {e}")
                     continue
 
+                ctx += f"<response>{tool_response_json}</response>"
+
                 print("Action taken")
-                print(f"Response: {response}")
+                print(f"Response: {tool_response}")
 
                 # Update history with the current step
-                history += f"Step {step}: Action: {action_dict}, Response: {response}\n"
+                history += f"Step {step}: Action: {action_dict}, Response: {tool_response}\n"
 
-                verify_prompt = verify_context(task['description'], history, str(action_dict), str(response))
+                verify_prompt = verify_context(task['description'], history, str(action_dict), tool_response_json)
                 outcome = await llm.generate_async(verify_prompt)
-                print(f"Outcome: {outcome}")
+                print(f"\nVerifier response: {outcome}")
 
                 comment = None
+                print("")
                 feedback = input("Press 'a' to approve, 'r' to reject, 'c' to comment, 's' to skip: ")
+
                 if feedback == 'a':
-                    print("Approved")
+                    print("User approved the action")
                     print(f"Learning: {ctx} -> \n{act_response}")
                     await llm.learn_async(ctx, act_response)
 
                 elif feedback == 'r':
-                    print("Rejected")
+                    print("User rejected the action")
+                    comment = input("Why did it fail? ")
+                    print(f"Comment: {comment}")
+                    critique_prompt = critique_context(task['description'], history, str(action_dict), tool_response_json)
+
+                    print(f"Learning: {critique_prompt} -> \n{comment}")
+                    await llm.learn_async(critique_prompt, comment)
+                    ctx += f"<comment>{comment}</comment>"
 
                 elif feedback == 'c':
                     comment = input("Enter your comment: ")
                     print(f"Comment: {comment}")
-                    critique_prompt = critique_context(task['description'], history, str(action_dict), str(response))
+                    critique_prompt = critique_context(task['description'], history, str(action_dict), tool_response_json)
 
                     print(f"Learning: {critique_prompt} -> \n{comment}")
                     await llm.learn_async(critique_prompt, comment)
+                    ctx += f"<comment>{comment}</comment>"
 
                 elif feedback == 's':
-                    print("Skipping")
+                    print("User skipped the action")
 
                 else:
-                    print("Invalid feedback")
+                    print("Invalid feedback, please try again")
     
     finally:
         # Clean up sessions

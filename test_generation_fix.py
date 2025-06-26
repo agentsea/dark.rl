@@ -14,12 +14,12 @@ async def test_basic_generation():
         from src.dark.online_llm import OnlineLLM
         
         # Test with a simple Qwen3 model
-        print("🔄 Loading Qwen3-8B with HF architecture...")
+        print("🔄 Loading Qwen3-8B with HF engine...")
         llm = OnlineLLM(
             model="Qwen/Qwen3-8B",
             temperature=0.7,
             max_tokens=20,  # Keep it short for quick testing
-            architecture="hf"
+            engine="hf"
         )
         
         print("✅ Model loaded successfully")
@@ -50,12 +50,12 @@ async def test_custom_generation():
         from src.dark.online_llm import OnlineLLM
         
         # Test with custom Dark implementation
-        print("🔄 Loading Qwen3-8B with Dark architecture...")
+        print("🔄 Loading Qwen3-8B with Dark engine...")
         llm = OnlineLLM(
             model="Qwen/Qwen3-8B",
             temperature=0.7,
             max_tokens=20,
-            architecture="dark"
+            engine="dark"
         )
         
         print("✅ Model loaded successfully")

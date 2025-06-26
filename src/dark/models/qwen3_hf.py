@@ -50,7 +50,7 @@ class Qwen3HFForCausalLM:
     with OnlineLLM interface while using standard HF transformers.
     """
     
-    def __init__(self, config: Config, lora_rank=0, lora_alpha=1.0):
+    def __init__(self, config: Config, lora_rank=0, lora_alpha=1.0, thinking_mode=True):
         self.config = config.hf_config
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
@@ -93,7 +93,7 @@ class Qwen3HFForCausalLM:
         self.current_adapter = None
         
         # Thinking mode settings
-        self.enable_thinking = True
+        self.enable_thinking = thinking_mode
         self.thinking_token_start = "<think>"
         self.thinking_token_end = "</think>"
     
@@ -250,6 +250,10 @@ class Qwen3HFForCausalLM:
         
         return outputs
     
+    def __call__(self, *args, **kwargs):
+        """Make the model callable like a standard PyTorch model"""
+        return self.forward(*args, **kwargs)
+    
     def freeze_base_model(self):
         """Freeze base model parameters (keep LoRA trainable)"""
         if hasattr(self.model, 'base_model'):
@@ -309,6 +313,6 @@ class Qwen3HFForCausalLM:
         return next(self.model.parameters()).device
 
 
-def create_qwen3_hf_model(config: Config, lora_rank=0, lora_alpha=1.0) -> Qwen3HFForCausalLM:
+def create_qwen3_hf_model(config: Config, lora_rank=0, lora_alpha=1.0, thinking_mode=True) -> Qwen3HFForCausalLM:
     """Factory function to create Qwen3 HF model"""
-    return Qwen3HFForCausalLM(config, lora_rank=lora_rank, lora_alpha=lora_alpha) 
+    return Qwen3HFForCausalLM(config, lora_rank=lora_rank, lora_alpha=lora_alpha, thinking_mode=thinking_mode) 

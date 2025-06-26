@@ -311,14 +311,39 @@ class OnlineLLM:
         prompt: str,
         lora_adapter: Optional[str] = None,
         sampling_params: Optional[SamplingParams] = None,
-    ) -> Generator[str, None, None]:
+    ):
         """Asynchronously stream text generation."""
-        # This is a simplified streaming implementation
-        # In practice, you'd want to yield tokens as they're generated
-        result = await self.generate_async(prompt, lora_adapter, sampling_params)
-        for char in result:
-            yield char
-            await asyncio.sleep(0.01)  # Small delay for streaming effect
+        if sampling_params is None:
+            sampling_params = self.default_sampling_params
+
+        # Load the appropriate LoRA adapter if specified
+        if lora_adapter and lora_adapter in self.lora_states:
+            async with self.lock:
+                self.load_lora_state(self.lora_states[lora_adapter])
+
+        # For this copy file version, use custom implementation streaming
+        seq = Sequence(self.tokenizer.encode(prompt), sampling_params)
+        
+        async with self.lock:
+            self.llm.eval()
+            self.llm.scheduler.add(seq)
+
+        emitted = 0
+        
+        while not seq.is_finished:
+            async with self.lock:
+                self.llm.eval()
+                with torch.cuda.stream(self.infer_stream):
+                    self.llm.step()
+            
+            # Emit new tokens as they're generated
+            while seq.num_completion_tokens > emitted:
+                tid = seq.completion_token_ids[emitted]
+                token_text = self.tokenizer.decode([tid], skip_special_tokens=True)
+                yield token_text
+                emitted += 1
+            
+            await asyncio.sleep(0)  # Yield to other async tasks
 
     # Synchronous wrapper methods for backward compatibility
     def generate(self, prompt: str, lora_adapter: Optional[str] = None) -> str:

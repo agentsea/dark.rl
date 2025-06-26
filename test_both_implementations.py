@@ -401,7 +401,7 @@ async def test_qwen3_hf_text_only():
         model="Qwen/Qwen3-8B",  # Use Qwen3 text model
         temperature=0.6,  # Qwen3 thinking mode recommended temperature
         max_tokens=100,
-        architecture="hf",  # Use HF implementation
+                    engine="hf",  # Use HF implementation
     )
     metrics.model_load_time = time.time() - load_start
     
@@ -546,7 +546,7 @@ async def test_qwen3_text_only():
         model="Qwen/Qwen3-8B",  # Use Qwen3 text model (no VL)
         temperature=0.7,
         max_tokens=50,
-        architecture="dark",  # Use custom Dark implementation
+                    engine="dark",  # Use custom Dark implementation
     )
     metrics.model_load_time = time.time() - load_start
     
@@ -668,7 +668,7 @@ async def test_qwen3_moe():
         model="Qwen/Qwen3-MoE-15B-A2B",
         temperature=0.7,
         max_tokens=100,
-        architecture="dark",  # Use our custom MoE implementation
+                    engine="dark",  # Use our custom MoE implementation
         lora_rank=8,
         lora_alpha=32
     )

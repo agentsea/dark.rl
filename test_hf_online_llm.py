@@ -19,7 +19,7 @@ async def test_hf_online_llm():
         model="Qwen/Qwen2.5-VL-7B-Instruct",
         temperature=0.7,
         max_tokens=50,
-        architecture="hf",  # Use HF implementation
+        engine="hf",  # Use HF implementation
         attn_implementation="flash_attention_2",  # Use Flash Attention 2 for speed
         lora_rank=8,
         lora_alpha=32
@@ -87,22 +87,22 @@ def test_hf_vs_custom_comparison():
     print("\n⚖️ Comparing HF vs Custom implementations...")
     
     # Test with HF implementation
-    print("Testing with HF implementation...")
+    print("Testing with HF engine...")
     llm_hf = OnlineLLM(
         model="Qwen/Qwen2.5-VL-7B-Instruct",
         temperature=0.0,  # Deterministic
         max_tokens=20,
-        architecture="hf"
+        engine="hf"
     )
     
     # Test with custom implementation (if available)
     try:
-        print("Testing with custom implementation...")
+        print("Testing with custom engine...")
         llm_custom = OnlineLLM(
             model="Qwen/Qwen2.5-VL-7B-Instruct", 
             temperature=0.0,  # Deterministic
             max_tokens=20,
-            architecture="dark"
+            engine="dark"
         )
         print("✅ Both implementations loaded successfully")
         
