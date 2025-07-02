@@ -3,11 +3,13 @@ import os
 import json
 import json_repair
 from pydantic import BaseModel
+from dataclasses import dataclass
+from typing import Optional, List
+from datetime import datetime
 
 from mcp_use import MCPClient
-from dataclasses import dataclass
 
-from dark.online_llm import AsyncOnlineLLM, BatchConfig  # Updated to AsyncOnlineLLM with BatchConfig
+from dark.online_llm import AsyncOnlineLLM, BatchConfig
 from dark.sampling_params import SamplingParams
 
 # Rich imports for beautiful terminal output
@@ -25,65 +27,47 @@ from rich import box
 # Initialize Rich console
 console = Console()
 
-MAX_STEPS = 10  # Define the maximum number of steps
-BASE_TEMPERATURE = 0.1  # Base temperature
-MAX_TEMPERATURE = 1.0   # Maximum temperature
-TEMPERATURE_INCREMENT = 0.2  # How much to increase temperature per repetition
+MAX_STEPS = 15  # Increased for web interactions
+BASE_TEMPERATURE = 0.1
+MAX_TEMPERATURE = 1.0
+TEMPERATURE_INCREMENT = 0.2
 
-# Optimized learning parameters based on our testing
-OPTIMAL_LEARNING_STEPS = 10  # Optimal: 10 steps for strong memorization
-OPTIMAL_LEARNING_RATE = 1e-4  # Optimal learning rate
-OPTIMAL_LORA_RANK = 16  # Increased rank for better learning capacity
-OPTIMAL_LORA_ALPHA = 64  # Increased alpha for stronger LoRA scaling
+# Optimized learning parameters
+OPTIMAL_LEARNING_STEPS = 10
+OPTIMAL_LEARNING_RATE = 1e-4
+OPTIMAL_LORA_RANK = 16
+OPTIMAL_LORA_ALPHA = 64
 
+# MCP Configuration for Playwright
 mcp_config = {
-  "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-filesystem",
-        "./bench/fs/numbers/"
-      ]
-    },
-    "scratchpad-tool": {
-      "command": "npx",
-      "args": ["-y", "scratchpad-tool"]
+    "mcpServers": {
+        "playwright": {
+            "command": "npx",
+            "args": [
+                "@playwright/mcp@latest"
+            ]
+        }
     }
-  }
 }
 
 class Action(BaseModel):
     action: str
     parameters: dict
 
+
+
 def act_ctx(task: str, tool_descriptions: list) -> str:
+    """Create action context for web automation with thinking"""
+    act_context = f"""Task: {task}
 
-    # The output of the action will be returned in the following format:
-    # <response>I have navigated to the flights page</response>
+Tools: browser_navigate, browser_take_screenshot, browser_click, browser_type
 
-    act_context = f"""You are operating a file system helping accomplish tasks.
-Please help complete the task '{task}' with the available tools: {tool_descriptions}
+Think first, then act. Format:
+<think>Reasoning about what to do...</think>
+<action_call>{{"action": "tool_name", "parameters": {{}}}}</action_call>
 
-For example if the task was to "Find a flight to Paris" you would output something like this depending on the state:
-
-    <tool_call>{{
-        "action": "browser_navigate",
-        "parameters": {{
-            "url": "https://flights.google.com"
-        }}
-    }}</tool_call>
-
-When the task is complete, return the `end` action, but not till you are absolutely sure!
-
-Please now review the history of actions and responses and output a new action.
-Please survey the environment before taking an action. Use the tools available to you to survey the environment.
-Please think before acting but don't think too long, bias towards action and observation when in doubt.
-Please notice the <comment> tags in the response as they are input from the user on how you did on the previous actions.
-DO NOT REPEAT TOOL CALLS.
-ACTION HISTORY:
-
-    """
+Next action:
+<think>"""
     return act_context
 
 def verify_context(task: str, history: str, action: str, response: str):
@@ -108,21 +92,41 @@ def critique_context(task: str, history: str, action: str, response: str):
     """
     return critique_prompt
 
+# Define some sample web automation tasks
 tasks = [
-    {"description": "Add all the numbers on line 5 in every even numbered file", "expected_output": "4"}, # 2, 1, 1
-    {"description": "Add all the numbers on line 6 in every odd numbered file", "expected_output": "18"}, # 9, 4, 5
-    {"description": "Add all the numbers on line 7 in every file", "expected_output": "19"}, # 7, 0, 4, 0, 5, 3
-    {"description": "Multiply all the numbers on line 2 in every file", "expected_output": "39"}, # 10, 8, 6, 1, 6, 8
-    {"description": "Multiply all the numbers on line 3 in every file", "expected_output": "36"}, # 11, 5, 4, 1, 6, 9
-    {"description": "Multiply all the numbers on line 4 in every file then subtract line 5 in file 2", "expected_output": "15"}, # 3, 1, 8, 1, 4, 0 - 2
+    {
+        "description": "Navigate to Google and search for 'Playwright automation'", 
+        "expected_output": "Successfully performed search and reached results page"
+    },
+    {
+        "description": "Navigate to GitHub homepage and find the search bar", 
+        "expected_output": "Located and identified the search functionality"
+    },
+    {
+        "description": "Go to a news website and take screenshots of the main headlines", 
+        "expected_output": "Captured visual content of news headlines"
+    },
+    {
+        "description": "Navigate to a shopping site and locate product categories", 
+        "expected_output": "Identified navigation and product organization"
+    }
 ]
 
+
+
 async def main():
+    console.print(Panel(
+        "[bold blue]🎭 Playwright + Qwen VL Training Session[/bold blue]\n\n"
+        "This session will train the model on web automation tasks using MCP integration.",
+        title="🚀 Welcome",
+        border_style="blue"
+    ))
+    
     # Create MCP Client 
     client = MCPClient.from_dict(mcp_config)
     
-    # Create the session (this is the key step that was missing!)
-    session = await client.create_session("filesystem")
+    # Create the session with Playwright MCP server
+    session = await client.create_session("playwright")
     
     # Get available tools from the session
     try:
@@ -130,8 +134,8 @@ async def main():
         if not session.connector.is_connected:
             await session.connect()
         
-        # Get tools using the MCP-use API - tools are on the connector
-        tools = await session.connector.list_tools()  # This returns list[Tool] directly
+        # Get tools using the MCP-use API
+        tools = await session.connector.list_tools()
         available_tools = []
         tool_descriptions = []
         
@@ -156,7 +160,7 @@ async def main():
             tool_descriptions.append(tool_desc)
         
         # Display tools in a beautiful table
-        tools_table = Table(title="🛠️  Available MCP Tools", box=box.ROUNDED)
+        tools_table = Table(title="🛠️  Available Playwright MCP Tools", box=box.ROUNDED)
         tools_table.add_column("Tool Name", style="blue", no_wrap=True)
         tools_table.add_column("Description", style="white")
         tools_table.add_column("Parameters", style="green")
@@ -191,16 +195,15 @@ async def main():
         
         # Fallback tools
         console.print("[blue]Using fallback tools...[/blue]")
-        available_tools = ["read_file", "write_file", "list_directory"]  # fallback
+        available_tools = ["navigate", "click", "screenshot"]
         tool_descriptions = [
-            "read_file: Read the contents of a file - Parameters: *path(string)",
-            "write_file: Write content to a file - Parameters: *path(string), *content(string)", 
-            "list_directory: List files in a directory - Parameters: *path(string)"
+            "navigate: Navigate to a URL - Parameters: *url(string)",
+            "click: Click on an element - Parameters: *selector(string)", 
+            "screenshot: Take a screenshot - Parameters: description(string)"
         ]
     
-    # Load the LLM model with optimized parameters for better learning
-    with console.status("[bold green]Loading LLM model with optimized learning parameters...") as status:
-        # Configure batch processing for efficient learning
+    # Load the Qwen VL model
+    with console.status("[bold green]Loading Qwen VL 2.5 model...") as status:
         batch_config = BatchConfig(
             max_batch_size=4,
             auto_batch_size=True,
@@ -208,78 +211,72 @@ async def main():
             min_batch_size=1
         )
 
-        model_name = "Qwen/Qwen3-8B"
+        model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
         
         llm = AsyncOnlineLLM(
             model=model_name, 
             temperature=0.2, 
-            max_tokens=500,  # Reduced from 10000 - should be enough for tool calls
-            engine="hf",  # Use dark engine for better control and performance
-            lora_rank=OPTIMAL_LORA_RANK,  # Optimized for strong learning
-            lora_alpha=OPTIMAL_LORA_ALPHA,  # Optimized for strong learning
+            max_tokens=150,  # Increased for thinking + action content
+            engine="hf",
+            lora_rank=OPTIMAL_LORA_RANK,
+            lora_alpha=OPTIMAL_LORA_ALPHA,
             batch_config=batch_config,
-            train_every=3,  # Train after accumulating 3 examples
-            use_adam8bit=True,  # Enable 8-bit Adam for memory efficiency
-            thinking_mode=False,  # Explicitly disable thinking mode
+            train_every=3,
+            use_adam8bit=True,
+            thinking_mode=False,
         )
     
-    # Display model configuration in a nice panel
+    # Display model configuration
     config_text = f"""
-    🤖 **Model**: {model_name}
+    🤖 **Model**: {model_name} (Vision-Language)
     🎛️  **Engine**: hf (HuggingFace)
-    🌡️  **Temperature**: 0.2
-    📝 **Max Tokens**: 500
+    🌡️  **Temperature**: 0.2 (min 0.15 to avoid sticking)
+    📝 **Max Tokens**: 150 (thinking + action content)
     
     **LoRA Configuration:**
     • Rank: {OPTIMAL_LORA_RANK}
     • Alpha: {OPTIMAL_LORA_ALPHA}
     
-    **Training Parameters:**
-    • Steps: {OPTIMAL_LEARNING_STEPS}
-    • Learning Rate: {OPTIMAL_LEARNING_RATE}
-    • Train Every: 3 examples
-    • Adam 8-bit: Enabled
-    
-    **Batch Processing:**
-    • Max Batch Size: {batch_config.max_batch_size}
-    • Auto Batch Size: {batch_config.auto_batch_size}
-    • Memory Threshold: {batch_config.memory_threshold}
+    **Web Automation:**
+    • MCP Integration: Enabled
+    • EOS Issue: FIXED! (guided format avoids completion trap)
+    • Format: <think> + <action_call> (reasoning before acting)
+    • Early Stopping: Stops immediately on complete </action_call>
+    • Thinking Display: Shows model's reasoning process
+    • Extraction: Separates thinking and action content
     """
     
     console.print(Panel(
         Markdown(config_text),
-        title="✅ LLM Model Loaded Successfully",
+        title="✅ Qwen VL Model Loaded Successfully",
         border_style="green",
         expand=False
     ))
 
     try:
-        # Accumulate learning examples for batch training
-        positive_examples = []  # For approved actions
-        negative_examples = []  # For rejected/commented actions
+        positive_examples = []
+        negative_examples = []
         
         for task_idx, task in enumerate(tasks, 1):
-            # Display task information in a prominent panel
+            # Display task information
             task_panel = Panel(
                 f"[bold white]{task['description']}[/bold white]\n\n"
-                f"[dim]Expected Output:[/dim] [blue]{task['expected_output']}[/blue]",
-                title=f"📋 Task {task_idx}/{len(tasks)}",
+                f"[dim]Expected Outcome:[/dim] [blue]{task['expected_output']}[/blue]",
+                title=f"📋 Web Automation Task {task_idx}/{len(tasks)}",
                 border_style="blue",
                 expand=False
             )
             console.print(task_panel)
 
-            history = ""  # Initialize history for each task
-            previous_actions = []  # Track previous actions for repetition detection
-            current_temperature = BASE_TEMPERATURE  # Current temperature for this task
-
+            history = ""
+            previous_actions = []
+            current_temperature = BASE_TEMPERATURE
+            
             ctx = act_ctx(task['description'], tool_descriptions)
             
             for step in range(MAX_STEPS):
-                # Use Rich prompt instead of input()
                 Prompt.ask("\n[dim]Press Enter to continue to the next step[/dim]", default="")
                 
-                # Display current step information
                 step_info = Panel(
                     f"[bold white]Step {step + 1}[/bold white] of [bold white]{MAX_STEPS}[/bold white]\n"
                     f"Temperature: [blue]{current_temperature}[/blue]",
@@ -287,16 +284,15 @@ async def main():
                     border_style="blue"
                 )
                 console.print(step_info)
-                    
-                # Create sampling params with dynamic temperature for more focused responses
+                
                 sampling_params = SamplingParams(
-                    temperature=current_temperature,
-                    max_tokens=200,  # Reduced from 3000 - tool calls should be concise
+                    temperature=max(current_temperature, 0.15),  # Minimum temp to avoid getting stuck
+                    max_tokens=150,  # Increased for thinking + action content
                     n=1,
-                    presence_penalty=0.2,  # Increased to reduce repetition and verbosity
-                    ignore_eos=False
+                    presence_penalty=0.2,  # Higher penalty to stop after action_call
+                    ignore_eos=False  # RESPECT EOS tokens - model knows when to stop!
                 )
-            
+                
                 try:
                     # Display context in a collapsible panel
                     console.print(Panel(
@@ -306,32 +302,72 @@ async def main():
                         expand=False
                     ))
                     
-                    # Stream the response with Rich formatting
+                    console.print("[bold blue]🤖 Qwen VL Response:[/bold blue]")
+                    
+                    # Stream response naturally - stop immediately on complete action_call
                     act_response = ""
-                    console.print("[bold blue]🤖 LLM Response:[/bold blue]")
+                    chunk_count = 0
+                    async for chunk in llm.stream(ctx, sampling_params=sampling_params):
+                        act_response += chunk
+                        chunk_count += 1
+                        
+                        # Print each chunk immediately for real-time feedback
+                        console.print(f"[dim]Chunk {chunk_count}:[/dim] {repr(chunk)}")
+                        
+                        # Stop immediately when we have a complete action_call
+                        if "</action_call>" in act_response:
+                            console.print("[green]✅ Complete action_call detected - stopping generation[/green]")
+                            break
+                        
+                        # Safety limit for thinking + action content
+                        if chunk_count > 60:
+                            console.print("[yellow]Safety limit reached - model may be stuck[/yellow]")
+                            break
                     
-                    with Live(console=console, refresh_per_second=10) as live:
-                        response_text = Text()
-                        async for chunk in llm.stream(ctx, sampling_params=sampling_params):
-                            response_text.append(chunk)
-                            act_response += chunk
-                            live.update(Panel(response_text, title="Response", border_style="blue"))
+                    # Display final complete response
+                    console.print(Panel(
+                        act_response,
+                        title=f"Complete Response ({len(act_response)} chars)",
+                        border_style="blue"
+                    ))
                     
-                    console.print()  # New line after streaming
-                
-                    # Extract action from response
-                    if "<tool_call>" in act_response and "</tool_call>" in act_response:
-                        action_start = act_response.find("<tool_call>") + 8
-                        action_end = act_response.find("</tool_call>")
+                    # Extract thinking and action from response
+                    thinking_content = ""
+                    action_str = ""
+                    
+                    if "</think>" in act_response and "<action_call>" in act_response and "</action_call>" in act_response:
+                        # Extract thinking content (everything before </think>)
+                        think_end = act_response.find("</think>")
+                        thinking_content = act_response[:think_end].strip()
+                        
+                        # Extract action content (between <action_call> and </action_call>)
+                        action_start = act_response.find("<action_call>") + 13
+                        action_end = act_response.find("</action_call>")
                         action_str = act_response[action_start:action_end].strip()
-                    else:
+                        
+                        # Display the thinking process
+                        console.print(Panel(
+                            thinking_content,
+                            title="🧠 Model's Thinking Process",
+                            border_style="cyan"
+                        ))
+                        
+                    elif "</action_call>" in act_response:
+                        # Fallback: old format without thinking
+                        action_end = act_response.find("</action_call>")
+                        action_str = act_response[:action_end].strip()
+                        
+                    if not action_str:
                         console.print("[red]❌ No valid action found in response[/red]")
-                        ctx += f"<response>No valid action found in response, are you sure you output a valid tool call? Check again</response>"
+                        console.print("[yellow]Expected format: <think>reasoning</think><action_call>{\"action\": \"tool_name\", \"parameters\": {...}}</action_call>[/yellow]")
+                        # Don't accumulate errors - reset context to avoid confusion
+                        ctx = act_ctx(task['description'], tool_descriptions)  
+                        # Don't add example here - the new format includes the prompt
                         continue
                     
                     action_dict = json_repair.loads(action_str)
                     
-                    # Display parsed action in a nice format
+                    # Display parsed action
                     action_table = Table(title="🎯 Parsed Action", box=box.SIMPLE)
                     action_table.add_column("Field", style="blue")
                     action_table.add_column("Value", style="white")
@@ -341,20 +377,17 @@ async def main():
                     action_table.add_row("Parameters", params_str)
                     console.print(action_table)
                     
-                    # Check for action repetition and adjust temperature
+                    # Check for repetition and adjust temperature
                     action_signature = (action_dict.get('action'), str(action_dict.get('parameters', {})))
                     
                     if action_signature in previous_actions:
-                        # Action is repeated, increase temperature
                         current_temperature = min(current_temperature + TEMPERATURE_INCREMENT, MAX_TEMPERATURE)
-                        console.print(f"[blue]🔄 Action repetition detected! Increasing temperature to {current_temperature}[/blue]")
+                        console.print(f"[blue]🔄 Repetition detected! Temperature → {current_temperature}[/blue]")
                     else:
-                        # New action, reset temperature to base
                         if current_temperature > BASE_TEMPERATURE:
-                            console.print(f"[green]✅ New action detected! Resetting temperature to {BASE_TEMPERATURE}[/green]")
+                            console.print(f"[green]✅ New action! Temperature → {BASE_TEMPERATURE}[/green]")
                         current_temperature = BASE_TEMPERATURE
                     
-                    # Add current action to history (keep last 3 actions to detect patterns)
                     previous_actions.append(action_signature)
                     if len(previous_actions) > 3:
                         previous_actions.pop(0)
@@ -421,7 +454,7 @@ async def main():
                     with console.status("[bold green]Learning from approved action..."):
                         await llm.learn(
                             [{"role": "user", "content": ctx}, {"role": "assistant", "content": act_response}],
-                            adapter="task_learning",
+                            adapter="web_automation",
                             steps=OPTIMAL_LEARNING_STEPS,
                             lr=OPTIMAL_LEARNING_RATE
                         )
@@ -455,7 +488,7 @@ async def main():
                     console.print("[red]Invalid feedback, please try again[/red]")
                 
                 llm.stats()
-        
+
         # Final batch learning for improved efficiency
         console.print("\n" + "=" * 60)
         console.print(Panel(
@@ -471,7 +504,7 @@ async def main():
         adapters = llm.list_adapters()
         if len(adapters) > 1:
             console.print(f"\n[bold blue]⚖️  Comparing {len(adapters)} trained adapters...[/bold blue]")
-            test_prompt = "Given a complex task, what should be your first step?"
+            test_prompt = "Given a complex web automation task, what should be your first step?"
             
             with console.status("[bold blue]Running adapter comparison..."):
                 comparison_results = await llm.parallel_adapter_generate(
@@ -496,7 +529,8 @@ async def main():
             f"🎉 **Training Session Completed Successfully!**\n\n"
             f"📈 Final Adapters: [blue]{', '.join(llm.list_adapters())}[/blue]\n"
             f"📊 Total Tasks Completed: [green]{len(tasks)}[/green]\n"
-            f"🧠 Learning Examples: [blue]{len(positive_examples) + len(negative_examples)}[/blue]",
+            f"🧠 Learning Examples: [blue]{len(positive_examples) + len(negative_examples)}[/blue]\n"
+            f"🎭 Web Automation: MCP Playwright Integration",
             title="✨ SUCCESS",
             border_style="green"
         )
@@ -507,7 +541,4 @@ async def main():
         await client.close_all_sessions()
 
 if __name__ == "__main__":
-    asyncio.run(main())
-        
-
-
+    asyncio.run(main()) 

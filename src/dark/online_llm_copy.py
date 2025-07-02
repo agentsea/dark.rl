@@ -121,7 +121,7 @@ class OnlineLLM:
         dt_ms = (time.perf_counter() - t0) * 1000
         print(f"[metric] lora_load_ms={dt_ms:.2f}")
 
-    async def stream_generate(
+    async def batch_generate(
         self,
         prompts: List[str],
         sampling_params: Optional[SamplingParams] = None,
@@ -177,6 +177,22 @@ class OnlineLLM:
             f"generate_per_token_ms={per_tok:.2f}"
         )
         return outs
+
+    # Backward compatibility alias (deprecated)
+    async def stream_generate(self, *args, **kwargs) -> List[str]:
+        """Deprecated: Use batch_generate() instead.
+        
+        This method has been renamed to batch_generate() to better reflect that it
+        generates complete responses rather than streaming them.
+        """
+        import warnings
+        warnings.warn(
+            "stream_generate() is deprecated and will be removed in a future version. "
+            "Use batch_generate() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        return await self.batch_generate(*args, **kwargs)
 
     async def fine_tune(
         self,
@@ -303,7 +319,7 @@ class OnlineLLM:
         sampling_params: Optional[SamplingParams] = None,
     ) -> str:
         """Asynchronously generate text from a prompt."""
-        results = await self.stream_generate([prompt], sampling_params, lora_adapter)
+        results = await self.batch_generate([prompt], sampling_params, lora_adapter)
         return results[0]
 
     async def stream_async(

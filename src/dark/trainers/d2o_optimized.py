@@ -243,7 +243,7 @@ class OptimizedD2OTrainer:
                 
                 # Generate all at once with timeout
                 responses = await asyncio.wait_for(
-                    online_llm.stream_generate(all_prompts_repeated, sampling_params),
+                    online_llm.batch_generate(all_prompts_repeated, sampling_params),
                     timeout=60.0
                 )
                 

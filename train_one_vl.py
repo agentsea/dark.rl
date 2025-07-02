@@ -58,32 +58,16 @@ class Action(BaseModel):
     parameters: dict
 
 def act_ctx(task: str, tool_descriptions: list) -> str:
+    # Ultra-clean prompt optimized for Qwen2.5-VL-7B  
+    act_context = f"""Task: {task}
 
-    # The output of the action will be returned in the following format:
-    # <response>I have navigated to the flights page</response>
+Tools: list_directory, read_file, read_multiple_files
 
-    act_context = f"""You are operating a file system helping accomplish tasks.
-Please help complete the task '{task}' with the available tools: {tool_descriptions}
+Output ONE action only:
+<action_call>{{"action": "list_directory", "parameters": {{"path": "/home/ubuntu/dark.rl/bench/fs/numbers"}}}}</action_call>
 
-For example if the task was to "Find a flight to Paris" you would output something like this depending on the state:
-
-    <tool_call>{{
-        "action": "browser_navigate",
-        "parameters": {{
-            "url": "https://flights.google.com"
-        }}
-    }}</tool_call>
-
-When the task is complete, return the `end` action, but not till you are absolutely sure!
-
-Please now review the history of actions and responses and output a new action.
-Please survey the environment before taking an action. Use the tools available to you to survey the environment.
-Please think before acting but don't think too long, bias towards action and observation when in doubt.
-Please notice the <comment> tags in the response as they are input from the user on how you did on the previous actions.
-DO NOT REPEAT TOOL CALLS.
-ACTION HISTORY:
-
-    """
+History:
+"""
     return act_context
 
 def verify_context(task: str, history: str, action: str, response: str):
@@ -208,12 +192,13 @@ async def main():
             min_batch_size=1
         )
 
-        model_name = "Qwen/Qwen3-8B"
+        # model_name = "Qwen/Qwen3-8B"
+        model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
         
         llm = AsyncOnlineLLM(
             model=model_name, 
             temperature=0.2, 
-            max_tokens=500,  # Reduced from 10000 - should be enough for tool calls
+            max_tokens=150,  # Enough for complete actions
             engine="hf",  # Use dark engine for better control and performance
             lora_rank=OPTIMAL_LORA_RANK,  # Optimized for strong learning
             lora_alpha=OPTIMAL_LORA_ALPHA,  # Optimized for strong learning
@@ -228,7 +213,7 @@ async def main():
     🤖 **Model**: {model_name}
     🎛️  **Engine**: hf (HuggingFace)
     🌡️  **Temperature**: 0.2
-    📝 **Max Tokens**: 500
+    📝 **Max Tokens**: 150
     
     **LoRA Configuration:**
     • Rank: {OPTIMAL_LORA_RANK}
@@ -291,10 +276,10 @@ async def main():
                 # Create sampling params with dynamic temperature for more focused responses
                 sampling_params = SamplingParams(
                     temperature=current_temperature,
-                    max_tokens=200,  # Reduced from 3000 - tool calls should be concise
+                    max_tokens=200,  # Enough for a complete action
                     n=1,
-                    presence_penalty=0.2,  # Increased to reduce repetition and verbosity
-                    ignore_eos=False
+                    presence_penalty=0.1,  # Reduce repetition but not too much
+                    ignore_eos=False  # RESPECT EOS tokens - model knows when to stop!
                 )
             
                 try:
@@ -306,27 +291,40 @@ async def main():
                         expand=False
                     ))
                     
-                    # Stream the response with Rich formatting
+                    # Stream the response with clearer formatting
                     act_response = ""
                     console.print("[bold blue]🤖 LLM Response:[/bold blue]")
                     
-                    with Live(console=console, refresh_per_second=10) as live:
-                        response_text = Text()
-                        async for chunk in llm.stream(ctx, sampling_params=sampling_params):
-                            response_text.append(chunk)
-                            act_response += chunk
-                            live.update(Panel(response_text, title="Response", border_style="blue"))
+                    # Stream response naturally - let model stop with EOS tokens
+                    chunk_count = 0
+                    async for chunk in llm.stream(ctx, sampling_params=sampling_params):
+                        act_response += chunk
+                        chunk_count += 1
+                        
+                        # Print each chunk immediately for real-time feedback
+                        console.print(f"[dim]Chunk {chunk_count}:[/dim] {repr(chunk)}")
+                        
+                        # Minimal safety limit - model should stop naturally
+                        if chunk_count > 150:  
+                            console.print("[yellow]Safety limit reached - model may be stuck[/yellow]")
+                            break
                     
-                    console.print()  # New line after streaming
+                    # Display final complete response
+                    console.print(Panel(
+                        act_response,
+                        title=f"Complete Response ({len(act_response)} chars)",
+                        border_style="blue"
+                    ))
                 
                     # Extract action from response
-                    if "<tool_call>" in act_response and "</tool_call>" in act_response:
-                        action_start = act_response.find("<tool_call>") + 8
-                        action_end = act_response.find("</tool_call>")
+                    if "<action_call>" in act_response and "</action_call>" in act_response:
+                        action_start = act_response.find("<action_call>") + 13
+                        action_end = act_response.find("</action_call>")
                         action_str = act_response[action_start:action_end].strip()
                     else:
                         console.print("[red]❌ No valid action found in response[/red]")
-                        ctx += f"<response>No valid action found in response, are you sure you output a valid tool call? Check again</response>"
+                        console.print("[yellow]Expected format: <action_call>{\"action\": \"tool_name\", \"parameters\": {...}}</action_call>[/yellow]")
+                        ctx += f"\n<response>ERROR: Use exactly this format: <action_call>{{\"action\": \"list_directory\", \"parameters\": {{\"path\": \"/home/ubuntu/dark.rl/bench/fs/numbers\"}}}}</action_call></response>\n"
                         continue
                     
                     action_dict = json_repair.loads(action_str)
