@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from mcp_use import MCPClient
 from dataclasses import dataclass
 
-from dark.online_llm import AsyncOnlineLLM, BatchConfig  # Updated to AsyncOnlineLLM with BatchConfig
+from dark.online_llm import AsyncOnlineLLM, BatchConfig
 from dark.sampling_params import SamplingParams
 
 # Rich imports for beautiful terminal output

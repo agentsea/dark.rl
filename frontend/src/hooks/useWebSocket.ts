@@ -34,9 +34,26 @@ export interface MCPServerRequest {
     query?: string
 }
 
+export interface MCPServerActionsRequest {
+    type: 'get_mcp_server_actions'
+    server_ids: string[]
+}
+
 export interface MCPServerResponse {
     type: 'mcp_servers_response'
     servers: MCPServer[]
+}
+
+export interface MCPServerActionsResponse {
+    type: 'mcp_server_actions_response'
+    server_id: string
+    actions: MCPServerAction[]
+}
+
+export interface MCPServerAction {
+    name: string
+    description: string
+    parameters?: Record<string, any>
 }
 
 export enum ConnectionStatus {
@@ -67,10 +84,13 @@ export default function useWebSocket({
     const [isStreaming, setIsStreaming] = useState(false)
     const [mcpServers, setMcpServers] = useState<MCPServer[]>([])
     const [loadingMcpServers, setLoadingMcpServers] = useState(false)
+    const [mcpServerActions, setMcpServerActions] = useState<Record<string, MCPServerAction[]>>({})
+    const [loadingMcpServerActions, setLoadingMcpServerActions] = useState(false)
 
     const wsRef = useRef<WebSocket | null>(null)
     const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
     const reconnectCountRef = useRef(0)
+    const currentResponseRef = useRef('')
 
     const connect = useCallback(() => {
         if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -91,7 +111,6 @@ export default function useWebSocket({
 
             wsRef.current.onmessage = (event) => {
                 try {
-                    console.log('Received WebSocket message:', event.data)
                     const data = JSON.parse(event.data)
 
                     // Handle MCP server response
@@ -102,29 +121,53 @@ export default function useWebSocket({
                         return
                     }
 
+                    // Handle MCP server actions response
+                    if (data.type === 'mcp_server_actions_response') {
+                        const actionsResponse = data as MCPServerActionsResponse
+                        setMcpServerActions(prev => ({
+                            ...prev,
+                            [actionsResponse.server_id]: actionsResponse.actions
+                        }))
+                        setLoadingMcpServerActions(false)
+                        return
+                    }
+
                     // Handle streaming response
                     const streamData = data as StreamResponse
                     if (streamData.choices && streamData.choices[0]) {
                         const choice = streamData.choices[0]
 
                         if (choice.delta?.content) {
-                            console.log('Adding content chunk:', choice.delta.content)
-                            setCurrentResponse(prev => prev + choice.delta.content)
+                            currentResponseRef.current += choice.delta.content
+                            setCurrentResponse(currentResponseRef.current)
                             setIsStreaming(true)
                         }
 
                         if (choice.finish_reason === 'stop' || choice.finish_reason === 'length') {
                             console.log('Stream finished, finalizing message')
+
+                            // Add any final content chunk
+                            if (choice.delta?.content) {
+                                currentResponseRef.current += choice.delta.content
+                                setCurrentResponse(currentResponseRef.current)
+                            }
+
+                            // End streaming
                             setIsStreaming(false)
+
+                            // Add the final message to history
                             setMessages(prev => [
                                 ...prev,
                                 {
                                     role: 'assistant',
-                                    content: currentResponse + (choice.delta?.content || ''),
+                                    content: currentResponseRef.current,
                                     timestamp: Date.now()
                                 }
                             ])
-                            setCurrentResponse('')
+
+                            // Clear the response and reset for next message
+                            currentResponseRef.current = ''
+                            // Keep currentResponse visible until user continues conversation
                         }
                     }
                 } catch (error) {
@@ -157,7 +200,7 @@ export default function useWebSocket({
             setConnectionStatus(ConnectionStatus.ERROR)
             console.error('Failed to create WebSocket connection:', error)
         }
-    }, [url, reconnectAttempts, reconnectInterval, currentResponse])
+    }, [url, reconnectAttempts, reconnectInterval])
 
     const disconnect = useCallback(() => {
         if (reconnectTimeoutRef.current) {
@@ -174,9 +217,9 @@ export default function useWebSocket({
         reconnectCountRef.current = 0
     }, [])
 
-    const sendMessage = useCallback((content: string, model = 'default') => {
-        if (connectionStatus !== ConnectionStatus.CONNECTED || !wsRef.current) {
-            console.error('WebSocket not connected')
+    const sendMessage = useCallback((content: string, model = 'default', customMessages?: Message[], taskId?: string, isAutoResponse = false) => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            console.error('WebSocket not connected for sending message')
             return
         }
 
@@ -186,33 +229,47 @@ export default function useWebSocket({
             timestamp: Date.now()
         }
 
-        // Add user message to chat
-        setMessages(prev => [...prev, userMessage])
+        // Use custom messages if provided, otherwise use stored messages
+        const messagesToSend = customMessages || [...messages, userMessage]
+
+        // Add user message to chat only if not using custom messages
+        if (!customMessages) {
+            setMessages(prev => [...prev, userMessage])
+        }
 
         // Prepare OpenAI-format request
-        const request: OpenAIRequest = {
+        const request: OpenAIRequest & { task_id?: string; auto_response?: boolean } = {
             model,
-            messages: [...messages, userMessage],
+            messages: messagesToSend,
             stream: true,
             max_tokens: 2048,
-            temperature: 0.7
+            temperature: 0.7,
+            ...(taskId && { task_id: taskId }),
+            ...(isAutoResponse && { auto_response: true })
         }
 
         // Send to WebSocket
         wsRef.current.send(JSON.stringify(request))
+        currentResponseRef.current = ''
         setCurrentResponse('')
         setIsStreaming(true)
     }, [connectionStatus, messages])
 
     const clearMessages = useCallback(() => {
         setMessages([])
+        currentResponseRef.current = ''
         setCurrentResponse('')
         setIsStreaming(false)
     }, [])
 
+    const clearCurrentResponse = useCallback(() => {
+        currentResponseRef.current = ''
+        setCurrentResponse('')
+    }, [])
+
     const getMcpServers = useCallback((query = '') => {
-        if (connectionStatus !== ConnectionStatus.CONNECTED || !wsRef.current) {
-            console.error('WebSocket not connected')
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            console.error('WebSocket not connected for MCP server request')
             return
         }
 
@@ -226,6 +283,167 @@ export default function useWebSocket({
         wsRef.current.send(JSON.stringify(request))
     }, [connectionStatus])
 
+    const getMcpServerActions = useCallback((serverIds: string[]) => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            console.error('WebSocket not connected for MCP server actions request')
+            return
+        }
+
+        setLoadingMcpServerActions(true)
+
+        const request: MCPServerActionsRequest = {
+            type: 'get_mcp_server_actions',
+            server_ids: serverIds
+        }
+
+        wsRef.current.send(JSON.stringify(request))
+    }, [connectionStatus])
+
+    const createTask = useCallback(async (prompt: string, model = 'qwen2.5-vl'): Promise<string | null> => {
+        // Wait for connection if it's still connecting
+        let retries = 0
+        const maxRetries = 30 // 3 seconds with 100ms intervals
+
+        while (retries < maxRetries) {
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+                break
+            }
+            if (wsRef.current?.readyState === WebSocket.CLOSED ||
+                wsRef.current?.readyState === WebSocket.CLOSING) {
+                console.error('WebSocket connection failed for task creation')
+                return null
+            }
+            await new Promise(resolve => setTimeout(resolve, 100))
+            retries++
+        }
+
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            console.error('WebSocket not connected for task creation after waiting')
+            return null
+        }
+
+        return new Promise((resolve) => {
+            const request = {
+                type: 'create_task',
+                prompt,
+                model
+            }
+
+            // Set up one-time listener for task creation response
+            const ws = wsRef.current!  // We know it's not null from the check above
+            const originalOnMessage = ws.onmessage
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data)
+
+                    if (data.type === 'task_created') {
+                        // Restore original message handler
+                        if (wsRef.current) {
+                            wsRef.current.onmessage = originalOnMessage
+                        }
+                        resolve(data.task_id)
+                        return
+                    }
+
+                    if (data.type === 'error') {
+                        console.error('Task creation error:', data.error)
+                        if (wsRef.current) {
+                            wsRef.current.onmessage = originalOnMessage
+                        }
+                        resolve(null)
+                        return
+                    }
+
+                    // Pass other messages to original handler
+                    if (originalOnMessage) {
+                        originalOnMessage.call(ws, event)
+                    }
+                } catch (error) {
+                    console.error('Error parsing task creation response:', error)
+                    if (wsRef.current) {
+                        wsRef.current.onmessage = originalOnMessage
+                    }
+                    resolve(null)
+                }
+            }
+
+            ws.send(JSON.stringify(request))
+        })
+    }, [connectionStatus])
+
+    const getTask = useCallback(async (taskId: string): Promise<any> => {
+        // Wait for connection if it's still connecting
+        let retries = 0
+        const maxRetries = 30 // 3 seconds with 100ms intervals
+
+        while (retries < maxRetries) {
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+                break
+            }
+            if (wsRef.current?.readyState === WebSocket.CLOSED ||
+                wsRef.current?.readyState === WebSocket.CLOSING) {
+                console.error('WebSocket connection failed for task retrieval')
+                return null
+            }
+            await new Promise(resolve => setTimeout(resolve, 100))
+            retries++
+        }
+
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            console.error('WebSocket not connected for task retrieval after waiting')
+            return null
+        }
+
+        return new Promise((resolve) => {
+            const request = {
+                type: 'get_task',
+                task_id: taskId
+            }
+
+            // Set up one-time listener for task data response
+            const ws = wsRef.current!
+            const originalOnMessage = ws.onmessage
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data)
+
+                    if (data.type === 'task_data') {
+                        // Restore original message handler
+                        if (wsRef.current) {
+                            wsRef.current.onmessage = originalOnMessage
+                        }
+                        resolve(data)
+                        return
+                    }
+
+                    if (data.type === 'error') {
+                        console.error('Task retrieval error:', data.error)
+                        if (wsRef.current) {
+                            wsRef.current.onmessage = originalOnMessage
+                        }
+                        resolve({ error: data.error })
+                        return
+                    }
+
+                    // Pass other messages to original handler
+                    if (originalOnMessage) {
+                        originalOnMessage.call(ws, event)
+                    }
+                } catch (error) {
+                    console.error('Error parsing task retrieval response:', error)
+                    if (wsRef.current) {
+                        wsRef.current.onmessage = originalOnMessage
+                    }
+                    resolve({ error: 'Failed to parse task data' })
+                }
+            }
+
+            ws.send(JSON.stringify(request))
+        })
+    }, [connectionStatus])
+
     useEffect(() => {
         if (autoConnect) {
             connect()
@@ -236,6 +454,23 @@ export default function useWebSocket({
         }
     }, [autoConnect, connect, disconnect])
 
+    const sendLearningFeedback = useCallback(async (type: string, message: any, taskId: string, userComment?: string): Promise<void> => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            console.error('WebSocket not connected for learning feedback')
+            return
+        }
+
+        const request = {
+            type: 'learning_feedback',
+            feedback_type: type,
+            message: message,
+            task_id: taskId,
+            user_comment: userComment
+        }
+
+        wsRef.current.send(JSON.stringify(request))
+    }, [connectionStatus])
+
     return {
         connectionStatus,
         messages,
@@ -243,10 +478,17 @@ export default function useWebSocket({
         isStreaming,
         mcpServers,
         loadingMcpServers,
+        mcpServerActions,
+        loadingMcpServerActions,
         connect,
         disconnect,
         sendMessage,
         clearMessages,
-        getMcpServers
+        getMcpServers,
+        getMcpServerActions,
+        createTask,
+        getTask,
+        clearCurrentResponse,
+        sendLearningFeedback
     }
 } 

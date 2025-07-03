@@ -1543,17 +1543,177 @@ class OnlineLLM:
         prompt = self._messages_to_prompt(msgs)
         return self.generate(prompt, adapter)
 
-    def chat_stream(self, msgs: List[Dict[str, Any]], adapter: Optional[str] = None) -> Generator[str, None, None]:
+    def chat_stream(self, msgs: List[Dict[str, Any]], adapter: Optional[str] = None, sampling_params: Optional[SamplingParams] = None) -> Generator[str, None, None]:
         """Stream chat with the model using a list of messages."""
+        # Check if this is a Qwen2.5-VL model with vision inputs
+        is_qwen_vl = "VL" in self.model_path and "2.5" in self.model_path
+        has_vision_content = any(
+            isinstance(msg.get("content"), list) and 
+            any(item.get("type") == "image" for item in msg.get("content", []) if isinstance(item, dict))
+            for msg in msgs
+        )
+        
+        if is_qwen_vl and self.using_hf and has_vision_content and hasattr(self.hf_model, 'processor'):
+            # Handle vision inputs with proper processing
+            try:
+                from qwen_vl_utils import process_vision_info
+                
+                # Add anti-hallucination system message if not present
+                has_system = any(msg.get('role') == 'system' for msg in msgs)
+                formatted_msgs = []
+                
+                if not has_system:
+                    formatted_msgs.append({
+                        "role": "system", 
+                        "content": "You are a helpful assistant. Answer questions directly and concisely."
+                    })
+                
+                # Add all messages with proper content formatting
+                for msg in msgs:
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    
+                    if role in ['system', 'user', 'assistant']:
+                        if isinstance(content, str):
+                            formatted_content = [{"type": "text", "text": content}]
+                        elif isinstance(content, list):
+                            formatted_content = content
+                        else:
+                            formatted_content = [{"type": "text", "text": str(content)}]
+                        
+                        formatted_msgs.append({
+                            "role": role,
+                            "content": formatted_content
+                        })
+                
+                # Apply chat template
+                text = self.hf_model.processor.apply_chat_template(
+                    formatted_msgs, tokenize=False, add_generation_prompt=True
+                )
+                
+                # Extract vision inputs
+                image_inputs, video_inputs = process_vision_info(formatted_msgs)
+                
+                # Process inputs
+                inputs = self.hf_model.processor(
+                    text=[text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                inputs = {k: v.to(self.hf_model.device) for k, v in inputs.items()}
+                
+                # Load adapter if specified
+                if adapter:
+                    adapter_found = self.ensure_lora_adapter(adapter)
+                    if adapter_found:
+                        self.load_lora_state(self.lora_states[adapter])
+                
+                # Generate with streaming
+                from transformers import TextIteratorStreamer
+                import threading
+                
+                # Use sampling params if provided, otherwise use defaults
+                if sampling_params is None:
+                    sampling_params = self.default_sampling_params
+                
+                streamer = TextIteratorStreamer(self.tokenizer, skip_special_tokens=True)
+                generation_kwargs = {
+                    **inputs,
+                    "max_new_tokens": sampling_params.max_tokens,
+                    "do_sample": sampling_params.temperature > 0,
+                    "temperature": sampling_params.temperature if sampling_params.temperature > 0 else None,
+                    "streamer": streamer,
+                    "pad_token_id": self.tokenizer.eos_token_id
+                }
+                
+                # Start generation in a separate thread
+                thread = threading.Thread(target=self.hf_model.generate, kwargs=generation_kwargs)
+                thread.start()
+                
+                # Stream tokens
+                for new_text in streamer:
+                    yield new_text
+                
+                thread.join()
+                return
+                
+            except ImportError:
+                logging.warning("qwen_vl_utils not available, falling back to text-only processing")
+            except Exception as e:
+                logging.warning(f"Vision processing failed: {e}, falling back to text-only")
+        
+        # Fallback to text-only processing
         prompt = self._messages_to_prompt(msgs)
         return self.stream(prompt, adapter)
 
     def _messages_to_prompt(self, msgs: List[Dict[str, Any]]) -> str:
         """Convert a list of messages to a single prompt string."""
+        # Check if this is a Qwen2.5-VL model with processor
+        is_qwen_vl = "VL" in self.model_path and "2.5" in self.model_path
+        
+        if is_qwen_vl and self.using_hf and hasattr(self.hf_model, 'processor'):
+            # Use the proper Qwen2.5-VL processor's apply_chat_template
+            try:
+                # Add anti-hallucination system message if not present
+                has_system = any(msg.get('role') == 'system' for msg in msgs)
+                formatted_msgs = []
+                
+                if not has_system:
+                    formatted_msgs.append({
+                        "role": "system", 
+                        "content": "You are a helpful assistant. Answer questions directly and concisely."
+                    })
+                
+                # Add all messages, handling both text-only and mixed content
+                for msg in msgs:
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    
+                    if role in ['system', 'user', 'assistant']:
+                        # Handle different content formats
+                        if isinstance(content, str):
+                            # Simple text content
+                            formatted_content = [{"type": "text", "text": content}]
+                        elif isinstance(content, list):
+                            # Already in proper format (mixed content with images/text)
+                            formatted_content = content
+                        else:
+                            # Fallback for other formats
+                            formatted_content = [{"type": "text", "text": str(content)}]
+                        
+                        formatted_msgs.append({
+                            "role": role,
+                            "content": formatted_content
+                        })
+                
+                # Use the processor's chat template
+                prompt = self.hf_model.processor.apply_chat_template(
+                    formatted_msgs, 
+                    tokenize=False, 
+                    add_generation_prompt=True
+                )
+                return prompt
+                
+            except Exception as e:
+                # Fallback to manual format if processor fails
+                logging.warning(f"Failed to use Qwen2.5-VL processor chat template: {e}")
+        
+        # Fallback: Use original format for other models or if processor fails
         prompt_parts = []
         for msg in msgs:
             role = msg.get("role", "user")
             content = msg.get("content", "")
+            
+            # Extract text from mixed content for fallback
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                content = " ".join(text_parts)
+            
             if role == "user":
                 prompt_parts.append(f"User: {content}")
             elif role == "assistant":
@@ -2167,8 +2327,10 @@ class AsyncOnlineLLM(OnlineLLM):
         images: Optional[List[Any]] = None,  # Support multiple images
     ) -> str:
         """Generate text from a prompt."""
+        logging.info(f"AsyncOnlineLLM.generate called with prompt: '{prompt[:100]}...', adapter: {adapter}")
         images_list = [images] if images is not None else None
         results = await self.batch_generate([prompt], sampling_params, adapter, images_list)
+        logging.info(f"batch_generate returned: {len(results)} results, first result: '{results[0] if results else 'None'}' (length: {len(results[0]) if results else 0})")
         return results[0]
 
     async def stream(
@@ -2182,6 +2344,8 @@ class AsyncOnlineLLM(OnlineLLM):
         For custom models: Real token-by-token streaming
         For HF models: Simulated streaming (character-by-character) until HF streaming is implemented
         """
+        logging.info(f"AsyncOnlineLLM.stream called with prompt: '{prompt[:100]}...', using_hf: {self.using_hf}")
+        
         if sampling_params is None:
             sampling_params = self.default_sampling_params
 
@@ -2198,10 +2362,17 @@ class AsyncOnlineLLM(OnlineLLM):
             # For HuggingFace models, we simulate streaming by generating the complete response
             # and then yielding it character by character
             # TODO: Implement true HF streaming when transformers supports it
+            logging.info("Using HF model, calling generate...")
             result = await self.generate(prompt, adapter, sampling_params)
+            logging.info(f"Generate returned: '{result}' (length: {len(result)})")
+            
+            if not result or result.strip() == "":
+                logging.warning("Generate returned empty result!")
+                return
             
             # Yield word by word for more realistic streaming feel
             words = result.split()
+            logging.info(f"Splitting into {len(words)} words")
             for i, word in enumerate(words):
                 if i > 0:
                     yield " "  # Add space before each word except the first
@@ -2209,6 +2380,7 @@ class AsyncOnlineLLM(OnlineLLM):
                 await asyncio.sleep(0.01)  # Small delay for streaming effect
         else:
             # For custom implementation, do real token-by-token streaming
+            logging.info("Using custom model implementation")
             from dark.engine.sequence import Sequence
             
             seq = Sequence(self.tokenizer.encode(prompt), sampling_params)
@@ -2239,6 +2411,109 @@ class AsyncOnlineLLM(OnlineLLM):
         # Convert messages to a single prompt (simplified)
         prompt = self._messages_to_prompt(msgs)
         return await self.generate(prompt, adapter)
+
+    async def chat_stream(self, msgs: List[Dict[str, Any]], adapter: Optional[str] = None, sampling_params: Optional[SamplingParams] = None) -> AsyncGenerator[str, None]:
+        """Stream chat with the model using a list of messages (async version)."""
+        logging.info(f"AsyncOnlineLLM.chat_stream called with {len(msgs)} messages")
+        
+        # Check if this is a Qwen2.5-VL model with vision inputs
+        is_qwen_vl = "VL" in self.model_path and "2.5" in self.model_path
+        has_vision_content = any(
+            isinstance(msg.get("content"), list) and 
+            any(item.get("type") == "image" for item in msg.get("content", []) if isinstance(item, dict))
+            for msg in msgs
+        )
+        
+        logging.info(f"is_qwen_vl: {is_qwen_vl}, has_vision_content: {has_vision_content}, using_hf: {self.using_hf}")
+        
+        if is_qwen_vl and self.using_hf and has_vision_content and hasattr(self.hf_model, 'processor'):
+            # Handle vision inputs with proper processing
+            try:
+                from qwen_vl_utils import process_vision_info
+                
+                # Add anti-hallucination system message if not present
+                has_system = any(msg.get('role') == 'system' for msg in msgs)
+                formatted_msgs = []
+                
+                if not has_system:
+                    formatted_msgs.append({
+                        "role": "system", 
+                        "content": "You are a helpful assistant. Answer questions directly and concisely."
+                    })
+                
+                # Add all messages with proper content formatting
+                for msg in msgs:
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    
+                    if role in ['system', 'user', 'assistant']:
+                        if isinstance(content, str):
+                            formatted_content = [{"type": "text", "text": content}]
+                        elif isinstance(content, list):
+                            formatted_content = content
+                        else:
+                            formatted_content = [{"type": "text", "text": str(content)}]
+                        
+                        formatted_msgs.append({
+                            "role": role,
+                            "content": formatted_content
+                        })
+                
+                # Apply chat template
+                text = self.hf_model.processor.apply_chat_template(
+                    formatted_msgs, tokenize=False, add_generation_prompt=True
+                )
+                
+                # Extract vision inputs
+                image_inputs, video_inputs = process_vision_info(formatted_msgs)
+                
+                # Process inputs
+                inputs = self.hf_model.processor(
+                    text=[text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                inputs = {k: v.to(self.hf_model.device) for k, v in inputs.items()}
+                
+                # Load adapter if specified
+                if adapter:
+                    async with self.lock:
+                        adapter_found = self.ensure_lora_adapter(adapter)
+                        if adapter_found:
+                            self.load_lora_state(self.lora_states[adapter])
+                
+                # Generate with streaming using AsyncOnlineLLM's generate method
+                result = await self.generate("", adapter, sampling_params, [])  # Empty prompt since we use inputs directly
+                
+                # For now, simulate streaming with the complete result
+                # TODO: Implement true async streaming for vision models
+                words = result.split()
+                for i, word in enumerate(words):
+                    if i > 0:
+                        yield " "
+                    yield word
+                    await asyncio.sleep(0.01)
+                return
+                
+            except ImportError:
+                logging.warning("qwen_vl_utils not available, falling back to text-only processing")
+            except Exception as e:
+                logging.warning(f"Vision processing failed: {e}, falling back to text-only")
+        
+        # Fallback to text-only processing using async stream
+        logging.info("Using text-only fallback processing")
+        prompt = self._messages_to_prompt(msgs)
+        logging.info(f"Generated prompt: {prompt[:200]}...")
+        
+        chunk_count = 0
+        async for chunk in self.stream(prompt, adapter, sampling_params):
+            chunk_count += 1
+            logging.debug(f"Yielding chunk {chunk_count}: '{chunk}'")
+            yield chunk
+        
+        logging.info(f"AsyncOnlineLLM.chat_stream completed, yielded {chunk_count} chunks")
     
     async def batch_learn_from_conversations(
         self,

@@ -349,17 +349,7 @@ body {
   }
 }
 
-@keyframes subtle-pulse {
-
-  0%,
-  100% {
-    opacity: 0.7;
-  }
-
-  50% {
-    opacity: 1;
-  }
-}
+/* Removed subtle-pulse animation - now using individual framer-motion pulses */
 
 /* Connection status */
 .status-online {
@@ -377,6 +367,26 @@ body {
   color: #61FDFC;
   text-shadow: 0 0 10px #61FDFC;
   opacity: 0.7;
+}
+
+/* Text wrapping and overflow handling */
+.word-break-normal {
+  word-break: normal;
+  overflow-wrap: anywhere;
+  hyphens: auto;
+}
+
+.break-words {
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+/* Prevent horizontal scrolling in responses */
+.response-container {
+  max-width: 100%;
+  overflow-x: hidden;
+  word-wrap: break-word;
+  white-space: pre-wrap;
 }
 
 /* Scrollbar styling */
