@@ -1114,6 +1114,89 @@ function TaskPage() {
                                         </div>
                                     )}
 
+                                    {/* MCP Server Actions selection box for current response */}
+                                    {showMcpActionsBox === getCurrentButtonId('correct') && (
+                                        <div style={{ marginTop: '16px', marginLeft: '24px' }}>
+                                            <div className="font-mono text-sm glow mb-2" style={{ color: '#61FDFC' }}>
+                                                Select the correct action from available MCP servers:
+                                            </div>
+
+                                            {loadingMcpServerActions ? (
+                                                <div style={{ color: '#9CA3AF', fontSize: '12px' }}>Loading actions...</div>
+                                            ) : (
+                                                <div style={{
+                                                    maxHeight: '200px',
+                                                    overflowY: 'auto',
+                                                    backgroundColor: 'rgba(0, 0, 0, 0.3)',
+                                                    border: '1px solid rgba(107, 114, 128, 0.3)',
+                                                    borderRadius: '8px',
+                                                    padding: '8px',
+                                                    maxWidth: '500px'
+                                                }}>
+                                                    {task?.mcp_servers && task.mcp_servers.map(serverId => (
+                                                        <div key={serverId} style={{ marginBottom: '12px' }}>
+                                                            <div style={{ color: '#3B82F6', fontSize: '12px', marginBottom: '4px', fontWeight: 'bold' }}>
+                                                                {serverId}
+                                                            </div>
+                                                            {mcpServerActions[serverId]?.map(action => (
+                                                                <button
+                                                                    key={action.name}
+                                                                    onClick={() => setSelectedAction({ serverId, actionName: action.name, description: action.description })}
+                                                                    className="text-xs font-mono border transition-all duration-200 hover:scale-105 block w-full text-left mb-1"
+                                                                    style={{
+                                                                        backgroundColor: selectedAction?.serverId === serverId && selectedAction?.actionName === action.name
+                                                                            ? 'rgba(59, 130, 246, 0.2)' : 'rgba(0, 0, 0, 0.2)',
+                                                                        borderColor: selectedAction?.serverId === serverId && selectedAction?.actionName === action.name
+                                                                            ? '#3B82F6' : 'rgba(107, 114, 128, 0.3)',
+                                                                        color: '#E5E7EB',
+                                                                        borderRadius: '4px',
+                                                                        padding: '8px',
+                                                                        cursor: 'pointer'
+                                                                    }}
+                                                                >
+                                                                    <div style={{ fontWeight: 'bold' }}>{action.name}</div>
+                                                                    <div style={{ fontSize: '10px', opacity: 0.8 }}>{action.description}</div>
+                                                                </button>
+                                                            ))}
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+
+                                            <div className="flex gap-2 mt-2">
+                                                <button
+                                                    onClick={() => handleMcpActionSelect(showMcpActionsBox!, -1)}
+                                                    disabled={!selectedAction}
+                                                    className="text-xs font-mono border transition-all duration-200 hover:scale-105"
+                                                    style={{
+                                                        backgroundColor: selectedAction ? 'rgba(34, 197, 94, 0.2)' : 'rgba(107, 114, 128, 0.1)',
+                                                        borderColor: selectedAction ? 'rgba(34, 197, 94, 0.4)' : 'rgba(107, 114, 128, 0.3)',
+                                                        color: selectedAction ? '#22c55e' : '#6B7280',
+                                                        borderRadius: '8px',
+                                                        padding: '8px 16px',
+                                                        cursor: selectedAction ? 'pointer' : 'not-allowed'
+                                                    }}
+                                                >
+                                                    Use Selected Action
+                                                </button>
+                                                <button
+                                                    onClick={handleMcpActionCancel}
+                                                    className="text-xs font-mono border transition-all duration-200 hover:scale-105"
+                                                    style={{
+                                                        backgroundColor: 'rgba(107, 114, 128, 0.2)',
+                                                        borderColor: 'rgba(107, 114, 128, 0.3)',
+                                                        color: '#9CA3AF',
+                                                        borderRadius: '8px',
+                                                        padding: '8px 16px',
+                                                        cursor: 'pointer'
+                                                    }}
+                                                >
+                                                    Cancel
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
+
                                     {/* Display submitted comments for current response */}
                                     {(['deny', 'comment'].some(type => submittedComments[getCurrentButtonId(type)])) && (
                                         <div style={{ marginTop: '16px', marginLeft: '24px' }}>

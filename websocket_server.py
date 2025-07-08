@@ -2,23 +2,52 @@
 """
 WebSocket server for Dark.RL frontend using real AsyncOnlineLLM.
 Accepts OpenAI-format requests and returns streaming responses from actual models.
-Now includes task management with SQLite persistence.
+Now includes task management with SQLite persistence and real MCP server integration.
 """
 
 import asyncio
 import json
 import logging
 import websockets
+import os
 from typing import Dict, Any
+from pathlib import Path
 
 # Import Dark.RL components
 from dark.online_llm import AsyncOnlineLLM, BatchConfig
 from dark.sampling_params import SamplingParams
 from task_manager import TaskManager
+from mcp_use import MCPClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def load_local_api_keys() -> Dict[str, str]:
+    """Load API keys from local ~/.agentsea/api_keys.json file"""
+    try:
+        agentsea_dir = Path.home() / '.agentsea'
+        api_keys_file = agentsea_dir / 'api_keys.json'
+        
+        if not api_keys_file.exists():
+            return {}
+        
+        with open(api_keys_file, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Error loading local API keys: {e}")
+        return {}
+
+def get_api_key(env_var: str) -> str:
+    """Get API key from environment variables or local file"""
+    # First check environment variables
+    env_value = os.getenv(env_var, "")
+    if env_value:
+        return env_value
+    
+    # Then check local file
+    local_keys = load_local_api_keys()
+    return local_keys.get(env_var, "")
 
 class DarkRLLLMServer:
     """Dark.RL LLM server that provides real AI responses with task management"""
@@ -33,19 +62,99 @@ class DarkRLLLMServer:
         self.current_model = None
         self.task_manager = TaskManager()
         
-        # Mock MCP servers for now - in real implementation these would come from MCP registry
+        # Real MCP server configurations
         self.mcp_servers = [
-            {"id": "playwright", "name": "Playwright", "description": "Web automation and testing"},
-            {"id": "postgres", "name": "PostgreSQL", "description": "Database operations"},
-            {"id": "filesystem", "name": "File System", "description": "File and directory operations"},
-            {"id": "github", "name": "GitHub", "description": "Git repository management"},
-            {"id": "slack", "name": "Slack", "description": "Team communication"},
-            {"id": "jira", "name": "Jira", "description": "Project management and issue tracking"},
-            {"id": "docker", "name": "Docker", "description": "Container management"},
-            {"id": "aws", "name": "AWS", "description": "Amazon Web Services"},
-            {"id": "plausible", "name": "Plausible Analytics", "description": "Website analytics"},
-            {"id": "prometheus", "name": "Prometheus", "description": "Monitoring and alerting"}
+            {
+                "id": "playwright",
+                "name": "Playwright",
+                "description": "Web automation and testing",
+                "config": {
+                    "command": "npx",
+                    "args": ["@playwright/mcp@latest"]
+                },
+                "requires_api_key": False
+            },
+            {
+                "id": "filesystem",
+                "name": "File System",
+                "description": "File and directory operations",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/ubuntu/dark.rl"]
+                },
+                "requires_api_key": False
+            },
+            {
+                "id": "sequential-thinking",
+                "name": "Sequential Thinking",
+                "description": "Sequential reasoning and thought processes",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+                },
+                "requires_api_key": False
+            },
+            {
+                "id": "firecrawl",
+                "name": "Firecrawl",
+                "description": "Web scraping and content extraction",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "firecrawl-mcp"],
+                    "env": {
+                        "FIRECRAWL_API_KEY": ""  # Will be populated dynamically
+                    }
+                },
+                "requires_api_key": True,
+                "api_key_env": "FIRECRAWL_API_KEY"
+            },
+            {
+                "id": "postgres",
+                "name": "PostgreSQL",
+                "description": "Database operations",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-postgres"],
+                    "env": {
+                        "POSTGRES_CONNECTION_STRING": ""  # Will be populated dynamically
+                    }
+                },
+                "requires_api_key": True,
+                "api_key_env": "POSTGRES_CONNECTION_STRING"
+            },
+            {
+                "id": "github",
+                "name": "GitHub",
+                "description": "Git repository management",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-github"],
+                    "env": {
+                        "GITHUB_PERSONAL_ACCESS_TOKEN": ""  # Will be populated dynamically
+                    }
+                },
+                "requires_api_key": True,
+                "api_key_env": "GITHUB_PERSONAL_ACCESS_TOKEN"
+            },
+            {
+                "id": "slack",
+                "name": "Slack",
+                "description": "Team communication",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-slack"],
+                    "env": {
+                        "SLACK_BOT_TOKEN": ""  # Will be populated dynamically
+                    }
+                },
+                "requires_api_key": True,
+                "api_key_env": "SLACK_BOT_TOKEN"
+            }
         ]
+        
+        # MCP client connections cache
+        self.mcp_clients = {}
+        self.mcp_sessions = {}
     
     async def initialize_model(self, model_key: str = "qwen3"):
         """Initialize the AsyncOnlineLLM with the specified model"""
@@ -112,73 +221,171 @@ class DarkRLLLMServer:
     
     def get_mcp_servers(self, query: str = "") -> list:
         """Get list of MCP servers, optionally filtered by query"""
-        if not query:
-            return self.mcp_servers
-        
-        query = query.lower()
-        filtered = []
+        servers = []
         
         for server in self.mcp_servers:
-            # Search in name and description
-            if (query in server["name"].lower() or 
-                query in server["description"].lower() or
-                query in server["id"].lower()):
-                filtered.append(server)
+            # Check if API key is configured if required
+            api_key_available = True
+            if server.get("requires_api_key", False):
+                api_key_env = server.get("api_key_env", "")
+                api_key_available = bool(get_api_key(api_key_env))
+            
+            server_info = {
+                "id": server["id"],
+                "name": server["name"],
+                "description": server["description"],
+                "requires_api_key": server.get("requires_api_key", False),
+                "api_key_available": api_key_available,
+                "api_key_env": server.get("api_key_env", "") if server.get("requires_api_key", False) else None
+            }
+            
+            # Filter by query if provided
+            if query:
+                query_lower = query.lower()
+                if not (query_lower in server["name"].lower() or 
+                       query_lower in server["description"].lower() or
+                       query_lower in server["id"].lower()):
+                    continue
+            
+            servers.append(server_info)
         
-        return filtered
+        return servers
 
-    def get_mcp_server_actions(self, server_ids: list) -> dict:
+    async def get_mcp_client(self, server_id: str):
+        """Get or create MCP client for a server"""
+        if server_id in self.mcp_clients:
+            return self.mcp_clients[server_id]
+        
+        # Find server config
+        server_config = None
+        for server in self.mcp_servers:
+            if server["id"] == server_id:
+                server_config = server
+                break
+        
+        if not server_config:
+            raise ValueError(f"Server {server_id} not found")
+        
+        # Check API key if required
+        if server_config.get("requires_api_key", False):
+            api_key_env = server_config.get("api_key_env", "")
+            if not get_api_key(api_key_env):
+                raise ValueError(f"API key {api_key_env} not configured for server {server_id}")
+        
+        # Create MCP config with dynamic API key population
+        config = server_config["config"].copy()
+        
+        # Populate API keys dynamically
+        if "env" in config:
+            for env_var, _ in config["env"].items():
+                config["env"][env_var] = get_api_key(env_var)
+        
+        mcp_config = {
+            "mcpServers": {
+                server_id: config
+            }
+        }
+        
+        # Create client
+        client = MCPClient.from_dict(mcp_config)
+        self.mcp_clients[server_id] = client
+        
+        return client
+
+    async def get_mcp_session(self, server_id: str):
+        """Get or create MCP session for a server"""
+        if server_id in self.mcp_sessions:
+            return self.mcp_sessions[server_id]
+        
+        client = await self.get_mcp_client(server_id)
+        session = await client.create_session(server_id)
+        
+        # Connect if not already connected
+        if not session.connector.is_connected:
+            await session.connect()
+        
+        self.mcp_sessions[server_id] = session
+        return session
+
+    async def cleanup_mcp_connections(self):
+        """Clean up MCP connections"""
+        for client in self.mcp_clients.values():
+            try:
+                await client.close_all_sessions()
+            except Exception as e:
+                logger.error(f"Error closing MCP client: {e}")
+        
+        self.mcp_clients.clear()
+        self.mcp_sessions.clear()
+
+    async def get_mcp_server_actions(self, server_ids: list) -> dict:
         """Get available actions for specified MCP servers"""
         server_actions = {}
         
-        # Mock actions for different server types
-        # In real implementation, this would query the actual MCP servers
-        mock_actions = {
-            "playwright": [
-                {"name": "navigate", "description": "Navigate to a web page", "parameters": {"url": "string"}},
-                {"name": "click", "description": "Click an element", "parameters": {"selector": "string"}},
-                {"name": "fill", "description": "Fill form input", "parameters": {"selector": "string", "value": "string"}},
-                {"name": "screenshot", "description": "Take a screenshot", "parameters": {"path": "string"}},
-                {"name": "wait_for_element", "description": "Wait for element to appear", "parameters": {"selector": "string"}}
-            ],
-            "filesystem": [
-                {"name": "read_file", "description": "Read contents of a file", "parameters": {"path": "string"}},
-                {"name": "write_file", "description": "Write content to a file", "parameters": {"path": "string", "content": "string"}},
-                {"name": "list_directory", "description": "List directory contents", "parameters": {"path": "string"}},
-                {"name": "create_directory", "description": "Create a new directory", "parameters": {"path": "string"}},
-                {"name": "delete_file", "description": "Delete a file", "parameters": {"path": "string"}}
-            ],
-            "github": [
-                {"name": "create_repo", "description": "Create a new repository", "parameters": {"name": "string", "description": "string"}},
-                {"name": "list_repos", "description": "List user repositories", "parameters": {}},
-                {"name": "create_issue", "description": "Create a new issue", "parameters": {"title": "string", "body": "string"}},
-                {"name": "list_issues", "description": "List repository issues", "parameters": {"repo": "string"}},
-                {"name": "create_pull_request", "description": "Create a pull request", "parameters": {"title": "string", "body": "string", "head": "string", "base": "string"}}
-            ],
-            "postgres": [
-                {"name": "execute_query", "description": "Execute SQL query", "parameters": {"query": "string"}},
-                {"name": "create_table", "description": "Create a new table", "parameters": {"table_name": "string", "schema": "string"}},
-                {"name": "insert_data", "description": "Insert data into table", "parameters": {"table_name": "string", "data": "object"}},
-                {"name": "select_data", "description": "Select data from table", "parameters": {"table_name": "string", "where": "string"}}
-            ],
-            "slack": [
-                {"name": "send_message", "description": "Send message to channel", "parameters": {"channel": "string", "message": "string"}},
-                {"name": "list_channels", "description": "List available channels", "parameters": {}},
-                {"name": "create_channel", "description": "Create a new channel", "parameters": {"name": "string", "description": "string"}},
-                {"name": "upload_file", "description": "Upload file to channel", "parameters": {"channel": "string", "file_path": "string"}}
-            ]
-        }
-        
         for server_id in server_ids:
-            if server_id in mock_actions:
-                server_actions[server_id] = mock_actions[server_id]
-            else:
-                # Default actions for unknown servers
-                server_actions[server_id] = [
-                    {"name": "generic_action", "description": f"Generic action for {server_id}", "parameters": {"input": "string"}}
-                ]
+            try:
+                # Get real tools from MCP server
+                session = await self.get_mcp_session(server_id)
+                tools = await session.connector.list_tools()
+                
+                # Convert MCP tools to actions format
+                actions = []
+                for tool in tools:
+                    # Build parameter information from inputSchema
+                    parameters = {}
+                    if hasattr(tool, 'inputSchema') and tool.inputSchema:
+                        schema = tool.inputSchema
+                        if isinstance(schema, dict) and 'properties' in schema:
+                            required = schema.get('required', [])
+                            for param_name, param_info in schema['properties'].items():
+                                param_type = param_info.get('type', 'string')
+                                param_desc = param_info.get('description', '')
+                                parameters[param_name] = {
+                                    "type": param_type,
+                                    "description": param_desc,
+                                    "required": param_name in required
+                                }
+                    
+                    action = {
+                        "name": tool.name,
+                        "description": tool.description or "No description available",
+                        "parameters": parameters
+                    }
+                    actions.append(action)
+                
+                server_actions[server_id] = actions
+                logger.info(f"Retrieved {len(actions)} actions for server {server_id}")
+                
+            except Exception as e:
+                logger.error(f"Error getting actions for server {server_id}: {e}")
+                # Return error information
+                server_actions[server_id] = [{
+                    "name": "error",
+                    "description": f"Failed to connect to {server_id}: {str(e)}",
+                    "parameters": {}
+                }]
         
         return server_actions
+
+    async def execute_mcp_action(self, server_id: str, action_name: str, parameters: dict) -> dict:
+        """Execute an MCP action on a server"""
+        try:
+            session = await self.get_mcp_session(server_id)
+            result = await session.connector.call_tool(action_name, parameters)
+            
+            # Convert result to dict format
+            return {
+                "success": True,
+                "result": result.model_dump() if hasattr(result, 'model_dump') else str(result),
+                "content": result.content if hasattr(result, 'content') else str(result)
+            }
+        except Exception as e:
+            logger.error(f"Error executing MCP action {action_name} on server {server_id}: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "content": f"Error executing {action_name}: {str(e)}"
+            }
 
     def create_task(self, initial_prompt: str, model: str = "qwen2.5-vl") -> str:
         """Create a new task and return its ID"""
@@ -404,7 +611,7 @@ async def handle_client(websocket):
                 # Handle MCP server actions requests
                 if request.get('type') == 'get_mcp_server_actions':
                     server_ids = request.get('server_ids', [])
-                    server_actions = llm_server.get_mcp_server_actions(server_ids)
+                    server_actions = await llm_server.get_mcp_server_actions(server_ids)
                     
                     # Send response for each server
                     for server_id, actions in server_actions.items():
@@ -412,6 +619,81 @@ async def handle_client(websocket):
                             "type": "mcp_server_actions_response",
                             "server_id": server_id,
                             "actions": actions
+                        }
+                        await websocket.send(json.dumps(response))
+                    continue
+                
+                # Handle MCP action execution requests
+                if request.get('type') == 'execute_mcp_action':
+                    server_id = request.get('server_id', '')
+                    action_name = request.get('action_name', '')
+                    parameters = request.get('parameters', {})
+                    
+                    if not server_id or not action_name:
+                        error_response = {
+                            "type": "error",
+                            "error": {"message": "server_id and action_name are required", "type": "invalid_request"}
+                        }
+                        await websocket.send(json.dumps(error_response))
+                        continue
+                    
+                    logger.info(f"Executing MCP action {action_name} on server {server_id} with parameters: {parameters}")
+                    
+                    result = await llm_server.execute_mcp_action(server_id, action_name, parameters)
+                    
+                    response = {
+                        "type": "mcp_action_result",
+                        "server_id": server_id,
+                        "action_name": action_name,
+                        "parameters": parameters,
+                        **result
+                    }
+                    await websocket.send(json.dumps(response))
+                    continue
+                
+                # Handle API key management requests
+                if request.get('type') == 'get_api_keys':
+                    try:
+                        keys = load_local_api_keys()
+                        response = {
+                            "type": "api_keys_response",
+                            "success": True,
+                            "keys": keys
+                        }
+                        await websocket.send(json.dumps(response))
+                    except Exception as e:
+                        response = {
+                            "type": "api_keys_response", 
+                            "success": False,
+                            "error": str(e)
+                        }
+                        await websocket.send(json.dumps(response))
+                    continue
+                
+                if request.get('type') == 'save_api_keys':
+                    try:
+                        keys = request.get('keys', {})
+                        # Save to local file
+                        agentsea_dir = Path.home() / '.agentsea'
+                        agentsea_dir.mkdir(exist_ok=True)
+                        api_keys_file = agentsea_dir / 'api_keys.json'
+                        
+                        with open(api_keys_file, 'w') as f:
+                            json.dump(keys, f, indent=2)
+                        
+                        # Clear MCP connection cache so connections are recreated with new API keys
+                        await llm_server.cleanup_mcp_connections()
+                        
+                        response = {
+                            "type": "api_keys_response",
+                            "success": True
+                        }
+                        await websocket.send(json.dumps(response))
+                    except Exception as e:
+                        response = {
+                            "type": "api_keys_response",
+                            "success": False,
+                            "error": str(e)
                         }
                         await websocket.send(json.dumps(response))
                     continue
@@ -717,6 +999,9 @@ async def handle_client(websocket):
         logger.info(f"Client disconnected: {client_addr}")
     except Exception as e:
         logger.error(f"Connection error: {e}")
+    finally:
+        # Clean up MCP connections when client disconnects
+        await llm_server.cleanup_mcp_connections()
 
 async def main():
     """Start the WebSocket server"""

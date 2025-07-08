@@ -3,7 +3,9 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { useNavigate } from 'react-router-dom'
 import TypingAnimation from './TypingAnimation'
 import MCPServerDropdown from './MCPServerDropdown'
+import APIKeyModal from './APIKeyModal'
 import useWebSocket, { ConnectionStatus } from '../hooks/useWebSocket'
+import type { MCPServer } from '../hooks/useWebSocket'
 
 function LandingPage() {
     const [prompt, setPrompt] = useState('')
@@ -14,6 +16,8 @@ function LandingPage() {
     const [exampleTimestamps, setExampleTimestamps] = useState<(number | null)[]>(Array(4).fill(null))
     const [hasInitiallyLoaded, setHasInitiallyLoaded] = useState(false)
     const [pulseTriggers, setPulseTriggers] = useState<number[]>(Array(4).fill(0))
+    const [showAPIKeyModal, setShowAPIKeyModal] = useState(false)
+    const [apiKeyServer, setApiKeyServer] = useState<MCPServer | null>(null)
 
     const navigate = useNavigate()
 
@@ -152,6 +156,28 @@ function LandingPage() {
         }
 
         setShowMCPDropdown(false)
+    }
+
+    // Handle API key required
+    const handleApiKeyRequired = (server: MCPServer) => {
+        setApiKeyServer(server)
+        setShowAPIKeyModal(true)
+        setShowMCPDropdown(false)
+    }
+
+    // Handle API key modal save
+    const handleApiKeyModalSave = async (server: MCPServer, apiKey: string) => {
+        // API key is already saved by the modal
+        // Now we can select the server
+        handleMCPServerSelect(server)
+        // Refresh the MCP servers to get updated API key status
+        getMcpServers(mcpQuery)
+    }
+
+    // Handle API key modal close
+    const handleApiKeyModalClose = () => {
+        setShowAPIKeyModal(false)
+        setApiKeyServer(null)
     }
 
     // Close MCP dropdown
@@ -330,6 +356,15 @@ function LandingPage() {
                                             onSelect={handleMCPServerSelect}
                                             onClose={closeMCPDropdown}
                                             query={mcpQuery}
+                                            onApiKeyRequired={handleApiKeyRequired}
+                                        />
+
+                                        {/* API Key Modal */}
+                                        <APIKeyModal
+                                            isVisible={showAPIKeyModal}
+                                            server={apiKeyServer}
+                                            onClose={handleApiKeyModalClose}
+                                            onSave={handleApiKeyModalSave}
                                         />
                                     </div>
                                 </form>

@@ -27,6 +27,9 @@ export interface MCPServer {
     id: string
     name: string
     description: string
+    requires_api_key: boolean
+    api_key_available: boolean
+    api_key_env?: string
 }
 
 export interface MCPServerRequest {
