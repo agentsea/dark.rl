@@ -10,7 +10,9 @@ import json
 import logging
 import websockets
 import os
-from typing import Dict, Any
+import re
+import json_repair
+from typing import Dict, Any, List
 from pathlib import Path
 
 # Import Dark.RL components
@@ -155,6 +157,9 @@ class DarkRLLLMServer:
         # MCP client connections cache
         self.mcp_clients = {}
         self.mcp_sessions = {}
+        
+        # MCP server actions cache
+        self.mcp_actions_cache = {}
     
     async def initialize_model(self, model_key: str = "qwen3"):
         """Initialize the AsyncOnlineLLM with the specified model"""
@@ -308,7 +313,7 @@ class DarkRLLLMServer:
         return session
 
     async def cleanup_mcp_connections(self):
-        """Clean up MCP connections"""
+        """Clean up MCP connections and clear caches"""
         for client in self.mcp_clients.values():
             try:
                 await client.close_all_sessions()
@@ -317,12 +322,49 @@ class DarkRLLLMServer:
         
         self.mcp_clients.clear()
         self.mcp_sessions.clear()
+        # Clear actions cache when connections are cleaned up
+        cache_count = len(self.mcp_actions_cache)
+        self.mcp_actions_cache.clear()
+        logger.info(f"🧹 Cleared MCP connections and actions cache ({cache_count} servers)")
+
+    def clear_mcp_actions_cache(self, server_id: str = None):
+        """Clear MCP actions cache for a specific server or all servers"""
+        if server_id:
+            if server_id in self.mcp_actions_cache:
+                del self.mcp_actions_cache[server_id]
+                logger.info(f"🗑️ Cleared actions cache for {server_id}")
+        else:
+            cache_count = len(self.mcp_actions_cache)
+            self.mcp_actions_cache.clear()
+            logger.info(f"🗑️ Cleared all MCP actions cache ({cache_count} servers)")
+
+    async def refresh_mcp_actions(self, server_id: str) -> dict:
+        """Refresh actions for a specific server by clearing cache and re-fetching"""
+        self.clear_mcp_actions_cache(server_id)
+        return await self.get_mcp_server_actions([server_id])
+
+    def get_mcp_cache_stats(self) -> dict:
+        """Get statistics about the MCP actions cache"""
+        return {
+            "cached_servers": list(self.mcp_actions_cache.keys()),
+            "cache_counts": {
+                server_id: len(actions) for server_id, actions in self.mcp_actions_cache.items()
+            },
+            "total_cached_servers": len(self.mcp_actions_cache),
+            "total_cached_actions": sum(len(actions) for actions in self.mcp_actions_cache.values())
+        }
 
     async def get_mcp_server_actions(self, server_ids: list) -> dict:
-        """Get available actions for specified MCP servers"""
+        """Get available actions for specified MCP servers with caching"""
         server_actions = {}
         
         for server_id in server_ids:
+            # Check cache first
+            if server_id in self.mcp_actions_cache:
+                server_actions[server_id] = self.mcp_actions_cache[server_id]
+                logger.info(f"✓ Using cached actions for {server_id}: {len(server_actions[server_id])} actions")
+                continue
+            
             try:
                 # Get real tools from MCP server
                 session = await self.get_mcp_session(server_id)
@@ -353,12 +395,14 @@ class DarkRLLLMServer:
                     }
                     actions.append(action)
                 
+                # Cache the actions
+                self.mcp_actions_cache[server_id] = actions
                 server_actions[server_id] = actions
-                logger.info(f"Retrieved {len(actions)} actions for server {server_id}")
+                logger.info(f"📥 Fetched and cached {len(actions)} actions for {server_id}")
                 
             except Exception as e:
                 logger.error(f"Error getting actions for server {server_id}: {e}")
-                # Return error information
+                # Return error information (don't cache errors)
                 server_actions[server_id] = [{
                     "name": "error",
                     "description": f"Failed to connect to {server_id}: {str(e)}",
@@ -366,6 +410,176 @@ class DarkRLLLMServer:
                 }]
         
         return server_actions
+
+    async def build_mcp_tool_descriptions(self, server_ids: List[str]) -> List[str]:
+        """Build detailed tool descriptions following train_one_vl.py patterns"""
+        tool_descriptions = []
+        
+        # Get actions for all requested servers
+        server_actions = await self.get_mcp_server_actions(server_ids)
+        
+        for server_id, actions in server_actions.items():
+            for action in actions:
+                if action.get("name") == "error":
+                    continue  # Skip error actions
+                
+                # Build tool description like in train_one_vl.py
+                tool_name = action.get("name", "unknown")
+                description = action.get("description", "No description")
+                
+                tool_desc = f"{tool_name}: {description}"
+                
+                # Add parameter information from action parameters
+                parameters = action.get("parameters", {})
+                if parameters:
+                    params = []
+                    for param_name, param_info in parameters.items():
+                        param_type = param_info.get("type", "unknown")
+                        is_required = param_info.get("required", False)
+                        required_mark = '*' if is_required else ''
+                        params.append(f"{required_mark}{param_name}({param_type})")
+                    
+                    if params:
+                        tool_desc += f" - Parameters: {', '.join(params)}"
+                
+                tool_descriptions.append(tool_desc)
+        
+        return tool_descriptions
+
+    async def build_tools_schema(self, server_ids: List[str]) -> List[dict]:
+        """Build tools schema in Qwen format"""
+        tools = []
+        
+        # Get actions for all requested servers
+        server_actions = await self.get_mcp_server_actions(server_ids)
+        
+        for server_id, actions in server_actions.items():
+            for action in actions:
+                if action.get("name") == "error":
+                    continue  # Skip error actions
+                
+                tool_name = action.get("name", "unknown")
+                description = action.get("description", "No description")
+                parameters = action.get("parameters", {})
+                
+                # Convert to Qwen tools format
+                tool_schema = {
+                    "name": tool_name,
+                    "description": description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+                
+                # Convert parameters to proper schema format
+                for param_name, param_info in parameters.items():
+                    tool_schema["parameters"]["properties"][param_name] = {
+                        "type": param_info.get("type", "string"),
+                        "description": param_info.get("description", "")
+                    }
+                    
+                    if param_info.get("required", False):
+                        tool_schema["parameters"]["required"].append(param_name)
+                
+                tools.append(tool_schema)
+        
+        return tools
+
+    def build_qwen_chat_messages(self, messages: List[dict], tools: List[dict] = None) -> List[dict]:
+        """Build messages in Qwen chat template format with tools"""
+        chat_messages = []
+        
+        # Build system message with tools
+        system_content = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+        
+        if tools:
+            system_content += "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+            system_content += "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n"
+            
+            for tool in tools:
+                system_content += json.dumps(tool, indent=2) + "\n"
+            
+            system_content += "</tools>\n\n"
+            system_content += 'For each function call, return a JSON object with function name and arguments within <tool_call></tool_call> XML tags:\n'
+            system_content += '<tool_call>\n{"name": "function_name", "arguments": {"param": "value"}}\n</tool_call>\n\n'
+            system_content += 'You can also include your reasoning in <think></think> tags before making tool calls.'
+        
+        chat_messages.append({"role": "system", "content": system_content})
+        
+        # Add conversation messages
+        for message in messages:
+            role = message.get('role', 'user')
+            content = message.get('content', '')
+            
+            if role in ['user', 'assistant', 'system']:
+                chat_messages.append({"role": role, "content": content})
+        
+        return chat_messages
+
+    def extract_action_from_response(self, response: str) -> dict:
+        """Extract action from response with thinking support (Qwen format)"""
+        result = {}
+        
+        # Extract thinking if present
+        if "<think>" in response and "</think>" in response:
+            think_start = response.find("<think>") + 7
+            think_end = response.find("</think>")
+            thinking = response[think_start:think_end].strip()
+            result["thinking"] = thinking
+        
+        # Extract tool call in Qwen format
+        if "<tool_call>" in response and "</tool_call>" in response:
+            tool_start = response.find("<tool_call>") + 11
+            tool_end = response.find("</tool_call>")
+            tool_str = response[tool_start:tool_end].strip()
+            
+            try:
+                tool_call = json.loads(tool_str)
+                
+                # Convert from Qwen format {"name": "...", "arguments": {...}} 
+                # to our internal format {"tool": "...", "parameters": {...}}
+                if "name" in tool_call:
+                    result["tool"] = tool_call["name"]
+                    result["parameters"] = tool_call.get("arguments", {})
+                    result["original_format"] = tool_call  # Keep original for reference
+                    return result
+                else:
+                    return {"error": "Tool call missing 'name' field", **result}
+                    
+            except Exception as e:
+                logger.error(f"Error parsing tool call JSON: {e}")
+                return {"error": f"Invalid JSON: {str(e)}", **result}
+        
+        return {"error": "No tool_call tags found", **result}
+
+    def extract_mentioned_servers(self, text: str) -> List[str]:
+        """Extract @server mentions from text"""
+        # Find all @server_id mentions
+        server_mentions = re.findall(r'@([a-zA-Z0-9_-]+)', text)
+        
+        # Filter to only include actual server IDs we know about
+        known_server_ids = {server["id"] for server in self.mcp_servers}
+        mentioned_servers = [server_id for server_id in server_mentions if server_id in known_server_ids]
+        
+        return list(set(mentioned_servers))  # Remove duplicates
+
+    async def should_use_action_mode(self, messages: List[dict]) -> tuple[bool, List[str]]:
+        """Determine if we should use action mode based on MCP server mentions"""
+        # Check the latest user message for @server mentions
+        if not messages:
+            return False, []
+        
+        latest_message = messages[-1]
+        if latest_message.get("role") != "user":
+            return False, []
+        
+        content = latest_message.get("content", "")
+        mentioned_servers = self.extract_mentioned_servers(content)
+        
+        # Use action mode if servers are mentioned
+        return len(mentioned_servers) > 0, mentioned_servers
 
     async def execute_mcp_action(self, server_id: str, action_name: str, parameters: dict) -> dict:
         """Execute an MCP action on a server"""
@@ -408,160 +622,22 @@ class DarkRLLLMServer:
         return self.task_manager.get_recent_tasks()
 
     async def stream_response(self, websocket, messages: list, model: str = "qwen3", temperature: float = 0.7, max_tokens: int = 2048, task_id: str = None):
-        """Stream response from the actual LLM"""
+        """Stream response from the actual LLM with MCP action support"""
         
         try:
             # Initialize model if needed
             await self.initialize_model(model)
             
-            # Use chat format instead of prompt conversion to prevent hallucinations
-            chat_messages = []
-            for message in messages:
-                role = message.get('role', 'user')
-                content = message.get('content', '')
+            # Check if we should use action mode based on MCP server mentions
+            use_action_mode, mentioned_servers = await self.should_use_action_mode(messages)
+            
+            if use_action_mode:
+                logger.info(f"🎯 Action mode detected! Mentioned servers: {mentioned_servers}")
+                await self.stream_action_response(websocket, messages, mentioned_servers, model, temperature, max_tokens, task_id)
+            else:
+                logger.info("💬 Standard chat mode")
+                await self.stream_chat_response(websocket, messages, model, temperature, max_tokens, task_id)
                 
-                if role == 'system':
-                    chat_messages.append({"role": "system", "content": content})
-                elif role == 'user':
-                    chat_messages.append({"role": "user", "content": content})
-                elif role == 'assistant':
-                    chat_messages.append({"role": "assistant", "content": content})
-            
-            # Create sampling parameters with limits to prevent infinite responses
-            sampling_params = SamplingParams(
-                temperature=max(0.3, min(temperature, 0.8)),  # Keep temperature reasonable
-                max_tokens=min(max_tokens, 500),  # Limit response length to prevent runaway generation
-                n=1,
-                presence_penalty=0.2,  # Increase to reduce repetition
-                ignore_eos=False
-            )
-            
-            logger.info(f"Streaming response for {len(chat_messages)} messages...")
-            
-            # Stream response from actual LLM using chat format
-            accumulated_response = ""
-            chunk_count = 0
-            
-            try:
-                # Use chat_stream if available (handles vision inputs and proper Qwen2.5-VL formatting)
-                if hasattr(self.llm, 'chat_stream'):
-                    logger.info("Using chat_stream method")
-                    # Check if chat_stream accepts sampling_params
-                    import inspect
-                    sig = inspect.signature(self.llm.chat_stream)
-                    if 'sampling_params' in sig.parameters:
-                        logger.info("chat_stream accepts sampling_params")
-                        stream_iterator = self.llm.chat_stream(chat_messages, sampling_params=sampling_params)
-                    else:
-                        logger.info("chat_stream does not accept sampling_params")
-                        stream_iterator = self.llm.chat_stream(chat_messages)
-                else:
-                    logger.info("Fallback: Using _messages_to_prompt method")
-                    # Fallback: Use OnlineLLM's _messages_to_prompt which handles Qwen2.5-VL formatting
-                    prompt = self.llm._messages_to_prompt(chat_messages)
-                    stream_iterator = self.llm.stream(prompt, sampling_params=sampling_params)
-                
-                # Handle both async generators and regular generators
-                if hasattr(stream_iterator, '__aiter__'):
-                    logger.info("Processing async generator")
-                    # Async generator
-                    async for chunk in stream_iterator:
-                        # Check if websocket is still open
-                        if websocket.close_code is not None:
-                            logger.warning("WebSocket closed during streaming")
-                            break
-                        
-                        accumulated_response += chunk
-                        chunk_count += 1
-                        logger.debug(f"Processed chunk {chunk_count}: '{chunk}'")
-                        
-                        # Create OpenAI-compatible streaming response
-                        stream_chunk = {
-                            "choices": [{
-                                "delta": {
-                                    "content": chunk
-                                },
-                                "finish_reason": None
-                            }]
-                        }
-                        
-                        try:
-                            await websocket.send(json.dumps(stream_chunk))
-                            # Small delay to make streaming visible
-                            await asyncio.sleep(0.02)
-                        except websockets.exceptions.ConnectionClosed:
-                            logger.warning("WebSocket connection closed while sending chunk")
-                            break
-                    logger.info(f"Async generator completed with {chunk_count} chunks")
-                else:
-                    logger.info("Processing regular generator")
-                    # Regular generator - convert to async
-                    for chunk in stream_iterator:
-                        # Check if websocket is still open
-                        if websocket.close_code is not None:
-                            logger.warning("WebSocket closed during streaming")
-                            break
-                        
-                        accumulated_response += chunk
-                        chunk_count += 1
-                        logger.debug(f"Processed chunk {chunk_count}: '{chunk}'")
-                        
-                        # Create OpenAI-compatible streaming response
-                        stream_chunk = {
-                            "choices": [{
-                                "delta": {
-                                    "content": chunk
-                                },
-                                "finish_reason": None
-                            }]
-                        }
-                        
-                        try:
-                            await websocket.send(json.dumps(stream_chunk))
-                            # Small delay to make streaming visible
-                            await asyncio.sleep(0.02)
-                        except websockets.exceptions.ConnectionClosed:
-                            logger.warning("WebSocket connection closed while sending chunk")
-                            break
-                    logger.info(f"Regular generator completed with {chunk_count} chunks")
-                
-                # Send final chunk only if connection is still open
-                if websocket.close_code is None:
-                    final_chunk = {
-                        "choices": [{
-                            "delta": {},
-                            "finish_reason": "stop"
-                        }]
-                    }
-                    
-                    await websocket.send(json.dumps(final_chunk))
-                    logger.info(f"Response completed. Total length: {len(accumulated_response)} characters, {chunk_count} chunks")
-                    
-                    # Save assistant response to database if task_id provided
-                    if task_id and accumulated_response:
-                        self.task_manager.add_message(task_id, 'assistant', accumulated_response)
-                        logger.info(f"Saved assistant response to task {task_id}")
-                else:
-                    logger.info(f"Streaming stopped due to closed connection. Sent {chunk_count} chunks")
-                    
-            except Exception as stream_error:
-                logger.error(f"Error in streaming loop: {stream_error}")
-                if websocket.close_code is None:
-                    # Try to send error response
-                    try:
-                        error_chunk = {
-                            "choices": [{
-                                "delta": {
-                                    "content": f"\n\n[Streaming Error: {str(stream_error)}]"
-                                },
-                                "finish_reason": "stop"
-                            }]
-                        }
-                        await websocket.send(json.dumps(error_chunk))
-                    except:
-                        pass  # Connection might be closed
-                raise stream_error
-            
         except Exception as e:
             logger.error(f"Error during streaming setup: {e}")
             import traceback
@@ -581,6 +657,345 @@ class DarkRLLLMServer:
                     await websocket.send(json.dumps(error_chunk))
                 except:
                     pass  # Connection might be closed
+
+    async def stream_chat_response(self, websocket, messages: list, model: str, temperature: float, max_tokens: int, task_id: str = None):
+        """Stream standard chat response"""
+        # Use chat format instead of prompt conversion to prevent hallucinations
+        chat_messages = []
+        for message in messages:
+            role = message.get('role', 'user')
+            content = message.get('content', '')
+            
+            if role == 'system':
+                chat_messages.append({"role": "system", "content": content})
+            elif role == 'user':
+                chat_messages.append({"role": "user", "content": content})
+            elif role == 'assistant':
+                chat_messages.append({"role": "assistant", "content": content})
+        
+        # Create sampling parameters with limits to prevent infinite responses
+        sampling_params = SamplingParams(
+            temperature=max(0.3, min(temperature, 0.8)),  # Keep temperature reasonable
+            max_tokens=min(max_tokens, 500),  # Limit response length to prevent runaway generation
+            n=1,
+            presence_penalty=0.2,  # Increase to reduce repetition
+            ignore_eos=False
+        )
+        
+        logger.info(f"Streaming chat response for {len(chat_messages)} messages...")
+        
+        # Stream response from actual LLM using chat format
+        accumulated_response = ""
+        chunk_count = 0
+        
+        try:
+            # Use chat_stream if available (handles vision inputs and proper Qwen2.5-VL formatting)
+            if hasattr(self.llm, 'chat_stream'):
+                logger.info("Using chat_stream method")
+                # Check if chat_stream accepts sampling_params
+                import inspect
+                sig = inspect.signature(self.llm.chat_stream)
+                if 'sampling_params' in sig.parameters:
+                    logger.info("chat_stream accepts sampling_params")
+                    stream_iterator = self.llm.chat_stream(chat_messages, sampling_params=sampling_params)
+                else:
+                    logger.info("chat_stream does not accept sampling_params")
+                    stream_iterator = self.llm.chat_stream(chat_messages)
+            else:
+                logger.info("Fallback: Using _messages_to_prompt method")
+                # Fallback: Use OnlineLLM's _messages_to_prompt which handles Qwen2.5-VL formatting
+                prompt = self.llm._messages_to_prompt(chat_messages)
+                stream_iterator = self.llm.stream(prompt, sampling_params=sampling_params)
+            
+            # Handle both async generators and regular generators
+            if hasattr(stream_iterator, '__aiter__'):
+                logger.info("Processing async generator")
+                # Async generator
+                async for chunk in stream_iterator:
+                    # Check if websocket is still open
+                    if websocket.close_code is not None:
+                        logger.warning("WebSocket closed during streaming")
+                        break
+                    
+                    accumulated_response += chunk
+                    chunk_count += 1
+                    logger.debug(f"Processed chunk {chunk_count}: '{chunk}'")
+                    
+                    # Create OpenAI-compatible streaming response
+                    stream_chunk = {
+                        "choices": [{
+                            "delta": {
+                                "content": chunk
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    
+                    try:
+                        await websocket.send(json.dumps(stream_chunk))
+                        # Small delay to make streaming visible
+                        await asyncio.sleep(0.02)
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.warning("WebSocket connection closed while sending chunk")
+                        break
+                logger.info(f"Async generator completed with {chunk_count} chunks")
+            else:
+                logger.info("Processing regular generator")
+                # Regular generator - convert to async
+                for chunk in stream_iterator:
+                    # Check if websocket is still open
+                    if websocket.close_code is not None:
+                        logger.warning("WebSocket closed during streaming")
+                        break
+                    
+                    accumulated_response += chunk
+                    chunk_count += 1
+                    logger.debug(f"Processed chunk {chunk_count}: '{chunk}'")
+                    
+                    # Create OpenAI-compatible streaming response
+                    stream_chunk = {
+                        "choices": [{
+                            "delta": {
+                                "content": chunk
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    
+                    try:
+                        await websocket.send(json.dumps(stream_chunk))
+                        # Small delay to make streaming visible
+                        await asyncio.sleep(0.02)
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.warning("WebSocket connection closed while sending chunk")
+                        break
+                logger.info(f"Regular generator completed with {chunk_count} chunks")
+            
+            # Send final chunk only if connection is still open
+            if websocket.close_code is None:
+                final_chunk = {
+                    "choices": [{
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                }
+                
+                await websocket.send(json.dumps(final_chunk))
+                logger.info(f"Response completed. Total length: {len(accumulated_response)} characters, {chunk_count} chunks")
+                
+                # Save assistant response to database if task_id provided
+                if task_id and accumulated_response:
+                    self.task_manager.add_message(task_id, 'assistant', accumulated_response)
+                    logger.info(f"Saved assistant response to task {task_id}")
+            else:
+                logger.info(f"Streaming stopped due to closed connection. Sent {chunk_count} chunks")
+                
+        except Exception as stream_error:
+            logger.error(f"Error in streaming loop: {stream_error}")
+            if websocket.close_code is None:
+                # Try to send error response
+                try:
+                    error_chunk = {
+                        "choices": [{
+                            "delta": {
+                                "content": f"\n\n[Streaming Error: {str(stream_error)}]"
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    }
+                    await websocket.send(json.dumps(error_chunk))
+                except:
+                    pass  # Connection might be closed
+            raise stream_error
+
+    async def stream_action_response(self, websocket, messages: list, mentioned_servers: List[str], model: str, temperature: float, max_tokens: int, task_id: str = None):
+        """Stream action-based response using Qwen chat template with tools"""
+        
+        try:
+            # Build tools schema for mentioned servers
+            tools = await self.build_tools_schema(mentioned_servers)
+            
+            if not tools:
+                # No tools found, fall back to chat mode
+                logger.warning(f"No tools found for servers: {mentioned_servers}")
+                await self.stream_chat_response(websocket, messages, model, temperature, max_tokens, task_id)
+                return
+            
+            # Build Qwen chat messages with tools
+            chat_messages = self.build_qwen_chat_messages(messages, tools)
+            
+            logger.info(f"🛠️ Built Qwen chat with {len(tools)} tools")
+            
+            # Create sampling parameters optimized for tool calling
+            sampling_params = SamplingParams(
+                temperature=max(0.1, min(temperature, 0.4)),  # Moderate temperature for reasoning + tool calls
+                max_tokens=min(max_tokens, 800),  # More tokens for thinking + tool calls
+                n=1,
+                presence_penalty=0.1,
+                ignore_eos=False
+            )
+            
+            # Stream the response using chat format
+            accumulated_response = ""
+            chunk_count = 0
+            
+            # Use chat_stream if available
+            if hasattr(self.llm, 'chat_stream'):
+                import inspect
+                sig = inspect.signature(self.llm.chat_stream)
+                if 'sampling_params' in sig.parameters:
+                    stream_iterator = self.llm.chat_stream(chat_messages, sampling_params=sampling_params)
+                else:
+                    stream_iterator = self.llm.chat_stream(chat_messages)
+            else:
+                # Fallback to prompt-based streaming
+                prompt = self.llm._messages_to_prompt(chat_messages)
+                stream_iterator = self.llm.stream(prompt, sampling_params=sampling_params)
+            
+            # Handle streaming
+            if hasattr(stream_iterator, '__aiter__'):
+                # Async generator
+                async for chunk in stream_iterator:
+                    if websocket.close_code is not None:
+                        logger.warning("WebSocket closed during action streaming")
+                        break
+                    
+                    accumulated_response += chunk
+                    chunk_count += 1
+                    
+                    # Check if we hit a tool call that needs user approval
+                    if ("<tool_call>" in accumulated_response and 
+                        "</tool_call>" in accumulated_response and
+                        chunk_count > 5):  # Make sure we have substantial content
+                        
+                        # Pause streaming and wait for user approval
+                        logger.info("🛠️ Tool call detected, pausing for user approval")
+                        
+                        # Stream current content
+                        stream_chunk = {
+                            "choices": [{
+                                "delta": {
+                                    "content": chunk
+                                },
+                                "finish_reason": "tool_call_requested"
+                            }]
+                        }
+                        
+                        try:
+                            await websocket.send(json.dumps(stream_chunk))
+                        except websockets.exceptions.ConnectionClosed:
+                            logger.warning("WebSocket connection closed while sending tool call chunk")
+                            break
+                        
+                        # This will trigger the frontend to show the tool call modal
+                        # The streaming will resume when user approves via a separate endpoint
+                        return
+                    
+                    # Stream chunk to client
+                    stream_chunk = {
+                        "choices": [{
+                            "delta": {
+                                "content": chunk
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    
+                    try:
+                        await websocket.send(json.dumps(stream_chunk))
+                        await asyncio.sleep(0.02)
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.warning("WebSocket connection closed while sending action chunk")
+                        break
+            else:
+                # Regular generator
+                for chunk in stream_iterator:
+                    if websocket.close_code is not None:
+                        logger.warning("WebSocket closed during action streaming")
+                        break
+                    
+                    accumulated_response += chunk
+                    chunk_count += 1
+                    
+                    # Check if we hit a tool call that needs user approval
+                    if ("<tool_call>" in accumulated_response and 
+                        "</tool_call>" in accumulated_response and
+                        chunk_count > 5):  # Make sure we have substantial content
+                        
+                        # Pause streaming and wait for user approval
+                        logger.info("🛠️ Tool call detected, pausing for user approval")
+                        
+                        # Stream current content
+                        stream_chunk = {
+                            "choices": [{
+                                "delta": {
+                                    "content": chunk
+                                },
+                                "finish_reason": "tool_call_requested"
+                            }]
+                        }
+                        
+                        try:
+                            await websocket.send(json.dumps(stream_chunk))
+                        except websockets.exceptions.ConnectionClosed:
+                            logger.warning("WebSocket connection closed while sending tool call chunk")
+                            break
+                        
+                        # This will trigger the frontend to show the tool call modal
+                        return
+                    
+                    # Stream chunk to client
+                    stream_chunk = {
+                        "choices": [{
+                            "delta": {
+                                "content": chunk
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    
+                    try:
+                        await websocket.send(json.dumps(stream_chunk))
+                        await asyncio.sleep(0.02)
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.warning("WebSocket connection closed while sending action chunk")
+                        break
+            
+            # If we reach here, no tool call was detected, send final chunk
+            if websocket.close_code is None:
+                final_chunk = {
+                    "choices": [{
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                }
+                
+                await websocket.send(json.dumps(final_chunk))
+                logger.info(f"Tool-enabled response completed. Length: {len(accumulated_response)} characters")
+                
+                # Save to task if provided
+                if task_id and accumulated_response:
+                    self.task_manager.add_message(task_id, 'assistant', accumulated_response)
+                    logger.info(f"Saved tool response to task {task_id}")
+            
+        except Exception as e:
+            logger.error(f"Error in action streaming: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            if websocket.close_code is None:
+                try:
+                    error_chunk = {
+                        "choices": [{
+                            "delta": {
+                                "content": f"\n\n[Action Error: {str(e)}]"
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    }
+                    await websocket.send(json.dumps(error_chunk))
+                except:
+                    pass
 
 async def handle_client(websocket):
     """Handle WebSocket client connections"""
@@ -696,6 +1111,191 @@ async def handle_client(websocket):
                             "error": str(e)
                         }
                         await websocket.send(json.dumps(response))
+                    continue
+                
+                # Handle MCP actions cache refresh
+                if request.get('type') == 'refresh_mcp_actions':
+                    server_id = request.get('server_id')
+                    if not server_id:
+                        error_response = {
+                            "type": "error",
+                            "error": {"message": "server_id is required", "type": "invalid_request"}
+                        }
+                        await websocket.send(json.dumps(error_response))
+                        continue
+                    
+                    logger.info(f"Refreshing MCP actions for server {server_id}")
+                    result = await llm_server.refresh_mcp_actions(server_id)
+                    
+                    response = {
+                        "type": "mcp_actions_refreshed",
+                        "server_id": server_id,
+                        "actions": result.get(server_id, [])
+                    }
+                    await websocket.send(json.dumps(response))
+                    continue
+                
+                # Handle MCP actions cache status
+                if request.get('type') == 'get_mcp_cache_status':
+                    cache_stats = llm_server.get_mcp_cache_stats()
+                    
+                    response = {
+                        "type": "mcp_cache_status",
+                        **cache_stats
+                    }
+                    await websocket.send(json.dumps(response))
+                    continue
+                
+                # Handle tool execution and stream continuation
+                if request.get('type') == 'execute_tool_and_continue':
+                    server_id = request.get('server_id', '')
+                    tool_name = request.get('tool_name', '')
+                    parameters = request.get('parameters', {})
+                    current_response = request.get('current_response', '')
+                    mentioned_servers = request.get('mentioned_servers', [])
+                    model = request.get('model', 'qwen2.5-vl')
+                    task_id = request.get('task_id')
+                    
+                    if not server_id or not tool_name:
+                        error_response = {
+                            "type": "error",
+                            "error": {"message": "server_id and tool_name are required", "type": "invalid_request"}
+                        }
+                        await websocket.send(json.dumps(error_response))
+                        continue
+                    
+                    logger.info(f"🚀 Executing tool {tool_name} on server {server_id} and continuing stream")
+                    
+                    try:
+                        # Execute the tool
+                        action_result = await llm_server.execute_mcp_action(server_id, tool_name, parameters)
+                        
+                        # Format tool response in Qwen format
+                        tool_response_content = f"\n<tool_response>\n{json.dumps(action_result, indent=2)}\n</tool_response>\n\n"
+                        
+                        # Stream the tool response
+                        tool_response_chunk = {
+                            "choices": [{
+                                "delta": {
+                                    "content": tool_response_content
+                                },
+                                "finish_reason": None
+                            }]
+                        }
+                        
+                        await websocket.send(json.dumps(tool_response_chunk))
+                        
+                        # Now continue generating the assistant's response after the tool call
+                        # Build context with the tool response
+                        updated_response = current_response + tool_response_content
+                        
+                        # Create a mock message to continue generation
+                        continue_messages = [
+                            {"role": "assistant", "content": updated_response}
+                        ]
+                        
+                        # Build tools schema and chat messages for continuation
+                        tools = await llm_server.build_tools_schema(mentioned_servers)
+                        chat_messages = llm_server.build_qwen_chat_messages([], tools)  # Empty conversation for context
+                        
+                        # Add the partial assistant response to continue from
+                        chat_messages.append({"role": "assistant", "content": updated_response})
+                        
+                        # Create sampling parameters for continuation
+                        sampling_params = SamplingParams(
+                            temperature=0.3,
+                            max_tokens=400,  # Remaining tokens for conclusion
+                            n=1,
+                            presence_penalty=0.1,
+                            ignore_eos=False
+                        )
+                        
+                        # Continue streaming from where we left off
+                        if hasattr(llm_server.llm, 'chat_stream'):
+                            import inspect
+                            sig = inspect.signature(llm_server.llm.chat_stream)
+                            if 'sampling_params' in sig.parameters:
+                                stream_iterator = llm_server.llm.chat_stream(chat_messages, sampling_params=sampling_params)
+                            else:
+                                stream_iterator = llm_server.llm.chat_stream(chat_messages)
+                        else:
+                            prompt = llm_server.llm._messages_to_prompt(chat_messages)
+                            stream_iterator = llm_server.llm.stream(prompt, sampling_params=sampling_params)
+                        
+                        # Continue streaming the response
+                        continuation_response = ""
+                        if hasattr(stream_iterator, '__aiter__'):
+                            async for chunk in stream_iterator:
+                                if websocket.close_code is not None:
+                                    break
+                                
+                                continuation_response += chunk
+                                
+                                stream_chunk = {
+                                    "choices": [{
+                                        "delta": {
+                                            "content": chunk
+                                        },
+                                        "finish_reason": None
+                                    }]
+                                }
+                                
+                                try:
+                                    await websocket.send(json.dumps(stream_chunk))
+                                    await asyncio.sleep(0.02)
+                                except websockets.exceptions.ConnectionClosed:
+                                    break
+                        else:
+                            for chunk in stream_iterator:
+                                if websocket.close_code is not None:
+                                    break
+                                
+                                continuation_response += chunk
+                                
+                                stream_chunk = {
+                                    "choices": [{
+                                        "delta": {
+                                            "content": chunk
+                                        },
+                                        "finish_reason": None
+                                    }]
+                                }
+                                
+                                try:
+                                    await websocket.send(json.dumps(stream_chunk))
+                                    await asyncio.sleep(0.02)
+                                except websockets.exceptions.ConnectionClosed:
+                                    break
+                        
+                        # Send final chunk
+                        if websocket.close_code is None:
+                            final_chunk = {
+                                "choices": [{
+                                    "delta": {},
+                                    "finish_reason": "stop"
+                                }]
+                            }
+                            
+                            await websocket.send(json.dumps(final_chunk))
+                            
+                            # Save complete response to task
+                            if task_id:
+                                complete_response = updated_response + continuation_response
+                                llm_server.task_manager.add_message(task_id, 'assistant', complete_response)
+                                logger.info(f"Saved complete tool response to task {task_id}")
+                    
+                    except Exception as e:
+                        logger.error(f"Error executing tool and continuing: {e}")
+                        error_chunk = {
+                            "choices": [{
+                                "delta": {
+                                    "content": f"\n\n❌ **Error executing tool:** {str(e)}"
+                                },
+                                "finish_reason": "stop"
+                            }]
+                        }
+                        await websocket.send(json.dumps(error_chunk))
+                    
                     continue
                 
                 # Handle task creation requests

@@ -146,6 +146,43 @@ export default function useWebSocket({
                             setIsStreaming(true)
                         }
 
+                        if (choice.finish_reason === 'tool_call_requested') {
+                            console.log('Tool call requested, showing modal')
+
+                            // Add any final content chunk
+                            if (choice.delta?.content) {
+                                currentResponseRef.current += choice.delta.content
+                                setCurrentResponse(currentResponseRef.current)
+                            }
+
+                            // Extract tool call and thinking
+                            const toolCallMatch = currentResponseRef.current.match(/<tool_call>(.*?)<\/tool_call>/s)
+                            const thinkingMatch = currentResponseRef.current.match(/<think>(.*?)<\/think>/s)
+
+                            if (toolCallMatch) {
+                                try {
+                                    const toolCall = JSON.parse(toolCallMatch[1])
+                                    const thinking = thinkingMatch ? thinkingMatch[1].trim() : undefined
+
+                                    // Trigger tool call modal
+                                    const toolCallEvent = new CustomEvent('toolCallRequested', {
+                                        detail: {
+                                            toolCall,
+                                            thinking,
+                                            fullResponse: currentResponseRef.current
+                                        }
+                                    })
+                                    window.dispatchEvent(toolCallEvent)
+
+                                    // Pause streaming - don't finalize message yet
+                                    setIsStreaming(false)
+                                    return
+                                } catch (e) {
+                                    console.error('Error parsing tool call:', e)
+                                }
+                            }
+                        }
+
                         if (choice.finish_reason === 'stop' || choice.finish_reason === 'length') {
                             console.log('Stream finished, finalizing message')
 
@@ -474,6 +511,85 @@ export default function useWebSocket({
         wsRef.current.send(JSON.stringify(request))
     }, [connectionStatus])
 
+    const executeMcpAction = useCallback(async (serverId: string, actionName: string, parameters: Record<string, any>): Promise<any> => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            console.error('WebSocket not connected for MCP action execution')
+            return null
+        }
+
+        return new Promise((resolve) => {
+            const request = {
+                type: 'execute_mcp_action',
+                server_id: serverId,
+                action_name: actionName,
+                parameters: parameters
+            }
+
+            // Set up one-time listener for action result
+            const ws = wsRef.current!
+            const originalOnMessage = ws.onmessage
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data)
+
+                    if (data.type === 'mcp_action_result') {
+                        // Restore original message handler
+                        if (wsRef.current) {
+                            wsRef.current.onmessage = originalOnMessage
+                        }
+                        resolve(data)
+                        return
+                    }
+
+                    // Pass other messages to original handler
+                    if (originalOnMessage) {
+                        originalOnMessage.call(ws, event)
+                    }
+                } catch (error) {
+                    console.error('Error parsing MCP action response:', error)
+                    if (wsRef.current) {
+                        wsRef.current.onmessage = originalOnMessage
+                    }
+                    resolve({ error: 'Failed to parse response' })
+                }
+            }
+
+            ws.send(JSON.stringify(request))
+        })
+    }, [connectionStatus])
+
+    const executeToolAndContinue = useCallback(async (
+        serverId: string,
+        toolName: string,
+        parameters: Record<string, any>,
+        currentResponse: string,
+        mentionedServers: string[],
+        model: string = 'qwen2.5-vl',
+        taskId?: string
+    ): Promise<void> => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            console.error('WebSocket not connected for tool execution and continuation')
+            return
+        }
+
+        const request = {
+            type: 'execute_tool_and_continue',
+            server_id: serverId,
+            tool_name: toolName,
+            parameters: parameters,
+            current_response: currentResponse,
+            mentioned_servers: mentionedServers,
+            model: model,
+            task_id: taskId
+        }
+
+        // Resume streaming mode
+        setIsStreaming(true)
+
+        wsRef.current.send(JSON.stringify(request))
+    }, [connectionStatus])
+
     return {
         connectionStatus,
         messages,
@@ -492,6 +608,8 @@ export default function useWebSocket({
         createTask,
         getTask,
         clearCurrentResponse,
-        sendLearningFeedback
+        sendLearningFeedback,
+        executeMcpAction,
+        executeToolAndContinue
     }
 } 

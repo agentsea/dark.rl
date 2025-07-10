@@ -121,28 +121,8 @@ export default function MCPServerDropdown({
                                     >
                                         <div className="flex items-start justify-between">
                                             <div className="flex-1">
-                                                <div className="flex items-center gap-2">
-                                                    <div className="font-mono font-semibold transition-colors" style={{ color: '#61FDFC' }}>
-                                                        @{server.id}
-                                                    </div>
-                                                    {server.requires_api_key && (
-                                                        <span
-                                                            className="text-xs font-mono px-1 py-0.5 rounded"
-                                                            style={{
-                                                                backgroundColor: server.api_key_available
-                                                                    ? 'rgba(34, 197, 94, 0.2)'
-                                                                    : 'rgba(239, 68, 68, 0.2)',
-                                                                color: server.api_key_available
-                                                                    ? '#22c55e'
-                                                                    : '#ef4444',
-                                                                border: `1px solid ${server.api_key_available
-                                                                    ? 'rgba(34, 197, 94, 0.3)'
-                                                                    : 'rgba(239, 68, 68, 0.3)'}`
-                                                            }}
-                                                        >
-                                                            {server.api_key_available ? '🔓 KEY' : '🔐 NO KEY'}
-                                                        </span>
-                                                    )}
+                                                <div className="font-mono font-semibold transition-colors" style={{ color: '#61FDFC' }}>
+                                                    @{server.id}
                                                 </div>
                                                 <div className="text-sm font-mono mt-1 transition-colors" style={{ color: '#61FDFC', opacity: 0.8 }}>
                                                     {server.name}
@@ -150,11 +130,6 @@ export default function MCPServerDropdown({
                                                 <div className="text-xs font-mono mt-1 transition-colors" style={{ color: '#61FDFC', opacity: 0.6 }}>
                                                     {server.description}
                                                 </div>
-                                                {server.requires_api_key && !server.api_key_available && (
-                                                    <div className="text-xs font-mono mt-1" style={{ color: '#ef4444', opacity: 0.8 }}>
-                                                        Click to configure {server.api_key_env} API key
-                                                    </div>
-                                                )}
                                             </div>
                                             <div className="text-xs font-mono ml-2 transition-colors" style={{ color: '#61FDFC' }}>
                                                 ↵
