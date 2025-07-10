@@ -11,9 +11,17 @@ import logging
 import websockets
 import os
 import re
-import json_repair
 from typing import Dict, Any, List
 from pathlib import Path
+
+# Rich imports for beautiful logging
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.markdown import Markdown
+from rich.syntax import Syntax
+from rich import box
 
 # Import Dark.RL components
 from dark.online_llm import AsyncOnlineLLM, BatchConfig
@@ -22,8 +30,16 @@ from task_manager import TaskManager
 from mcp_use import MCPClient
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[logging.StreamHandler()]
+)
 logger = logging.getLogger(__name__)
+
+# Initialize Rich console for beautiful output
+console = Console()
 
 def load_local_api_keys() -> Dict[str, str]:
     """Load API keys from local ~/.agentsea/api_keys.json file"""
@@ -495,16 +511,44 @@ class DarkRLLLMServer:
         system_content = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
         
         if tools:
-            system_content += "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
-            system_content += "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n"
+            system_content += "\n\n" + "❗"*60 + "\n"
+            system_content += "THIS IS NOT A CODING TUTORIAL - YOU HAVE REAL TOOLS!\n"
+            system_content += "❗"*60 + "\n\n"
+            
+            system_content += "STOP generating JavaScript examples!\n"
+            system_content += "STOP saying 'you need to write a script'!\n"
+            system_content += "STOP explaining how to use Playwright!\n\n"
+            
+            system_content += "YOU ARE A ROBOT WITH BROWSER CONTROL.\n"
+            system_content += "When asked to find restaurants, YOU go find them.\n"
+            system_content += "When asked to navigate, YOU navigate.\n"
+            system_content += "When asked to click, YOU click.\n\n"
+            
+            system_content += "IMMEDIATE ACTION REQUIRED:\n"
+            system_content += "- User says 'find restaurants' → YOU call browser_navigate\n"
+            system_content += "- User says 'click button' → YOU call browser_click\n"
+            system_content += "- User says 'take screenshot' → YOU call browser_take_screenshot\n\n"
+            
+            system_content += "Available tools (USE THESE NOW!):\n<tools>\n"
             
             for tool in tools:
                 system_content += json.dumps(tool, indent=2) + "\n"
             
             system_content += "</tools>\n\n"
-            system_content += 'For each function call, return a JSON object with function name and arguments within <tool_call></tool_call> XML tags:\n'
-            system_content += '<tool_call>\n{"name": "function_name", "arguments": {"param": "value"}}\n</tool_call>\n\n'
-            system_content += 'You can also include your reasoning in <think></think> tags before making tool calls.'
+            
+            system_content += "MANDATORY FORMAT (INCLUDE THE XML TAGS!):\n"
+            system_content += "<tool_call>\n"
+            system_content += '{"name": "actual_tool_name", "arguments": {"actual_param": "actual_value"}}\n'
+            system_content += "</tool_call>\n\n"
+            
+            system_content += "CRITICAL: You MUST include the <tool_call> and </tool_call> XML tags!\n"
+            system_content += "Example response: <tool_call>\n"
+            system_content += '{"name": "browser_navigate", "arguments": {"url": "https://yelp.com"}}\n'
+            system_content += "</tool_call>\n\n"
+            
+            system_content += "RIGHT NOW: If the user mentions restaurants, immediately navigate to a restaurant site!\n"
+            system_content += "RIGHT NOW: If the user mentions websites, immediately navigate there!\n"
+            system_content += "NO EXPLANATIONS. NO CODE. JUST TOOL CALLS!"
         
         chat_messages.append({"role": "system", "content": system_content})
         
@@ -516,7 +560,105 @@ class DarkRLLLMServer:
             if role in ['user', 'assistant', 'system']:
                 chat_messages.append({"role": role, "content": content})
         
+        # Log the complete prompt being sent to model
+        self._log_prompt_to_model(chat_messages, tools)
+        
         return chat_messages
+    
+    def _log_final_processed_prompt(self, final_prompt: str):
+        """Log the final processed prompt that goes to the LLM with all formatting"""
+        console.print("\n" + "🔥"*100)
+        console.print(Panel(
+            "🚀 FINAL PROCESSED PROMPT TO LLM",
+            style="bold red",
+            border_style="red"
+        ))
+        
+        console.print(Panel(
+            final_prompt,
+            title=f"📤 EXACT PROMPT SENT TO MODEL ({len(final_prompt)} chars)",
+            style="white",
+            border_style="red"
+        ))
+        
+        console.print("🔥"*100 + "\n")
+    
+    def _log_prompt_to_model(self, chat_messages: List[dict], tools: List[dict] = None):
+        """Log the prompt being sent to the model with Rich formatting"""
+        console.print("\n" + "="*100)
+        console.print(Panel(
+            "🤖 SENDING PROMPT TO MODEL",
+            style="bold blue",
+            border_style="blue"
+        ))
+        
+        # Show tools if present
+        if tools:
+            tools_table = Table(title="🛠️ Available Tools", box=box.MINIMAL)
+            tools_table.add_column("Name", style="cyan", no_wrap=True)
+            tools_table.add_column("Description", style="white")
+            
+            for tool in tools:
+                tools_table.add_row(
+                    tool.get("name", "unknown"),
+                    tool.get("description", "No description")[:80] + "..." if len(tool.get("description", "")) > 80 else tool.get("description", "")
+                )
+            
+            console.print(tools_table)
+        
+        # Show each message with full content
+        for i, msg in enumerate(chat_messages):
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            
+            # Color code by role
+            if role == "system":
+                style = "yellow"
+                icon = "⚙️"
+            elif role == "user":
+                style = "green"
+                icon = "👤"
+            elif role == "assistant":
+                style = "blue"
+                icon = "🤖"
+            else:
+                style = "white"
+                icon = "❓"
+            
+            # Show FULL content for debugging - no truncation
+            console.print(Panel(
+                content,
+                title=f"{icon} {role.upper()} MESSAGE {i+1} ({len(content)} chars)",
+                style=style,
+                border_style=style
+            ))
+        
+        console.print("="*100 + "\n")
+
+    def _log_model_response(self, response: str, response_type: str = "STREAMING"):
+        """Log the model's response with Rich formatting"""
+        console.print("\n" + "="*100)
+        console.print(Panel(
+            f"🤖 MODEL {response_type} RESPONSE",
+            style="bold magenta",
+            border_style="magenta"
+        ))
+        
+        # Show FULL response - no truncation
+        console.print(Panel(
+            response,
+            title=f"📝 RAW MODEL OUTPUT ({len(response)} chars)",
+            style="white",
+            border_style="magenta"
+        ))
+        
+        # Check for tool calls and thinking
+        if "<tool_call>" in response:
+            console.print("🔧 **TOOL CALL DETECTED** - Model is requesting tool execution")
+        if "<think>" in response:
+            console.print("🧠 **THINKING DETECTED** - Model is showing reasoning")
+        
+        console.print("="*100 + "\n")
 
     def extract_action_from_response(self, response: str) -> dict:
         """Extract action from response with thinking support (Qwen format)"""
@@ -639,7 +781,12 @@ class DarkRLLLMServer:
                 await self.stream_chat_response(websocket, messages, model, temperature, max_tokens, task_id)
                 
         except Exception as e:
-            logger.error(f"Error during streaming setup: {e}")
+            console.print(Panel(
+                f"❌ Error during streaming setup: {str(e)}",
+                title="🚨 STREAMING ERROR",
+                style="bold red",
+                border_style="red"
+            ))
             import traceback
             traceback.print_exc()
             
@@ -682,7 +829,12 @@ class DarkRLLLMServer:
             ignore_eos=False
         )
         
-        logger.info(f"Streaming chat response for {len(chat_messages)} messages...")
+        console.print(Panel(
+            f"📨 Streaming chat response for {len(chat_messages)} messages",
+            title="💬 CHAT MODE ACTIVATED",
+            style="bold magenta",
+            border_style="magenta"
+        ))
         
         # Stream response from actual LLM using chat format
         accumulated_response = ""
@@ -786,12 +938,31 @@ class DarkRLLLMServer:
                 # Save assistant response to database if task_id provided
                 if task_id and accumulated_response:
                     self.task_manager.add_message(task_id, 'assistant', accumulated_response)
-                    logger.info(f"Saved assistant response to task {task_id}")
+                    
+                    console.print(Panel(
+                        f"💾 Saved chat response to task: {task_id}\n"
+                        f"📏 Length: {len(accumulated_response)} characters\n"
+                        f"📊 Total chunks: {chunk_count}",
+                        title="✅ CHAT STREAMING COMPLETED",
+                        style="bold green",
+                        border_style="green"
+                    ))
             else:
-                logger.info(f"Streaming stopped due to closed connection. Sent {chunk_count} chunks")
+                console.print(Panel(
+                    f"⚠️ Streaming stopped due to closed connection\n"
+                    f"📊 Sent {chunk_count} chunks before disconnect",
+                    title="🔌 CONNECTION CLOSED",
+                    style="bold yellow",
+                    border_style="yellow"
+                ))
                 
         except Exception as stream_error:
-            logger.error(f"Error in streaming loop: {stream_error}")
+            console.print(Panel(
+                f"❌ Error in streaming loop: {str(stream_error)}",
+                title="🚨 STREAMING ERROR",
+                style="bold red",
+                border_style="red"
+            ))
             if websocket.close_code is None:
                 # Try to send error response
                 try:
@@ -824,23 +995,62 @@ class DarkRLLLMServer:
             # Build Qwen chat messages with tools
             chat_messages = self.build_qwen_chat_messages(messages, tools)
             
-            logger.info(f"🛠️ Built Qwen chat with {len(tools)} tools")
+            console.print(Panel(
+                f"🛠️ Built Qwen chat with {len(tools)} tools\n"
+                f"🎯 Mentioned servers: {', '.join(mentioned_servers)}",
+                title="📋 TOOL MODE ACTIVATED",
+                style="bold cyan",
+                border_style="cyan"
+            ))
             
             # Create sampling parameters optimized for tool calling
             sampling_params = SamplingParams(
-                temperature=max(0.1, min(temperature, 0.4)),  # Moderate temperature for reasoning + tool calls
+                temperature=0.3,  # Slightly higher temperature to encourage tool calling over safe responses
                 max_tokens=min(max_tokens, 800),  # More tokens for thinking + tool calls
                 n=1,
-                presence_penalty=0.1,
+                presence_penalty=0.0,  # No presence penalty to allow tool call patterns
                 ignore_eos=False
             )
+            
+            console.print(Panel(
+                f"🌡️ Temperature: {sampling_params.temperature}\n"
+                f"📏 Max tokens: {sampling_params.max_tokens}\n"
+                f"🔄 Presence penalty: {sampling_params.presence_penalty}",
+                title="⚙️ SAMPLING PARAMETERS",
+                style="dim",
+                border_style="dim"
+            ))
             
             # Stream the response using chat format
             accumulated_response = ""
             chunk_count = 0
             
-            # Use chat_stream if available
+            console.print(Panel(
+                "Starting model response generation...",
+                title="🚀 MODEL STREAMING STARTED",
+                style="bold green",
+                border_style="green"
+            ))
+            
+            # Use streaming - force it to use actual streaming
+            console.print(Panel(
+                "🔄 Attempting to use streaming interface...",
+                title="🚀 STREAMING SETUP",
+                style="bold cyan"
+            ))
+            
+            # Try chat_stream first
             if hasattr(self.llm, 'chat_stream'):
+                console.print("✅ Using chat_stream interface")
+                
+                # Try to capture the final prompt that will be generated
+                if hasattr(self.llm, '_messages_to_prompt'):
+                    try:
+                        final_prompt = self.llm._messages_to_prompt(chat_messages)
+                        self._log_final_processed_prompt(final_prompt)
+                    except Exception as e:
+                        console.print(f"⚠️ Could not capture final prompt: {e}")
+                
                 import inspect
                 sig = inspect.signature(self.llm.chat_stream)
                 if 'sampling_params' in sig.parameters:
@@ -849,15 +1059,31 @@ class DarkRLLLMServer:
                     stream_iterator = self.llm.chat_stream(chat_messages)
             else:
                 # Fallback to prompt-based streaming
+                console.print("⚠️ Falling back to prompt-based streaming")
                 prompt = self.llm._messages_to_prompt(chat_messages)
+                self._log_final_processed_prompt(prompt)
                 stream_iterator = self.llm.stream(prompt, sampling_params=sampling_params)
+            
+            # Check if the iterator is actually async
+            if hasattr(stream_iterator, '__aiter__'):
+                console.print("✅ Got async iterator for streaming")
+            else:
+                console.print("⚠️ Got sync iterator for streaming")
             
             # Handle streaming
             if hasattr(stream_iterator, '__aiter__'):
+                console.print("🔄 Starting async streaming loop...")
+                chunk_number = 0
                 # Async generator
                 async for chunk in stream_iterator:
+                    chunk_number += 1
+                    if chunk_number <= 5:  # Log first few chunks
+                        console.print(f"📦 Chunk #{chunk_number}: '{chunk}' ({len(chunk)} chars)")
+                    elif chunk_number == 6:
+                        console.print("📦 ... (continuing to stream, will only log important events)")
+                    
                     if websocket.close_code is not None:
-                        logger.warning("WebSocket closed during action streaming")
+                        console.print("⚠️ WebSocket closed during action streaming")
                         break
                     
                     accumulated_response += chunk
@@ -868,8 +1094,19 @@ class DarkRLLLMServer:
                         "</tool_call>" in accumulated_response and
                         chunk_count > 5):  # Make sure we have substantial content
                         
-                        # Pause streaming and wait for user approval
-                        logger.info("🛠️ Tool call detected, pausing for user approval")
+                        # Extract and display the tool call
+                        tool_call_match = accumulated_response.split('<tool_call>')[1].split('</tool_call>')[0]
+                        thinking_match = ""
+                        if "<think>" in accumulated_response and "</think>" in accumulated_response:
+                            thinking_match = accumulated_response.split('<think>')[1].split('</think>')[0]
+                        
+                        console.print(Panel(
+                            f"🧠 **AI Thinking:**\n{thinking_match}\n\n🛠️ **Tool Call:**\n{tool_call_match}" if thinking_match 
+                            else f"🛠️ **Tool Call:**\n{tool_call_match}",
+                            title="⏸️ TOOL CALL DETECTED - PAUSING FOR USER APPROVAL",
+                            style="bold yellow",
+                            border_style="yellow"
+                        ))
                         
                         # Stream current content
                         stream_chunk = {
@@ -884,7 +1121,11 @@ class DarkRLLLMServer:
                         try:
                             await websocket.send(json.dumps(stream_chunk))
                         except websockets.exceptions.ConnectionClosed:
-                            logger.warning("WebSocket connection closed while sending tool call chunk")
+                            console.print(Panel(
+                                "WebSocket connection closed while sending tool call chunk",
+                                title="⚠️ CONNECTION CLOSED",
+                                style="bold red"
+                            ))
                             break
                         
                         # This will trigger the frontend to show the tool call modal
@@ -905,13 +1146,23 @@ class DarkRLLLMServer:
                         await websocket.send(json.dumps(stream_chunk))
                         await asyncio.sleep(0.02)
                     except websockets.exceptions.ConnectionClosed:
-                        logger.warning("WebSocket connection closed while sending action chunk")
+                        console.print("⚠️ WebSocket connection closed while sending action chunk")
                         break
+                
+                console.print(f"✅ Async streaming completed after {chunk_count} chunks")
             else:
+                console.print("🔄 Starting sync streaming loop...")
+                chunk_number = 0
                 # Regular generator
                 for chunk in stream_iterator:
+                    chunk_number += 1
+                    if chunk_number <= 5:  # Log first few chunks
+                        console.print(f"📦 Sync Chunk #{chunk_number}: '{chunk}' ({len(chunk)} chars)")
+                    elif chunk_number == 6:
+                        console.print("📦 ... (continuing sync stream, will only log important events)")
+                    
                     if websocket.close_code is not None:
-                        logger.warning("WebSocket closed during action streaming")
+                        console.print("⚠️ WebSocket closed during action streaming")
                         break
                     
                     accumulated_response += chunk
@@ -922,8 +1173,7 @@ class DarkRLLLMServer:
                         "</tool_call>" in accumulated_response and
                         chunk_count > 5):  # Make sure we have substantial content
                         
-                        # Pause streaming and wait for user approval
-                        logger.info("🛠️ Tool call detected, pausing for user approval")
+                        console.print("⏸️ Tool call detected in sync stream, pausing for user approval")
                         
                         # Stream current content
                         stream_chunk = {
@@ -938,7 +1188,7 @@ class DarkRLLLMServer:
                         try:
                             await websocket.send(json.dumps(stream_chunk))
                         except websockets.exceptions.ConnectionClosed:
-                            logger.warning("WebSocket connection closed while sending tool call chunk")
+                            console.print("⚠️ WebSocket connection closed while sending tool call chunk")
                             break
                         
                         # This will trigger the frontend to show the tool call modal
@@ -958,8 +1208,10 @@ class DarkRLLLMServer:
                         await websocket.send(json.dumps(stream_chunk))
                         await asyncio.sleep(0.02)
                     except websockets.exceptions.ConnectionClosed:
-                        logger.warning("WebSocket connection closed while sending action chunk")
+                        console.print("⚠️ WebSocket connection closed while sending action chunk")
                         break
+                
+                console.print(f"✅ Sync streaming completed after {chunk_count} chunks")
             
             # If we reach here, no tool call was detected, send final chunk
             if websocket.close_code is None:
@@ -971,15 +1223,37 @@ class DarkRLLLMServer:
                 }
                 
                 await websocket.send(json.dumps(final_chunk))
-                logger.info(f"Tool-enabled response completed. Length: {len(accumulated_response)} characters")
+                
+                # Log the final response
+                self._log_model_response(accumulated_response, "FINAL")
+                
+                console.print(Panel(
+                    f"🎯 Tool-enabled response completed\n"
+                    f"📏 Length: {len(accumulated_response)} characters\n"
+                    f"📊 Total chunks: {chunk_count}",
+                    title="✅ ACTION STREAMING COMPLETED",
+                    style="bold green",
+                    border_style="green"
+                ))
                 
                 # Save to task if provided
                 if task_id and accumulated_response:
                     self.task_manager.add_message(task_id, 'assistant', accumulated_response)
-                    logger.info(f"Saved tool response to task {task_id}")
+                    
+                    console.print(Panel(
+                        f"💾 Saved tool response to task: {task_id}",
+                        title="📚 TASK UPDATED",
+                        style="bold cyan",
+                        border_style="cyan"
+                    ))
             
         except Exception as e:
-            logger.error(f"Error in action streaming: {e}")
+            console.print(Panel(
+                f"❌ Error in action streaming: {str(e)}",
+                title="🚨 ACTION STREAMING ERROR",
+                style="bold red",
+                border_style="red"
+            ))
             import traceback
             traceback.print_exc()
             
@@ -1000,7 +1274,13 @@ class DarkRLLLMServer:
 async def handle_client(websocket):
     """Handle WebSocket client connections"""
     client_addr = websocket.remote_address
-    logger.info(f"Client connected: {client_addr}")
+    
+    console.print(Panel(
+        f"🌐 Client connected: {client_addr[0]}:{client_addr[1]}",
+        title="🔗 NEW CONNECTION",
+        style="bold blue",
+        border_style="blue"
+    ))
     
     llm_server = DarkRLLLMServer()
     
@@ -1164,11 +1444,26 @@ async def handle_client(websocket):
                         await websocket.send(json.dumps(error_response))
                         continue
                     
-                    logger.info(f"🚀 Executing tool {tool_name} on server {server_id} and continuing stream")
+                    console.print(Panel(
+                        f"🚀 Executing tool: **{tool_name}**\n"
+                        f"📡 Server: **{server_id}**\n"
+                        f"⚙️ Parameters: `{json.dumps(parameters, indent=2)}`",
+                        title="🔧 TOOL EXECUTION STARTED",
+                        style="bold blue",
+                        border_style="blue"
+                    ))
                     
                     try:
                         # Execute the tool
                         action_result = await llm_server.execute_mcp_action(server_id, tool_name, parameters)
+                        
+                        console.print(Panel(
+                            f"✅ Tool executed successfully\n\n"
+                            f"**Result:**\n```json\n{json.dumps(action_result, indent=2)}\n```",
+                            title="🎉 TOOL EXECUTION COMPLETED",
+                            style="bold green",
+                            border_style="green"
+                        ))
                         
                         # Format tool response in Qwen format
                         tool_response_content = f"\n<tool_response>\n{json.dumps(action_result, indent=2)}\n</tool_response>\n\n"
@@ -1209,6 +1504,13 @@ async def handle_client(websocket):
                             presence_penalty=0.1,
                             ignore_eos=False
                         )
+                        
+                        console.print(Panel(
+                            "🔄 Continuing model generation after tool execution...",
+                            title="↩️ RESUMING STREAM",
+                            style="bold cyan",
+                            border_style="cyan"
+                        ))
                         
                         # Continue streaming from where we left off
                         if hasattr(llm_server.llm, 'chat_stream'):
@@ -1282,10 +1584,23 @@ async def handle_client(websocket):
                             if task_id:
                                 complete_response = updated_response + continuation_response
                                 llm_server.task_manager.add_message(task_id, 'assistant', complete_response)
-                                logger.info(f"Saved complete tool response to task {task_id}")
+                                
+                                console.print(Panel(
+                                    f"💾 Saved complete response to task: {task_id}\n"
+                                    f"📏 Total length: {len(complete_response)} characters",
+                                    title="✅ TASK SAVED",
+                                    style="bold green",
+                                    border_style="green"
+                                ))
                     
                     except Exception as e:
-                        logger.error(f"Error executing tool and continuing: {e}")
+                        console.print(Panel(
+                            f"❌ Error executing tool and continuing: {str(e)}",
+                            title="🚨 TOOL EXECUTION ERROR",
+                            style="bold red",
+                            border_style="red"
+                        ))
+                        
                         error_chunk = {
                             "choices": [{
                                 "delta": {
@@ -1359,6 +1674,185 @@ async def handle_client(websocket):
                         "tasks": tasks
                     }
                     await websocket.send(json.dumps(response))
+                    continue
+
+                # Handle enhanced correction requests  
+                if request.get('type') == 'correction_with_execution':
+                    console.print(Panel(
+                        f"🔧 Received correction request",
+                        title="📝 CORRECTION REQUEST",
+                        style="bold yellow",
+                        border_style="yellow"
+                    ))
+                    
+                    try:
+                        task_id = request.get('task_id')
+                        message_index = request.get('message_index')  # Index of bad response to replace
+                        corrected_tool_call = request.get('corrected_tool_call')  # {"name": "tool", "arguments": {...}}
+                        thought = request.get('thought', '')  # Reasoning for the correction
+                        should_execute = request.get('should_execute', False)  # Whether to execute the correction
+                        
+                        if not task_id or corrected_tool_call is None:
+                            error_response = {
+                                "type": "error",
+                                "error": {"message": "task_id and corrected_tool_call are required", "type": "invalid_request"}
+                            }
+                            await websocket.send(json.dumps(error_response))
+                            continue
+                        
+                        console.print(Panel(
+                            f"🎯 **Task ID:** {task_id}\n"
+                            f"🔧 **Corrected Tool:** {corrected_tool_call.get('name', 'unknown')}\n"
+                            f"⚙️ **Parameters:** {json.dumps(corrected_tool_call.get('arguments', {}), indent=2)}\n"
+                            f"🧠 **Thought:** {thought}\n"
+                            f"🚀 **Execute:** {'Yes' if should_execute else 'No'}",
+                            title="📋 CORRECTION DETAILS",
+                            style="bold cyan",
+                            border_style="cyan"
+                        ))
+                        
+                        # Build the corrected response with thought tags
+                        corrected_response = ""
+                        if thought:
+                            corrected_response += f"<thought>\n{thought}\n</thought>\n\n"
+                        
+                        corrected_response += f"<tool_call>\n{json.dumps(corrected_tool_call, indent=2)}\n</tool_call>"
+                        
+                        console.print(Panel(
+                            corrected_response,
+                            title="✅ CORRECTED RESPONSE",
+                            style="bold green", 
+                            border_style="green"
+                        ))
+                        
+                        # Execute the corrected action if requested
+                        execution_result = None
+                        if should_execute:
+                            console.print(Panel(
+                                "🚀 Executing corrected action...",
+                                title="⚡ EXECUTION STARTED",
+                                style="bold blue",
+                                border_style="blue"
+                            ))
+                            
+                            tool_name = corrected_tool_call.get('name')
+                            parameters = corrected_tool_call.get('arguments', {})
+                            
+                            # Find which server this tool belongs to
+                            server_id = None
+                            server_actions = await llm_server.get_mcp_server_actions(['playwright', 'filesystem', 'sequential-thinking'])
+                            for sid, actions in server_actions.items():
+                                for action in actions:
+                                    if action.get('name') == tool_name:
+                                        server_id = sid
+                                        break
+                                if server_id:
+                                    break
+                            
+                            if server_id:
+                                execution_result = await llm_server.execute_mcp_action(server_id, tool_name, parameters)
+                                
+                                console.print(Panel(
+                                    f"✅ **Execution successful!**\n\n"
+                                    f"**Result:**\n```json\n{json.dumps(execution_result, indent=2)}\n```",
+                                    title="🎉 EXECUTION COMPLETED",
+                                    style="bold green",
+                                    border_style="green"
+                                ))
+                                
+                                # Add tool response to corrected response
+                                tool_response_content = f"\n\n<tool_response>\n{json.dumps(execution_result, indent=2)}\n</tool_response>"
+                                corrected_response += tool_response_content
+                            else:
+                                console.print(Panel(
+                                    f"❌ Could not find server for tool: {tool_name}",
+                                    title="🚨 EXECUTION ERROR",
+                                    style="bold red",
+                                    border_style="red"
+                                ))
+                        
+                        # Replace the bad response in the task
+                        task_data = llm_server.get_task(task_id)
+                        if not task_data.get('error'):
+                            # Update the specific message
+                            success = llm_server.task_manager.replace_message(task_id, message_index, corrected_response)
+                            
+                            if success:
+                                console.print(Panel(
+                                    f"💾 **Replaced bad response** in task {task_id}\n"
+                                    f"📍 **Message index:** {message_index}\n"
+                                    f"📝 **New length:** {len(corrected_response)} chars",
+                                    title="🔄 RESPONSE REPLACED",
+                                    style="bold purple",
+                                    border_style="purple"
+                                ))
+                            else:
+                                console.print(Panel(
+                                    f"❌ Failed to replace message at index {message_index}",
+                                    title="🚨 REPLACEMENT ERROR",
+                                    style="bold red",
+                                    border_style="red"
+                                ))
+                        
+                        # Apply learning from the correction
+                        if task_data and not task_data.get('error'):
+                            messages = task_data.get('messages', [])
+                            # Find the user prompt that led to the bad response
+                            user_prompt = None
+                            if message_index > 0:
+                                for i in range(message_index - 1, -1, -1):
+                                    if messages[i]['role'] == 'user':
+                                        user_prompt = messages[i]['content']
+                                        break
+                            
+                            if user_prompt:
+                                await llm_server.initialize_model()
+                                
+                                # Create learning example with the corrected response
+                                learning_example = [
+                                    {"role": "user", "content": user_prompt},
+                                    {"role": "assistant", "content": corrected_response}
+                                ]
+                                
+                                # Apply corrective learning
+                                await llm_server.llm.learn(
+                                    learning_example,
+                                    adapter="correction_learning",
+                                    steps=15,  # More intensive for corrections
+                                    lr=2e-4   # Higher learning rate for corrections
+                                )
+                                
+                                console.print(Panel(
+                                    "🧠 Applied corrective learning to model",
+                                    title="🎓 LEARNING COMPLETED",
+                                    style="bold magenta",
+                                    border_style="magenta"
+                                ))
+                        
+                        # Send response back to frontend
+                        response = {
+                            'type': 'correction_processed',
+                            'success': True,
+                            'corrected_response': corrected_response,
+                            'execution_result': execution_result,
+                            'message_replaced': success if 'success' in locals() else False
+                        }
+                        await websocket.send(json.dumps(response))
+                        
+                    except Exception as e:
+                        console.print(Panel(
+                            f"❌ Error processing correction: {str(e)}",
+                            title="🚨 CORRECTION ERROR",
+                            style="bold red",
+                            border_style="red"
+                        ))
+                        
+                        error_response = {
+                            'type': 'error',
+                            'error': f'Failed to process correction: {str(e)}'
+                        }
+                        await websocket.send(json.dumps(error_response))
+                    
                     continue
 
                 # Handle learning feedback requests
@@ -1608,21 +2102,46 @@ async def main():
     host = "localhost"
     port = 8000
     
-    logger.info(f"Starting Dark.RL WebSocket server on {host}:{port}")
-    logger.info("Using real AsyncOnlineLLM for responses")
-    logger.info("Connect your frontend to: ws://localhost:8000")
+    console.print(Panel(
+        f"🚀 **Dark.RL WebSocket Server**\n\n"
+        f"🌐 **Host:** {host}\n"
+        f"🔌 **Port:** {port}\n"
+        f"🤖 **Engine:** AsyncOnlineLLM\n"
+        f"🛠️ **Features:** Real MCP servers, API key management, tool calling\n\n"
+        f"**Connect your frontend to:** ws://{host}:{port}\n\n"
+        f"⚡ **Ready for connections!**",
+        title="🔥 DARK.RL SERVER STARTING",
+        style="bold green",
+        border_style="green"
+    ))
     
     # Start server on root path
     async with websockets.serve(handle_client, host, port):
-        logger.info("Server started successfully")
+        console.print(Panel(
+            "✅ Server started successfully!\n"
+            "🎯 Ready to handle WebSocket connections",
+            title="🚀 SERVER READY",
+            style="bold blue",
+            border_style="blue"
+        ))
         await asyncio.Future()  # Run forever
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Server stopped by user")
+        console.print(Panel(
+            "🛑 Server stopped by user",
+            title="👋 SHUTDOWN",
+            style="bold yellow",
+            border_style="yellow"
+        ))
     except Exception as e:
-        logger.error(f"Server error: {e}")
+        console.print(Panel(
+            f"❌ Server error: {str(e)}",
+            title="🚨 SERVER ERROR",
+            style="bold red",
+            border_style="red"
+        ))
         import traceback
         traceback.print_exc() 

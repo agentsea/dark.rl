@@ -590,6 +590,71 @@ export default function useWebSocket({
         wsRef.current.send(JSON.stringify(request))
     }, [connectionStatus])
 
+    const sendCorrectionWithExecution = useCallback(async (
+        taskId: string,
+        messageIndex: number,
+        correctedToolCall: { name: string; arguments: Record<string, any> },
+        thought: string,
+        shouldExecute: boolean = false
+    ): Promise<any> => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            console.error('WebSocket not connected for correction submission')
+            return null
+        }
+
+        return new Promise((resolve) => {
+            const request = {
+                type: 'correction_with_execution',
+                task_id: taskId,
+                message_index: messageIndex,
+                corrected_tool_call: correctedToolCall,
+                thought: thought,
+                should_execute: shouldExecute
+            }
+
+            // Set up one-time listener for correction response
+            const ws = wsRef.current!
+            const originalOnMessage = ws.onmessage
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data)
+
+                    if (data.type === 'correction_processed') {
+                        // Restore original message handler
+                        if (wsRef.current) {
+                            wsRef.current.onmessage = originalOnMessage
+                        }
+                        resolve(data)
+                        return
+                    }
+
+                    if (data.type === 'error') {
+                        console.error('Correction error:', data.error)
+                        if (wsRef.current) {
+                            wsRef.current.onmessage = originalOnMessage
+                        }
+                        resolve({ error: data.error })
+                        return
+                    }
+
+                    // Pass other messages to original handler
+                    if (originalOnMessage) {
+                        originalOnMessage.call(ws, event)
+                    }
+                } catch (error) {
+                    console.error('Error parsing correction response:', error)
+                    if (wsRef.current) {
+                        wsRef.current.onmessage = originalOnMessage
+                    }
+                    resolve({ error: 'Failed to parse response' })
+                }
+            }
+
+            ws.send(JSON.stringify(request))
+        })
+    }, [connectionStatus])
+
     return {
         connectionStatus,
         messages,
@@ -610,6 +675,7 @@ export default function useWebSocket({
         clearCurrentResponse,
         sendLearningFeedback,
         executeMcpAction,
-        executeToolAndContinue
+        executeToolAndContinue,
+        sendCorrectionWithExecution
     }
 } 

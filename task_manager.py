@@ -116,6 +116,16 @@ class TaskManager:
             """, (task_id,))
             
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_task_messages_with_indexes(self, task_id: str) -> List[Dict[str, Any]]:
+        """Get all messages for a task with their indexes for correction purposes"""
+        messages = self.get_task_messages(task_id)
+        
+        # Add index to each message
+        for i, message in enumerate(messages):
+            message['index'] = i
+            
+        return messages
     
     def add_message(self, task_id: str, role: str, content: str) -> bool:
         """Add a message to a task"""
@@ -136,6 +146,49 @@ class TaskManager:
             return True
         except Exception as e:
             print(f"Error adding message: {e}")
+            return False
+
+    def replace_message(self, task_id: str, message_index: int, new_content: str) -> bool:
+        """Replace a message at the specified index with new content"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # First get all messages ordered by timestamp to find the correct message ID
+                cursor = conn.execute("""
+                    SELECT id FROM messages 
+                    WHERE task_id = ? 
+                    ORDER BY timestamp ASC
+                """, (task_id,))
+                
+                message_ids = [row[0] for row in cursor.fetchall()]
+                
+                # Check if the index is valid
+                if message_index < 0 or message_index >= len(message_ids):
+                    print(f"Error: Invalid message index {message_index}. Task has {len(message_ids)} messages.")
+                    return False
+                
+                # Get the message ID at the specified index
+                target_message_id = message_ids[message_index]
+                
+                # Update the message content
+                conn.execute("""
+                    UPDATE messages 
+                    SET content = ?, timestamp = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (new_content, target_message_id))
+                
+                # Update task's updated_at timestamp
+                conn.execute("""
+                    UPDATE tasks SET updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (task_id,))
+                
+                conn.commit()
+                
+                print(f"✅ Successfully replaced message {message_index} in task {task_id}")
+                return True
+                
+        except Exception as e:
+            print(f"Error replacing message: {e}")
             return False
     
     def get_recent_tasks(self, limit: int = 10) -> List[Dict[str, Any]]:

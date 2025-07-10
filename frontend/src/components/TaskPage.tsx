@@ -3,6 +3,7 @@ import { motion } from 'framer-motion'
 import { useParams, useNavigate } from 'react-router-dom'
 import TypingAnimation from './TypingAnimation'
 import MCPServerDropdown from './MCPServerDropdown'
+import CorrectionModal from './CorrectionModal'
 import useWebSocket, { ConnectionStatus } from '../hooks/useWebSocket'
 
 interface Task {
@@ -171,7 +172,8 @@ function TaskPage() {
         getMcpServerActions,
         getTask,
         clearCurrentResponse,
-        sendLearningFeedback
+        sendLearningFeedback,
+        sendCorrectionWithExecution
     } = useWebSocket({
         url: 'ws://localhost:8000',
         autoConnect: true,
@@ -416,6 +418,10 @@ function TaskPage() {
     const [showMcpActionsBox, setShowMcpActionsBox] = useState<string | null>(null)
     const [selectedAction, setSelectedAction] = useState<{ serverId: string; actionName: string; description: string } | null>(null)
 
+    // State for correction modal
+    const [correctionModalOpen, setCorrectionModalOpen] = useState<boolean>(false)
+    const [correctionMessageIndex, setCorrectionMessageIndex] = useState<number>(-1)
+
     // Handle learning feedback for assistant messages
     const handleLearningFeedback = async (type: string, message: TaskMessage, index: number) => {
         if (!id) return
@@ -435,14 +441,15 @@ function TaskPage() {
             }
 
             if (type === 'correct') {
-                // Show MCP server actions selection
-                setShowMcpActionsBox(buttonId)
+                // Open correction modal
+                setCorrectionMessageIndex(index)
+                setCorrectionModalOpen(true)
 
                 // Get MCP server actions for this task
                 if (task?.mcp_servers && task.mcp_servers.length > 0) {
                     getMcpServerActions(task.mcp_servers)
                 }
-                return // Don't send feedback yet, wait for action selection
+                return // Don't send feedback yet, wait for correction submission
             }
 
             await sendLearningFeedback(type, message, id, userComment)
@@ -474,14 +481,15 @@ function TaskPage() {
             }
 
             if (type === 'correct') {
-                // Show MCP server actions selection
-                setShowMcpActionsBox(buttonId)
+                // Open correction modal for current response
+                setCorrectionMessageIndex(-1) // -1 indicates current response
+                setCorrectionModalOpen(true)
 
                 // Get MCP server actions for this task
                 if (task?.mcp_servers && task.mcp_servers.length > 0) {
                     getMcpServerActions(task.mcp_servers)
                 }
-                return // Don't send feedback yet, wait for action selection
+                return // Don't send feedback yet, wait for correction submission
             }
 
             const message = { role: 'assistant', content: currentResponse, timestamp: new Date().toISOString() }
@@ -569,6 +577,90 @@ function TaskPage() {
     const handleCommentCancel = () => {
         setActiveCommentBox(null)
         setCommentText('')
+    }
+
+    // Convert MCP server actions to tool format for CorrectionModal
+    const getAvailableTools = () => {
+        const tools: Array<{
+            name: string
+            description: string
+            parameters: {
+                type: string
+                properties: Record<string, any>
+                required: string[]
+            }
+        }> = []
+
+        if (task?.mcp_servers) {
+            task.mcp_servers.forEach(serverId => {
+                const actions = mcpServerActions[serverId] || []
+                actions.forEach(action => {
+                    let parameters = {
+                        type: 'object',
+                        properties: {},
+                        required: []
+                    }
+
+                    if (action.parameters && typeof action.parameters === 'object') {
+                        parameters = {
+                            type: action.parameters.type || 'object',
+                            properties: action.parameters.properties || {},
+                            required: action.parameters.required || []
+                        }
+                    }
+
+                    tools.push({
+                        name: `${serverId}.${action.name}`,
+                        description: action.description,
+                        parameters
+                    })
+                })
+            })
+        }
+
+        return tools
+    }
+
+    // Handle correction modal submission
+    const handleCorrectionSubmit = async (
+        taskId: string,
+        messageIndex: number,
+        correctedToolCall: { name: string; arguments: Record<string, any> },
+        thought: string,
+        shouldExecute: boolean
+    ) => {
+        try {
+            const result = await sendCorrectionWithExecution(
+                taskId,
+                messageIndex,
+                correctedToolCall,
+                thought,
+                shouldExecute
+            )
+
+            // Close modal
+            setCorrectionModalOpen(false)
+            setCorrectionMessageIndex(-1)
+
+            // If successful and should execute, reload task to see the results
+            if (result && !result.error && shouldExecute) {
+                setTimeout(async () => {
+                    try {
+                        const taskData = await getTask(taskId)
+                        if (taskData && !taskData.error) {
+                            setTaskMessages(taskData.messages || [])
+                        }
+                    } catch (error) {
+                        console.error('Error reloading task after correction:', error)
+                    }
+                }, 1000)
+            }
+
+            return result
+        } catch (error) {
+            console.error('Failed to submit correction:', error)
+            return { error: 'Failed to submit correction' }
+        }
     }
 
     // Generate unique button ID for hover tracking
@@ -1254,6 +1346,7 @@ function TaskPage() {
                                         onSelect={handleMCPServerSelect}
                                         onClose={closeMCPDropdown}
                                         query={mcpQuery}
+                                        onApiKeyRequired={() => { }}
                                     />
                                 </div>
                             </form>
@@ -1279,6 +1372,16 @@ function TaskPage() {
                     </motion.div>
                 </div>
             )}
+
+            {/* Correction Modal */}
+            <CorrectionModal
+                isOpen={correctionModalOpen}
+                onClose={() => setCorrectionModalOpen(false)}
+                availableTools={getAvailableTools()}
+                currentTaskId={id || ''}
+                messageIndex={correctionMessageIndex}
+                onSubmitCorrection={handleCorrectionSubmit}
+            />
         </div>
     )
 }
