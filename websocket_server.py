@@ -488,22 +488,8 @@ class DarkRLLLMServer:
                 tool_schema = {
                     "name": tool_name,
                     "description": description,
-                    "parameters": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
+                    "parameters": parameters  # Parameters are already in the correct JSON schema format
                 }
-                
-                # Convert parameters to proper schema format
-                for param_name, param_info in parameters.items():
-                    tool_schema["parameters"]["properties"][param_name] = {
-                        "type": param_info.get("type", "string"),
-                        "description": param_info.get("description", "")
-                    }
-                    
-                    if param_info.get("required", False):
-                        tool_schema["parameters"]["required"].append(param_name)
                 
                 tools.append(tool_schema)
         
@@ -1746,10 +1732,10 @@ async def handle_client(websocket):
                             border_style="cyan"
                         ))
                         
-                        # Build the corrected response with thought tags
+                        # Build the corrected response with think tags
                         corrected_response = ""
                         if thought:
-                            corrected_response += f"<thought>\n{thought}\n</thought>\n\n"
+                            corrected_response += f"<think>\n{thought}\n</think>\n\n"
                         
                         corrected_response += f"<tool_call>\n{json.dumps(corrected_tool_call, indent=2)}\n</tool_call>"
                         

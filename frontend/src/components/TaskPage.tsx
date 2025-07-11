@@ -679,8 +679,8 @@ function TaskPage() {
             setCorrectionModalOpen(false)
             setCorrectionMessageIndex(-1)
 
-            // If successful and should execute, reload task to see the results
-            if (result && !result.error && shouldExecute) {
+            // If successful, reload task to see the corrected response
+            if (result && !result.error) {
                 setTimeout(async () => {
                     try {
                         const taskData = await getTask(taskId)
@@ -690,7 +690,7 @@ function TaskPage() {
                     } catch (error) {
                         console.error('Error reloading task after correction:', error)
                     }
-                }, 1000)
+                }, 500) // Reduced timeout since we just need to reload the corrected message
             }
 
             return result

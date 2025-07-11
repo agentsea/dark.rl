@@ -145,7 +145,6 @@ export default function CorrectionModal({
 
             if (result.success) {
                 console.log('✅ Correction submitted successfully!')
-                alert('Correction submitted successfully!')
                 onClose()
             } else {
                 console.log('❌ Error submitting correction:', result.error)
