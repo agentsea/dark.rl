@@ -424,7 +424,12 @@ function TaskPage() {
 
     // Handle learning feedback for assistant messages
     const handleLearningFeedback = async (type: string, message: TaskMessage, index: number) => {
-        if (!id) return
+        console.log('🔴 handleLearningFeedback called with type:', type, 'index:', index)
+
+        if (!id) {
+            console.log('❌ No task ID, returning')
+            return
+        }
 
         try {
             let userComment: string | undefined
@@ -442,12 +447,17 @@ function TaskPage() {
 
             if (type === 'correct') {
                 // Open correction modal
+                console.log('🔧 Opening correction modal for message index:', index)
                 setCorrectionMessageIndex(index)
                 setCorrectionModalOpen(true)
+                console.log('📱 Modal state set - correctionModalOpen: true, correctionMessageIndex:', index)
 
                 // Get MCP server actions for this task
                 if (task?.mcp_servers && task.mcp_servers.length > 0) {
+                    console.log('🛠️ Getting MCP server actions for servers:', task.mcp_servers)
                     getMcpServerActions(task.mcp_servers)
+                } else {
+                    console.log('⚠️ No MCP servers found for task')
                 }
                 return // Don't send feedback yet, wait for correction submission
             }
@@ -464,7 +474,12 @@ function TaskPage() {
 
     // Handle current response learning feedback
     const handleCurrentResponseLearningFeedback = async (type: string) => {
-        if (!id || !currentResponse) return
+        console.log('🔴 handleCurrentResponseLearningFeedback called with type:', type)
+
+        if (!id || !currentResponse) {
+            console.log('❌ No task ID or current response, returning')
+            return
+        }
 
         try {
             let userComment: string | undefined
@@ -482,12 +497,17 @@ function TaskPage() {
 
             if (type === 'correct') {
                 // Open correction modal for current response
+                console.log('🔧 Opening correction modal for CURRENT response')
                 setCorrectionMessageIndex(-1) // -1 indicates current response
                 setCorrectionModalOpen(true)
+                console.log('📱 Modal state set - correctionModalOpen: true, correctionMessageIndex: -1 (current response)')
 
                 // Get MCP server actions for this task
                 if (task?.mcp_servers && task.mcp_servers.length > 0) {
+                    console.log('🛠️ Getting MCP server actions for servers:', task.mcp_servers)
                     getMcpServerActions(task.mcp_servers)
+                } else {
+                    console.log('⚠️ No MCP servers found for task')
                 }
                 return // Don't send feedback yet, wait for correction submission
             }
@@ -591,10 +611,20 @@ function TaskPage() {
             }
         }> = []
 
+        console.log('🔨 getAvailableTools called')
+        console.log('📋 Task MCP servers:', task?.mcp_servers)
+        console.log('🛠️ Available mcpServerActions:', mcpServerActions)
+
         if (task?.mcp_servers) {
             task.mcp_servers.forEach(serverId => {
                 const actions = mcpServerActions[serverId] || []
+                console.log(`🔧 Processing server ${serverId} with ${actions.length} actions`)
+
                 actions.forEach(action => {
+                    console.log(`🔍 Processing action: ${action.name}`)
+                    console.log(`📋 Raw action data:`, action)
+                    console.log(`📋 Action parameters:`, action.parameters)
+
                     let parameters = {
                         type: 'object',
                         properties: {},
@@ -602,15 +632,21 @@ function TaskPage() {
                     }
 
                     if (action.parameters && typeof action.parameters === 'object') {
+                        console.log(`📋 Found parameters object:`, action.parameters)
                         parameters = {
                             type: action.parameters.type || 'object',
                             properties: action.parameters.properties || {},
                             required: action.parameters.required || []
                         }
+                        console.log(`📋 Final parameters:`, parameters)
+                    } else {
+                        console.log(`⚠️ No parameters found for action ${action.name}`)
                     }
 
+                    const toolName = `${serverId}.${action.name}`
+                    console.log(`➕ Adding tool: ${toolName}`)
                     tools.push({
-                        name: `${serverId}.${action.name}`,
+                        name: toolName,
                         description: action.description,
                         parameters
                     })
@@ -618,6 +654,7 @@ function TaskPage() {
             })
         }
 
+        console.log(`✅ getAvailableTools returning ${tools.length} tools:`, tools)
         return tools
     }
 
@@ -739,6 +776,9 @@ function TaskPage() {
             </div>
         )
     }
+
+    // Debug modal state
+    console.log('🔧 About to render CorrectionModal with:', { correctionModalOpen, correctionMessageIndex, taskId: id })
 
     return (
         <div className="min-h-screen relative">

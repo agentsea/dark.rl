@@ -146,8 +146,8 @@ export default function useWebSocket({
                             setIsStreaming(true)
                         }
 
-                        if (choice.finish_reason === 'tool_call_requested') {
-                            console.log('Tool call requested, showing modal')
+                        if (choice.finish_reason === 'stop' || choice.finish_reason === 'length') {
+                            console.log('Stream finished, finalizing message')
 
                             // Add any final content chunk
                             if (choice.delta?.content) {
@@ -155,11 +155,13 @@ export default function useWebSocket({
                                 setCurrentResponse(currentResponseRef.current)
                             }
 
-                            // Extract tool call and thinking
+                            // Check if this message contains a tool call
                             const toolCallMatch = currentResponseRef.current.match(/<tool_call>(.*?)<\/tool_call>/s)
                             const thinkingMatch = currentResponseRef.current.match(/<think>(.*?)<\/think>/s)
 
                             if (toolCallMatch) {
+                                console.log('Tool call detected in completed message, showing modal')
+
                                 try {
                                     const toolCall = JSON.parse(toolCallMatch[1])
                                     const thinking = thinkingMatch ? thinkingMatch[1].trim() : undefined
@@ -174,24 +176,15 @@ export default function useWebSocket({
                                     })
                                     window.dispatchEvent(toolCallEvent)
 
-                                    // Pause streaming - don't finalize message yet
+                                    // End streaming but don't clear response yet (tool modal will handle continuation)
                                     setIsStreaming(false)
                                     return
                                 } catch (e) {
                                     console.error('Error parsing tool call:', e)
                                 }
                             }
-                        }
 
-                        if (choice.finish_reason === 'stop' || choice.finish_reason === 'length') {
-                            console.log('Stream finished, finalizing message')
-
-                            // Add any final content chunk
-                            if (choice.delta?.content) {
-                                currentResponseRef.current += choice.delta.content
-                                setCurrentResponse(currentResponseRef.current)
-                            }
-
+                            // No tool call detected, handle as normal message
                             // End streaming
                             setIsStreaming(false)
 

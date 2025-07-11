@@ -389,8 +389,13 @@ class DarkRLLLMServer:
                 # Convert MCP tools to actions format
                 actions = []
                 for tool in tools:
-                    # Build parameter information from inputSchema
-                    parameters = {}
+                    # Build parameter information from inputSchema in JSON schema format
+                    parameters = {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                    
                     if hasattr(tool, 'inputSchema') and tool.inputSchema:
                         schema = tool.inputSchema
                         if isinstance(schema, dict) and 'properties' in schema:
@@ -398,11 +403,12 @@ class DarkRLLLMServer:
                             for param_name, param_info in schema['properties'].items():
                                 param_type = param_info.get('type', 'string')
                                 param_desc = param_info.get('description', '')
-                                parameters[param_name] = {
+                                parameters["properties"][param_name] = {
                                     "type": param_type,
-                                    "description": param_desc,
-                                    "required": param_name in required
+                                    "description": param_desc
                                 }
+                                if param_name in required:
+                                    parameters["required"].append(param_name)
                     
                     action = {
                         "name": tool.name,
@@ -537,12 +543,17 @@ class DarkRLLLMServer:
             system_content += "</tools>\n\n"
             
             system_content += "MANDATORY FORMAT (INCLUDE THE XML TAGS!):\n"
+            system_content += "1. First, think about what you need to do:\n"
+            system_content += "<think>\nI need to [explain your reasoning here]\n</think>\n\n"
+            system_content += "2. Then make the tool call:\n"
             system_content += "<tool_call>\n"
             system_content += '{"name": "actual_tool_name", "arguments": {"actual_param": "actual_value"}}\n'
             system_content += "</tool_call>\n\n"
             
-            system_content += "CRITICAL: You MUST include the <tool_call> and </tool_call> XML tags!\n"
-            system_content += "Example response: <tool_call>\n"
+            system_content += "CRITICAL: You MUST include both <think> and <tool_call> XML tags!\n"
+            system_content += "Example response:\n"
+            system_content += "<think>\nI need to navigate to a restaurant website to find good restaurants in Boulder.\n</think>\n\n"
+            system_content += "<tool_call>\n"
             system_content += '{"name": "browser_navigate", "arguments": {"url": "https://yelp.com"}}\n'
             system_content += "</tool_call>\n\n"
             
@@ -1103,18 +1114,18 @@ class DarkRLLLMServer:
                         console.print(Panel(
                             f"🧠 **AI Thinking:**\n{thinking_match}\n\n🛠️ **Tool Call:**\n{tool_call_match}" if thinking_match 
                             else f"🛠️ **Tool Call:**\n{tool_call_match}",
-                            title="⏸️ TOOL CALL DETECTED - PAUSING FOR USER APPROVAL",
+                            title="⏸️ TOOL CALL DETECTED - ENDING MESSAGE",
                             style="bold yellow",
                             border_style="yellow"
                         ))
                         
-                        # Stream current content
+                        # Stream current content and END the assistant message
                         stream_chunk = {
                             "choices": [{
                                 "delta": {
                                     "content": chunk
                                 },
-                                "finish_reason": "tool_call_requested"
+                                "finish_reason": "stop"  # End the message here
                             }]
                         }
                         
@@ -1127,6 +1138,16 @@ class DarkRLLLMServer:
                                 style="bold red"
                             ))
                             break
+                        
+                        # Save the assistant message with tool call to task
+                        if task_id and accumulated_response:
+                            self.task_manager.add_message(task_id, 'assistant', accumulated_response)
+                            console.print(Panel(
+                                f"💾 Saved assistant message with tool call to task: {task_id}",
+                                title="📚 TASK UPDATED",
+                                style="bold cyan",
+                                border_style="cyan"
+                            ))
                         
                         # This will trigger the frontend to show the tool call modal
                         # The streaming will resume when user approves via a separate endpoint
@@ -1173,15 +1194,15 @@ class DarkRLLLMServer:
                         "</tool_call>" in accumulated_response and
                         chunk_count > 5):  # Make sure we have substantial content
                         
-                        console.print("⏸️ Tool call detected in sync stream, pausing for user approval")
+                        console.print("⏸️ Tool call detected in sync stream, ending message")
                         
-                        # Stream current content
+                        # Stream current content and END the assistant message
                         stream_chunk = {
                             "choices": [{
                                 "delta": {
                                     "content": chunk
                                 },
-                                "finish_reason": "tool_call_requested"
+                                "finish_reason": "stop"  # End the message here
                             }]
                         }
                         
@@ -1190,6 +1211,16 @@ class DarkRLLLMServer:
                         except websockets.exceptions.ConnectionClosed:
                             console.print("⚠️ WebSocket connection closed while sending tool call chunk")
                             break
+                        
+                        # Save the assistant message with tool call to task
+                        if task_id and accumulated_response:
+                            self.task_manager.add_message(task_id, 'assistant', accumulated_response)
+                            console.print(Panel(
+                                f"💾 Saved assistant message with tool call to task: {task_id}",
+                                title="📚 TASK UPDATED",
+                                style="bold cyan",
+                                border_style="cyan"
+                            ))
                         
                         # This will trigger the frontend to show the tool call modal
                         return
@@ -1465,36 +1496,41 @@ async def handle_client(websocket):
                             border_style="green"
                         ))
                         
-                        # Format tool response in Qwen format
-                        tool_response_content = f"\n<tool_response>\n{json.dumps(action_result, indent=2)}\n</tool_response>\n\n"
+                        # Format tool response in Qwen format  
+                        tool_response_content = f"<tool_response>\n{json.dumps(action_result, indent=2)}\n</tool_response>"
                         
-                        # Stream the tool response
+                        # Stream the tool response as a separate assistant message
                         tool_response_chunk = {
                             "choices": [{
                                 "delta": {
                                     "content": tool_response_content
                                 },
-                                "finish_reason": None
+                                "finish_reason": "stop"  # End the tool response message
                             }]
                         }
                         
                         await websocket.send(json.dumps(tool_response_chunk))
                         
-                        # Now continue generating the assistant's response after the tool call
-                        # Build context with the tool response
-                        updated_response = current_response + tool_response_content
+                        # Save tool response as separate assistant message
+                        if task_id:
+                            llm_server.task_manager.add_message(task_id, 'assistant', tool_response_content)
+                            console.print(Panel(
+                                f"💾 Saved tool response message to task: {task_id}",
+                                title="📚 TOOL RESPONSE SAVED",
+                                style="bold cyan",
+                                border_style="cyan"
+                            ))
                         
-                        # Create a mock message to continue generation
-                        continue_messages = [
-                            {"role": "assistant", "content": updated_response}
+                        # Now generate the final assistant response after the tool execution
+                        # Build a fresh context for the final response (without the complex tool context)
+                        # We'll generate a simple concluding response based on the tool result
+                        
+                        # Create a simple prompt for the final response
+                        conclusion_prompt = f"Based on the tool execution result, provide a brief summary or conclusion to the user."
+                        
+                        chat_messages = [
+                            {"role": "user", "content": conclusion_prompt},
                         ]
-                        
-                        # Build tools schema and chat messages for continuation
-                        tools = await llm_server.build_tools_schema(mentioned_servers)
-                        chat_messages = llm_server.build_qwen_chat_messages([], tools)  # Empty conversation for context
-                        
-                        # Add the partial assistant response to continue from
-                        chat_messages.append({"role": "assistant", "content": updated_response})
                         
                         # Create sampling parameters for continuation
                         sampling_params = SamplingParams(
@@ -1580,15 +1616,14 @@ async def handle_client(websocket):
                             
                             await websocket.send(json.dumps(final_chunk))
                             
-                            # Save complete response to task
-                            if task_id:
-                                complete_response = updated_response + continuation_response
-                                llm_server.task_manager.add_message(task_id, 'assistant', complete_response)
+                            # Save final conclusion response to task
+                            if task_id and continuation_response:
+                                llm_server.task_manager.add_message(task_id, 'assistant', continuation_response)
                                 
                                 console.print(Panel(
-                                    f"💾 Saved complete response to task: {task_id}\n"
-                                    f"📏 Total length: {len(complete_response)} characters",
-                                    title="✅ TASK SAVED",
+                                    f"💾 Saved final response to task: {task_id}\n"
+                                    f"📏 Response length: {len(continuation_response)} characters",
+                                    title="✅ FINAL RESPONSE SAVED",
                                     style="bold green",
                                     border_style="green"
                                 ))
@@ -1806,13 +1841,31 @@ async def handle_client(websocket):
                                         break
                             
                             if user_prompt:
-                                await llm_server.initialize_model()
+                                # Ensure we're using the same model as the task (OnlineLLM handles both inference and training)
+                                task_model = task_data.get('task', {}).get('model', 'qwen2.5-vl')
+                                if llm_server.current_model != task_model:
+                                    logger.info(f"Switching model for correction learning: {llm_server.current_model} -> {task_model}")
+                                    await llm_server.initialize_model(task_model)
+                                else:
+                                    logger.info(f"Using existing model for correction learning: {task_model}")
                                 
                                 # Create learning example with the corrected response
                                 learning_example = [
                                     {"role": "user", "content": user_prompt},
                                     {"role": "assistant", "content": corrected_response}
                                 ]
+                                
+                                # Pretty print the correction learning example
+                                console.print(Panel(
+                                    f"📚 **Learning from CORRECTED RESPONSE via Modal**\n\n"
+                                    f"**JSON Messages:**\n```json\n{json.dumps(learning_example, indent=2)}\n```\n\n"
+                                    f"**Processed as Plain Text:**\n"
+                                    f"👤 **User:** {user_prompt}\n\n"
+                                    f"🤖 **Corrected Assistant:** {corrected_response}",
+                                    title="🔧 CORRECTION MODAL LEARNING",
+                                    style="bold cyan",
+                                    border_style="cyan"
+                                ))
                                 
                                 # Apply corrective learning
                                 await llm_server.llm.learn(
@@ -1867,10 +1920,7 @@ async def handle_client(websocket):
                     logger.info(f"Learning feedback: {feedback_type} for task {task_id}")
                     
                     try:
-                        # Initialize model if needed
-                        await llm_server.initialize_model()
-                        
-                        # Get task and message history for context
+                        # Get task and message history for context first to determine correct model
                         task_data = llm_server.get_task(task_id)
                         if task_data.get('error'):
                             await websocket.send(json.dumps({
@@ -1878,6 +1928,14 @@ async def handle_client(websocket):
                                 'error': 'Task not found'
                             }))
                             continue
+                        
+                        # Ensure we're using the same model as the task (OnlineLLM handles both inference and training)
+                        task_model = task_data.get('task', {}).get('model', 'qwen2.5-vl')
+                        if llm_server.current_model != task_model:
+                            logger.info(f"Switching model for learning: {llm_server.current_model} -> {task_model}")
+                            await llm_server.initialize_model(task_model)
+                        else:
+                            logger.info(f"Using existing model for learning: {task_model}")
                         
                         # Get all messages for this task to build context
                         messages = task_data.get('messages', [])
@@ -1913,6 +1971,18 @@ async def handle_client(websocket):
                                     {"role": "assistant", "content": message['content']}
                                 ]
                                 
+                                # Pretty print the learning example
+                                console.print(Panel(
+                                    f"📚 **Learning from APPROVED response**\n\n"
+                                    f"**JSON Messages:**\n```json\n{json.dumps(learning_example, indent=2)}\n```\n\n"
+                                    f"**Processed as Plain Text:**\n"
+                                    f"👤 **User:** {user_prompt}\n\n"
+                                    f"🤖 **Assistant:** {message['content']}",
+                                    title="✅ POSITIVE LEARNING EXAMPLE",
+                                    style="bold green",
+                                    border_style="green"
+                                ))
+                                
                                 # Apply positive learning (from train_one_vl.py: OPTIMAL_LEARNING_STEPS=10, OPTIMAL_LEARNING_RATE=1e-4)
                                 await llm_server.llm.learn(
                                     learning_example,
@@ -1931,9 +2001,23 @@ async def handle_client(websocket):
                                 # Create critique context (following train_one_vl.py critique_context)
                                 critique_context = f"You are tasked with determining if an action taken by an agent to accomplish a task is correct. The task was: {task_data['task']['title']}. The response was: {message['content']}. The user feedback was: {user_comment}. Please output a critique of the response."
                                 
+                                critique_example = [{"role": "user", "content": critique_context}, {"role": "assistant", "content": user_comment}]
+                                
+                                # Pretty print the learning example
+                                console.print(Panel(
+                                    f"📚 **Learning from DENIED response**\n\n"
+                                    f"**JSON Messages:**\n```json\n{json.dumps(critique_example, indent=2)}\n```\n\n"
+                                    f"**Processed as Plain Text:**\n"
+                                    f"👤 **Critique Context:** {critique_context}\n\n"
+                                    f"🤖 **Expected Response:** {user_comment}",
+                                    title="❌ NEGATIVE LEARNING EXAMPLE",
+                                    style="bold red",
+                                    border_style="red"
+                                ))
+                                
                                 # Apply negative learning
                                 await llm_server.llm.learn(
-                                    [{"role": "user", "content": critique_context}, {"role": "assistant", "content": user_comment}],
+                                    critique_example,
                                     adapter="critique_learning",
                                     steps=10,
                                     lr=1e-4
@@ -1964,6 +2048,19 @@ async def handle_client(websocket):
                                         {"role": "assistant", "content": user_comment}  # Use user's correction as the right answer
                                     ]
                                     
+                                    # Pretty print the learning example
+                                    console.print(Panel(
+                                        f"📚 **Learning from CORRECTED response**\n\n"
+                                        f"**Original bad response:** {message['content']}\n\n"
+                                        f"**JSON Messages:**\n```json\n{json.dumps(corrected_example, indent=2)}\n```\n\n"
+                                        f"**Processed as Plain Text:**\n"
+                                        f"👤 **User:** {user_prompt}\n\n"
+                                        f"🤖 **Corrected Assistant:** {user_comment}",
+                                        title="🔧 CORRECTIVE LEARNING EXAMPLE",
+                                        style="bold blue",
+                                        border_style="blue"
+                                    ))
+                                    
                                     # Apply corrective learning
                                     await llm_server.llm.learn(
                                         corrected_example,
@@ -1982,9 +2079,23 @@ async def handle_client(websocket):
                                 # Store feedback for future reference
                                 feedback_context = f"Task: {task_data['task']['title']}. Response: {message['content']}. User feedback: {user_comment}. Consider this feedback for future responses."
                                 
+                                feedback_example = [{"role": "user", "content": feedback_context}, {"role": "assistant", "content": "I understand and will consider this feedback."}]
+                                
+                                # Pretty print the learning example
+                                console.print(Panel(
+                                    f"📚 **Learning from GENERAL COMMENT**\n\n"
+                                    f"**JSON Messages:**\n```json\n{json.dumps(feedback_example, indent=2)}\n```\n\n"
+                                    f"**Processed as Plain Text:**\n"
+                                    f"👤 **Feedback Context:** {feedback_context}\n\n"
+                                    f"🤖 **Expected Response:** I understand and will consider this feedback.",
+                                    title="💬 GENERAL FEEDBACK LEARNING",
+                                    style="bold purple",
+                                    border_style="purple"
+                                ))
+                                
                                 # Light learning from general feedback
                                 await llm_server.llm.learn(
-                                    [{"role": "user", "content": feedback_context}, {"role": "assistant", "content": "I understand and will consider this feedback."}],
+                                    feedback_example,
                                     adapter="general_feedback",
                                     steps=5,  # Less intensive for general feedback
                                     lr=5e-5   # Lower learning rate for general feedback
