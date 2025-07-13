@@ -23,6 +23,15 @@ body {
     0 0 3px currentColor;
 }
 
+/* Border glow effect for hover */
+.border-glow:hover {
+  border-color: #61FDFC !important;
+  box-shadow:
+    0 0 10px rgba(97, 253, 252, 0.3),
+    0 0 20px rgba(97, 253, 252, 0.2),
+    0 0 30px rgba(97, 253, 252, 0.1);
+}
+
 .glow-strong {
   text-shadow:
     0 0 2px currentColor,
@@ -384,7 +393,7 @@ body {
 /* Prevent horizontal scrolling in responses */
 .response-container {
   max-width: 100%;
-  overflow-x: hidden;
+  overflow: visible;
   word-wrap: break-word;
   white-space: pre-wrap;
 }

@@ -13,6 +13,7 @@ import os
 import re
 from typing import Dict, Any, List
 from pathlib import Path
+import openai
 
 # Rich imports for beautiful logging
 from rich.console import Console
@@ -29,9 +30,9 @@ from dark.sampling_params import SamplingParams
 from task_manager import TaskManager
 from mcp_use import MCPClient
 
-# Configure logging
+# Configure logging with DEBUG level for detailed troubleshooting
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(message)s",
     datefmt="[%X]",
     handlers=[logging.StreamHandler()]
@@ -40,6 +41,9 @@ logger = logging.getLogger(__name__)
 
 # Initialize Rich console for beautiful output
 console = Console()
+
+# Global LLM server instance (loaded at startup)
+global_llm_server = None
 
 def load_local_api_keys() -> Dict[str, str]:
     """Load API keys from local ~/.agentsea/api_keys.json file"""
@@ -79,6 +83,10 @@ class DarkRLLLMServer:
         }
         self.current_model = None
         self.task_manager = TaskManager()
+        
+        # Initialize OpenAI client
+        self.openai_client = None
+        self._init_openai_client()
         
         # Real MCP server configurations
         self.mcp_servers = [
@@ -176,6 +184,592 @@ class DarkRLLLMServer:
         
         # MCP server actions cache
         self.mcp_actions_cache = {}
+    
+    def _init_openai_client(self):
+        """Initialize OpenAI client with API key"""
+        api_key = get_api_key("OPENAI_API_KEY")
+        if api_key:
+            self.openai_client = openai.AsyncOpenAI(api_key=api_key)
+            logger.info("✅ OpenAI client initialized")
+        else:
+            logger.warning("⚠️ OpenAI API key not found - dual model comparison disabled")
+    
+    async def stream_gpt_response(self, messages: List[dict], model: str = "gpt-4.1", temperature: float = 0.7, max_tokens: int = 2048) -> str:
+        """Stream response from GPT-4.1"""
+        if not self.openai_client:
+            raise ValueError("OpenAI client not initialized - API key required")
+        
+        try:
+            # Convert messages to OpenAI format
+            openai_messages = []
+            for msg in messages:
+                role = msg.get('role', 'user')
+                content = msg.get('content', '')
+                
+                if role in ['system', 'user', 'assistant']:
+                    openai_messages.append({
+                        "role": role,
+                        "content": content
+                    })
+            
+            # Create streaming response
+            response = await self.openai_client.chat.completions.create(
+                model=model,
+                messages=openai_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True
+            )
+            
+            accumulated_response = ""
+            async for chunk in response:
+                if chunk.choices[0].delta.content:
+                    accumulated_response += chunk.choices[0].delta.content
+            
+            return accumulated_response
+            
+        except Exception as e:
+            logger.error(f"Error streaming GPT response: {e}")
+            return f"[GPT Error: {str(e)}]"
+    
+    async def stream_dual_response(self, websocket, messages: list, model: str = "qwen3", temperature: float = 0.7, max_tokens: int = 2048, task_id: str = None):
+        """Stream responses from both local model and GPT-4.1 simultaneously"""
+        
+        # Send initial dual response header
+        dual_start = {
+            "type": "dual_response_start",
+            "local_model": model,
+            "gpt_model": "gpt-4.1"
+        }
+        await websocket.send(json.dumps(dual_start))
+        
+        # Create tasks for both models
+        local_task = asyncio.create_task(self._stream_local_response(websocket, messages, model, temperature, max_tokens, task_id))
+        gpt_task = asyncio.create_task(self._stream_gpt_response(websocket, messages, temperature, max_tokens))
+        
+        # Wait for both to complete
+        local_response, gpt_response = await asyncio.gather(local_task, gpt_task, return_exceptions=True)
+        
+        # Send completion marker
+        dual_complete = {
+            "type": "dual_response_complete",
+            "local_finished": not isinstance(local_response, Exception),
+            "gpt_finished": not isinstance(gpt_response, Exception)
+        }
+        await websocket.send(json.dumps(dual_complete))
+        
+        return local_response, gpt_response
+
+    async def stream_dual_action_response(self, websocket, messages: list, mentioned_servers: List[str], model: str = "qwen3", temperature: float = 0.7, max_tokens: int = 2048, task_id: str = None):
+        """Stream responses from both local model (with tools) and GPT-4.1 (with tools) simultaneously"""
+        
+        # Send initial dual response header
+        dual_start = {
+            "type": "dual_response_start",
+            "local_model": f"{model} (with tools)",
+            "gpt_model": "gpt-4.1 (reasoning only)"
+        }
+        await websocket.send(json.dumps(dual_start))
+        
+        # Build tools schema for mentioned servers - BOTH models get the same context
+        tools = await self.build_tools_schema(mentioned_servers)
+        
+        if not tools:
+            # No tools found, fall back to dual chat mode
+            logger.warning(f"No tools found for servers: {mentioned_servers}")
+            return await self.stream_dual_response(websocket, messages, model, temperature, max_tokens, task_id)
+        
+        # Build Qwen chat messages with tools - THIS IS THE GROUND TRUTH PROMPT
+        qwen_chat_messages = self.build_qwen_chat_messages(messages, tools)
+        
+        # Extract the actual prompt that will be sent to the local model
+        if hasattr(self.llm, '_messages_to_prompt'):
+            await self.initialize_model(model)
+            actual_prompt = self.llm._messages_to_prompt(qwen_chat_messages)
+        else:
+            # Fallback: manually construct a similar prompt
+            actual_prompt = ""
+            for msg in qwen_chat_messages:
+                role = msg.get('role', 'user')
+                content = msg.get('content', '')
+                if role == 'system':
+                    actual_prompt += f"<|im_start|>system\n{content}<|im_end|>\n"
+                elif role == 'user':
+                    actual_prompt += f"<|im_start|>user\n{content}<|im_end|>\n"
+                elif role == 'assistant':
+                    actual_prompt += f"<|im_start|>assistant\n{content}<|im_end|>\n"
+            actual_prompt += "<|im_start|>assistant\n"
+        
+        # Create tasks for both models
+        # Local model gets full tool context
+        local_task = asyncio.create_task(self._stream_local_action_response(websocket, messages, mentioned_servers, model, temperature, max_tokens, task_id))
+        
+        # GPT-4.1 gets the EXACT SAME prompt as the local model for fair comparison
+        gpt_task = asyncio.create_task(self._stream_gpt_with_same_prompt(websocket, actual_prompt, temperature, max_tokens))
+        
+        # Wait for both to complete
+        local_response, gpt_response = await asyncio.gather(local_task, gpt_task, return_exceptions=True)
+        
+        # Send completion marker
+        dual_complete = {
+            "type": "dual_response_complete",
+            "local_finished": not isinstance(local_response, Exception),
+            "gpt_finished": not isinstance(gpt_response, Exception)
+        }
+        await websocket.send(json.dumps(dual_complete))
+        
+        # IMPORTANT: Don't auto-continue after dual response - wait for user to select which response they prefer
+        # This prevents the infinite loop
+        
+        return local_response, gpt_response
+
+    async def _stream_local_response(self, websocket, messages: list, model: str, temperature: float, max_tokens: int, task_id: str) -> str:
+        """Stream local model response with dual response format"""
+        await self.initialize_model(model)
+        
+        # Build message history
+        chat_messages = []
+        for message in messages:
+            role = message.get('role', 'user')
+            content = message.get('content', '')
+            
+            if role == 'system':
+                chat_messages.append({"role": "system", "content": content})
+            elif role == 'user':
+                chat_messages.append({"role": "user", "content": content})
+            elif role == 'assistant':
+                chat_messages.append({"role": "assistant", "content": content})
+        
+        # Create sampling parameters
+        sampling_params = SamplingParams(
+            temperature=max(0.3, min(temperature, 0.8)),
+            max_tokens=min(max_tokens, 500),
+            n=1,
+            presence_penalty=0.2,
+            ignore_eos=False
+        )
+        
+        accumulated_response = ""
+        
+        try:
+            # Use chat_stream if available
+            if hasattr(self.llm, 'chat_stream'):
+                import inspect
+                sig = inspect.signature(self.llm.chat_stream)
+                if 'sampling_params' in sig.parameters:
+                    stream_iterator = self.llm.chat_stream(chat_messages, sampling_params=sampling_params)
+                else:
+                    stream_iterator = self.llm.chat_stream(chat_messages)
+            else:
+                prompt = self.llm._messages_to_prompt(chat_messages)
+                stream_iterator = self.llm.stream(prompt, sampling_params=sampling_params)
+            
+            # Handle streaming
+            if hasattr(stream_iterator, '__aiter__'):
+                async for chunk in stream_iterator:
+                    if websocket.close_code is not None:
+                        break
+                    
+                    accumulated_response += chunk
+                    
+                    # Send local model chunk
+                    stream_chunk = {
+                        "type": "dual_response_chunk",
+                        "source": "local",
+                        "model": model,
+                        "choices": [{
+                            "delta": {
+                                "content": chunk
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    
+                    await websocket.send(json.dumps(stream_chunk))
+                    await asyncio.sleep(0.02)
+            else:
+                for chunk in stream_iterator:
+                    if websocket.close_code is not None:
+                        break
+                    
+                    accumulated_response += chunk
+                    
+                    # Send local model chunk
+                    stream_chunk = {
+                        "type": "dual_response_chunk",
+                        "source": "local",
+                        "model": model,
+                        "choices": [{
+                            "delta": {
+                                "content": chunk
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    
+                    await websocket.send(json.dumps(stream_chunk))
+                    await asyncio.sleep(0.02)
+            
+            # Send local completion
+            if websocket.close_code is None:
+                local_complete = {
+                    "type": "dual_response_chunk",
+                    "source": "local",
+                    "model": model,
+                    "choices": [{
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                }
+                await websocket.send(json.dumps(local_complete))
+                
+                # Save to task if provided
+                if task_id and accumulated_response:
+                    self.task_manager.add_message(task_id, 'assistant', accumulated_response)
+            
+            return accumulated_response
+            
+        except Exception as e:
+            logger.error(f"Error in local streaming: {e}")
+            error_chunk = {
+                "type": "dual_response_chunk",
+                "source": "local",
+                "model": model,
+                "choices": [{
+                    "delta": {
+                        "content": f"[Local Error: {str(e)}]"
+                    },
+                    "finish_reason": "stop"
+                }]
+            }
+            await websocket.send(json.dumps(error_chunk))
+            return f"[Local Error: {str(e)}]"
+    
+    async def _stream_gpt_response(self, websocket, messages: list, temperature: float, max_tokens: int) -> str:
+        """Stream GPT-4.1 response with dual response format"""
+        if not self.openai_client:
+            error_chunk = {
+                "type": "dual_response_chunk",
+                "source": "gpt",
+                "model": "gpt-4.1",
+                "choices": [{
+                    "delta": {
+                        "content": "[GPT Error: OpenAI API key not configured]"
+                    },
+                    "finish_reason": "stop"
+                }]
+            }
+            await websocket.send(json.dumps(error_chunk))
+            return "[GPT Error: OpenAI API key not configured]"
+        
+        try:
+            # Convert messages to OpenAI format
+            openai_messages = []
+            for msg in messages:
+                role = msg.get('role', 'user')
+                content = msg.get('content', '')
+                
+                if role in ['system', 'user', 'assistant']:
+                    openai_messages.append({
+                        "role": role,
+                        "content": content
+                    })
+            
+            # Create streaming response
+            response = await self.openai_client.chat.completions.create(
+                model="gpt-4.1",
+                messages=openai_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True
+            )
+            
+            accumulated_response = ""
+            async for chunk in response:
+                if websocket.close_code is not None:
+                    break
+                
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    accumulated_response += content
+                    
+                    # Send GPT chunk
+                    stream_chunk = {
+                        "type": "dual_response_chunk",
+                        "source": "gpt",
+                        "model": "gpt-4.1",
+                        "choices": [{
+                            "delta": {
+                                "content": content
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    
+                    await websocket.send(json.dumps(stream_chunk))
+                    await asyncio.sleep(0.02)
+            
+            # Send GPT completion
+            if websocket.close_code is None:
+                gpt_complete = {
+                    "type": "dual_response_chunk",
+                    "source": "gpt",
+                    "model": "gpt-4.1",
+                    "choices": [{
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                }
+                await websocket.send(json.dumps(gpt_complete))
+            
+            return accumulated_response
+            
+        except Exception as e:
+            logger.error(f"Error streaming GPT response: {e}")
+            error_chunk = {
+                "type": "dual_response_chunk",
+                "source": "gpt",
+                "model": "gpt-4.1",
+                "choices": [{
+                    "delta": {
+                        "content": f"[GPT Error: {str(e)}]"
+                    },
+                    "finish_reason": "stop"
+                }]
+            }
+            await websocket.send(json.dumps(error_chunk))
+            return f"[GPT Error: {str(e)}]"
+
+    async def _stream_local_action_response(self, websocket, messages: list, mentioned_servers: List[str], model: str, temperature: float, max_tokens: int, task_id: str) -> str:
+        """Stream local model response with full tool capabilities in dual response format"""
+        try:
+            await self.initialize_model(model)
+            
+            # Build tools schema for mentioned servers
+            tools = await self.build_tools_schema(mentioned_servers)
+            
+            if not tools:
+                # No tools found, fall back to chat mode
+                logger.warning(f"No tools found for servers: {mentioned_servers}")
+                return await self._stream_local_response(websocket, messages, model, temperature, max_tokens, task_id)
+            
+            # Build Qwen chat messages with tools
+            chat_messages = self.build_qwen_chat_messages(messages, tools)
+            
+            # Create sampling parameters optimized for tool calling
+            sampling_params = SamplingParams(
+                temperature=max(0.3, min(temperature, 0.7)),
+                max_tokens=min(max_tokens, 600),  # More tokens for thinking + tool calls
+                n=1,
+                presence_penalty=0.1,  # Reduce presence penalty to prevent over-constraint
+                ignore_eos=False
+            )
+            
+            accumulated_response = ""
+            
+            # Use streaming
+            if hasattr(self.llm, 'chat_stream'):
+                import inspect
+                sig = inspect.signature(self.llm.chat_stream)
+                if 'sampling_params' in sig.parameters:
+                    stream_iterator = self.llm.chat_stream(chat_messages, sampling_params=sampling_params)
+                else:
+                    stream_iterator = self.llm.chat_stream(chat_messages)
+            else:
+                prompt = self.llm._messages_to_prompt(chat_messages)
+                stream_iterator = self.llm.stream(prompt, sampling_params=sampling_params)
+            
+            # Handle streaming
+            if hasattr(stream_iterator, '__aiter__'):
+                async for chunk in stream_iterator:
+                    if websocket.close_code is not None:
+                        break
+                    
+                    accumulated_response += chunk
+                    
+                    # Send chunk without tool execution in dual mode
+                    stream_chunk = {
+                        "type": "dual_response_chunk",
+                        "source": "local",
+                        "model": f"{model} (with tools)",
+                        "choices": [{
+                            "delta": {
+                                "content": chunk
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    
+                    await websocket.send(json.dumps(stream_chunk))
+                    await asyncio.sleep(0.02)
+            else:
+                for chunk in stream_iterator:
+                    if websocket.close_code is not None:
+                        break
+                    
+                    accumulated_response += chunk
+                    
+                    # Send chunk without tool execution in dual mode
+                    stream_chunk = {
+                        "type": "dual_response_chunk",
+                        "source": "local",
+                        "model": f"{model} (with tools)",
+                        "choices": [{
+                            "delta": {
+                                "content": chunk
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    
+                    await websocket.send(json.dumps(stream_chunk))
+                    await asyncio.sleep(0.02)
+            
+            # Send completion - NOTE: Don't save to task in dual mode, wait for user selection
+            if websocket.close_code is None:
+                local_complete = {
+                    "type": "dual_response_chunk",
+                    "source": "local",
+                    "model": f"{model} (with tools)",
+                    "choices": [{
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                }
+                await websocket.send(json.dumps(local_complete))
+            
+            return accumulated_response
+            
+        except Exception as e:
+            logger.error(f"Error in local action streaming: {e}")
+            error_chunk = {
+                "type": "dual_response_chunk",
+                "source": "local",
+                "model": f"{model} (with tools)",
+                "choices": [{
+                    "delta": {
+                        "content": f"[Local Error: {str(e)}]"
+                    },
+                    "finish_reason": "stop"
+                }]
+            }
+            await websocket.send(json.dumps(error_chunk))
+            return f"[Local Error: {str(e)}]"
+
+
+    
+    async def _stream_gpt_with_same_prompt(self, websocket, actual_prompt: str, temperature: float, max_tokens: int) -> str:
+        """Stream GPT-4.1 response using the exact same prompt as the local model"""
+        if not self.openai_client:
+            error_chunk = {
+                "type": "dual_response_chunk",
+                "source": "gpt",
+                "model": "gpt-4.1 (reasoning only)",
+                "choices": [{
+                    "delta": {
+                        "content": "[GPT Error: OpenAI API key not configured]"
+                    },
+                    "finish_reason": "stop"
+                }]
+            }
+            await websocket.send(json.dumps(error_chunk))
+            return "[GPT Error: OpenAI API key not configured]"
+        
+        try:
+            # Convert the Qwen prompt format to OpenAI messages format
+            # Parse the actual_prompt to extract the conversation
+            import re
+            
+            openai_messages = []
+            
+            # Split by message markers
+            parts = re.split(r'<\|im_start\|>(system|user|assistant)\n', actual_prompt)
+            
+            current_role = None
+            for i, part in enumerate(parts):
+                if part.strip() in ['system', 'user', 'assistant']:
+                    current_role = part.strip()
+                elif current_role and part.strip():
+                    # Clean up the content (remove end markers)
+                    content = re.sub(r'<\|im_end\|>.*$', '', part, flags=re.DOTALL).strip()
+                    if content:
+                        openai_messages.append({
+                            "role": current_role,
+                            "content": content
+                        })
+                    current_role = None
+            
+            # If parsing failed, create a simple prompt-based message
+            if not openai_messages:
+                openai_messages = [{
+                    "role": "user",
+                    "content": f"Continue this conversation with the exact same style and format:\n\n{actual_prompt}"
+                }]
+            
+            # Create streaming response
+            response = await self.openai_client.chat.completions.create(
+                model="gpt-4",  # Use gpt-4 instead of gpt-4.1 as it's more widely available
+                messages=openai_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True
+            )
+            
+            accumulated_response = ""
+            async for chunk in response:
+                if websocket.close_code is not None:
+                    break
+                
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    accumulated_response += content
+                    
+                    # Send GPT chunk
+                    stream_chunk = {
+                        "type": "dual_response_chunk",
+                        "source": "gpt",
+                        "model": "gpt-4.1 (reasoning only)",
+                        "choices": [{
+                            "delta": {
+                                "content": content
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    
+                    await websocket.send(json.dumps(stream_chunk))
+                    await asyncio.sleep(0.02)
+            
+            # Send GPT completion
+            if websocket.close_code is None:
+                gpt_complete = {
+                    "type": "dual_response_chunk",
+                    "source": "gpt",
+                    "model": "gpt-4.1 (reasoning only)",
+                    "choices": [{
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                }
+                await websocket.send(json.dumps(gpt_complete))
+            
+            return accumulated_response
+            
+        except Exception as e:
+            logger.error(f"Error streaming GPT response: {e}")
+            error_chunk = {
+                "type": "dual_response_chunk",
+                "source": "gpt",
+                "model": "gpt-4.1 (reasoning only)",
+                "choices": [{
+                    "delta": {
+                        "content": f"[GPT Error: {str(e)}]"
+                    },
+                    "finish_reason": "stop"
+                }]
+            }
+            await websocket.send(json.dumps(error_chunk))
+            return f"[GPT Error: {str(e)}]"
     
     async def initialize_model(self, model_key: str = "qwen3"):
         """Initialize the AsyncOnlineLLM with the specified model"""
@@ -704,8 +1298,17 @@ class DarkRLLLMServer:
         
         return list(set(mentioned_servers))  # Remove duplicates
 
-    async def should_use_action_mode(self, messages: List[dict]) -> tuple[bool, List[str]]:
-        """Determine if we should use action mode based on MCP server mentions"""
+    async def should_use_action_mode(self, messages: List[dict], task_id: str = None) -> tuple[bool, List[str]]:
+        """Determine if we should use action mode based on MCP server mentions or task context"""
+        # First check if task has associated MCP servers
+        if task_id:
+            task_data = self.get_task(task_id)
+            if not task_data.get('error'):
+                task_servers = task_data.get('task', {}).get('mcp_servers', [])
+                if task_servers:
+                    logger.info(f"🎯 Task {task_id} has MCP servers: {task_servers} - using action mode")
+                    return True, task_servers
+        
         # Check the latest user message for @server mentions
         if not messages:
             return False, []
@@ -720,20 +1323,169 @@ class DarkRLLLMServer:
         # Use action mode if servers are mentioned
         return len(mentioned_servers) > 0, mentioned_servers
 
+    def _serialize_mcp_result(self, result, depth=0):
+        """Safely serialize MCP results to JSON-compatible format"""
+        indent = "  " * depth
+        try:
+            logger.debug(f"{indent}🔍 Serializing object: type={type(result).__name__}, value={str(result)[:100]}...")
+            
+            # Handle different types of MCP results
+            if hasattr(result, 'model_dump'):
+                logger.debug(f"{indent}✅ Using model_dump() for {type(result).__name__}")
+                # Pydantic model - use model_dump
+                serialized = result.model_dump()
+                logger.debug(f"{indent}✅ model_dump() successful: {str(serialized)[:200]}...")
+                return serialized
+            elif hasattr(result, '__dict__'):
+                logger.debug(f"{indent}🔧 Converting object with __dict__ for {type(result).__name__}")
+                # Object with attributes - convert to dict
+                obj_dict = {}
+                for key, value in result.__dict__.items():
+                    logger.debug(f"{indent}  🔑 Processing attribute: {key} = {type(value).__name__}")
+                    if isinstance(value, (str, int, float, bool, type(None))):
+                        obj_dict[key] = value
+                        logger.debug(f"{indent}  ✅ Simple type: {key} = {value}")
+                    elif isinstance(value, list):
+                        logger.debug(f"{indent}  📋 List with {len(value)} items")
+                        obj_dict[key] = [self._serialize_mcp_result(item, depth + 1) for item in value]
+                        logger.debug(f"{indent}  ✅ List serialized: {key}")
+                    elif hasattr(value, 'model_dump'):
+                        logger.debug(f"{indent}  🎯 Using model_dump for nested object: {type(value).__name__}")
+                        obj_dict[key] = value.model_dump()
+                        logger.debug(f"{indent}  ✅ Nested model_dump successful: {key}")
+                    elif hasattr(value, '__dict__'):
+                        logger.debug(f"{indent}  🔄 Recursing into nested object: {type(value).__name__}")
+                        obj_dict[key] = self._serialize_mcp_result(value, depth + 1)
+                        logger.debug(f"{indent}  ✅ Nested object serialized: {key}")
+                    else:
+                        logger.debug(f"{indent}  🔤 Converting to string: {type(value).__name__}")
+                        obj_dict[key] = str(value)
+                        logger.debug(f"{indent}  ✅ String conversion: {key} = {str(value)[:50]}...")
+                logger.debug(f"{indent}✅ Object dict serialization complete")
+                return obj_dict
+            elif isinstance(result, list):
+                logger.debug(f"{indent}📋 Serializing list with {len(result)} items")
+                # List - serialize each item
+                serialized_list = [self._serialize_mcp_result(item, depth + 1) for item in result]
+                logger.debug(f"{indent}✅ List serialization complete")
+                return serialized_list
+            elif isinstance(result, dict):
+                logger.debug(f"{indent}📖 Serializing dict with {len(result)} keys")
+                # Dict - serialize each value
+                serialized_dict = {key: self._serialize_mcp_result(value, depth + 1) for key, value in result.items()}
+                logger.debug(f"{indent}✅ Dict serialization complete")
+                return serialized_dict
+            else:
+                logger.debug(f"{indent}🔤 Fallback to string for {type(result).__name__}")
+                # Fallback to string representation
+                str_result = str(result)
+                logger.debug(f"{indent}✅ String fallback: {str_result[:100]}...")
+                return str_result
+        except Exception as e:
+            logger.error(f"{indent}❌ Error serializing MCP result at depth {depth}: {e}")
+            logger.error(f"{indent}❌ Object type: {type(result).__name__}")
+            logger.error(f"{indent}❌ Object attributes: {dir(result) if hasattr(result, '__dict__') else 'No __dict__'}")
+            import traceback
+            logger.error(f"{indent}❌ Full traceback: {traceback.format_exc()}")
+            return str(result)
+
     async def execute_mcp_action(self, server_id: str, action_name: str, parameters: dict) -> dict:
         """Execute an MCP action on a server"""
         try:
-            session = await self.get_mcp_session(server_id)
-            result = await session.connector.call_tool(action_name, parameters)
+            logger.info(f"🚀 Executing MCP action: {action_name} on server {server_id}")
+            logger.debug(f"📋 Parameters: {json.dumps(parameters, indent=2)}")
             
-            # Convert result to dict format
-            return {
+            session = await self.get_mcp_session(server_id)
+            logger.debug(f"✅ Got MCP session for {server_id}")
+            
+            result = await session.connector.call_tool(action_name, parameters)
+            logger.info(f"✅ MCP action executed successfully: {action_name}")
+            logger.debug(f"🔍 Raw result type: {type(result).__name__}")
+            logger.debug(f"🔍 Raw result attributes: {dir(result) if hasattr(result, '__dict__') else 'No __dict__'}")
+            logger.debug(f"🔍 Raw result string representation: {str(result)[:200]}...")
+            
+            # Test JSON serialization on the raw result to see where it fails
+            try:
+                json.dumps(result)
+                logger.debug("✅ Raw result is JSON serializable")
+            except Exception as json_error:
+                logger.warning(f"❌ Raw result is NOT JSON serializable: {json_error}")
+                logger.debug(f"❌ JSON error type: {type(json_error).__name__}")
+            
+            # Safely serialize the result
+            logger.debug("🔄 Starting serialization process...")
+            serialized_result = self._serialize_mcp_result(result)
+            logger.info("✅ Serialization completed successfully")
+            
+            # Test JSON serialization on the serialized result
+            try:
+                json.dumps(serialized_result)
+                logger.debug("✅ Serialized result is JSON serializable")
+            except Exception as json_error:
+                logger.error(f"❌ Serialized result is STILL NOT JSON serializable: {json_error}")
+                logger.error(f"❌ Serialized result type: {type(serialized_result).__name__}")
+                logger.error(f"❌ Serialized result: {str(serialized_result)[:500]}...")
+                # Fallback to string representation
+                serialized_result = str(result)
+            
+            # Extract content if available
+            logger.debug("🔄 Extracting content...")
+            content = ""
+            if hasattr(result, 'content'):
+                logger.debug(f"📝 Found content attribute: type={type(result.content).__name__}")
+                if isinstance(result.content, list):
+                    logger.debug(f"📋 Content is a list with {len(result.content)} items")
+                    # Handle list of content items (common in MCP)
+                    content_parts = []
+                    for i, item in enumerate(result.content):
+                        logger.debug(f"  🔍 Content item {i}: type={type(item).__name__}")
+                        if hasattr(item, 'text'):
+                            logger.debug(f"  📝 Found text attribute in item {i}")
+                            content_parts.append(item.text)
+                        elif isinstance(item, str):
+                            logger.debug(f"  🔤 Item {i} is a string")
+                            content_parts.append(item)
+                        else:
+                            logger.debug(f"  🔄 Converting item {i} to string")
+                            content_parts.append(str(item))
+                    content = "\n".join(content_parts)
+                    logger.debug(f"✅ Extracted content from list: {len(content)} characters")
+                else:
+                    logger.debug("🔤 Content is not a list, converting to string")
+                    content = str(result.content)
+                    logger.debug(f"✅ Extracted content: {len(content)} characters")
+            else:
+                logger.debug("❌ No content attribute found, using string representation")
+                content = str(result)
+                logger.debug(f"✅ Using result string: {len(content)} characters")
+            
+            final_result = {
                 "success": True,
-                "result": result.model_dump() if hasattr(result, 'model_dump') else str(result),
-                "content": result.content if hasattr(result, 'content') else str(result)
+                "result": serialized_result,
+                "content": content
             }
+            
+            # Final JSON serialization test
+            try:
+                json.dumps(final_result)
+                logger.info("✅ Final result is JSON serializable")
+            except Exception as json_error:
+                logger.error(f"❌ Final result is NOT JSON serializable: {json_error}")
+                # Ultimate fallback
+                final_result = {
+                    "success": True,
+                    "result": str(result),
+                    "content": content
+                }
+                logger.warning("🔄 Using ultimate fallback with string result")
+            
+            logger.info(f"🎉 MCP action execution completed: {action_name}")
+            return final_result
+            
         except Exception as e:
-            logger.error(f"Error executing MCP action {action_name} on server {server_id}: {e}")
+            logger.error(f"❌ Error executing MCP action {action_name} on server {server_id}: {e}")
+            import traceback
+            logger.error(f"❌ Full traceback: {traceback.format_exc()}")
             return {
                 "success": False,
                 "error": str(e),
@@ -760,22 +1512,54 @@ class DarkRLLLMServer:
         """Get list of recent tasks"""
         return self.task_manager.get_recent_tasks()
 
-    async def stream_response(self, websocket, messages: list, model: str = "qwen3", temperature: float = 0.7, max_tokens: int = 2048, task_id: str = None):
-        """Stream response from the actual LLM with MCP action support"""
+    async def stream_response(self, websocket, messages: list, model: str = "qwen3", temperature: float = 0.7, max_tokens: int = 2048, task_id: str = None, dual_model: bool = True):
+        """Stream response from the actual LLM with MCP action support and optional dual model comparison"""
         
         try:
+            # Debug logging for dual model decision
+            logger.info(f"🐛 stream_response called with dual_model={dual_model}, task_id={task_id}")
+            
             # Initialize model if needed
             await self.initialize_model(model)
             
-            # Check if we should use action mode based on MCP server mentions
-            use_action_mode, mentioned_servers = await self.should_use_action_mode(messages)
+            # Check if we should use action mode based on MCP server mentions or task context
+            use_action_mode, mentioned_servers = await self.should_use_action_mode(messages, task_id)
+            logger.info(f"🐛 use_action_mode={use_action_mode}, mentioned_servers={mentioned_servers}")
             
-            if use_action_mode:
-                logger.info(f"🎯 Action mode detected! Mentioned servers: {mentioned_servers}")
-                await self.stream_action_response(websocket, messages, mentioned_servers, model, temperature, max_tokens, task_id)
+            # Only force dual model mode for action mode if dual_model is not explicitly set to False
+            force_dual_for_action = use_action_mode and self.openai_client and dual_model is not False
+            use_dual_mode = force_dual_for_action or (dual_model and self.openai_client)
+            
+            logger.info(f"🐛 force_dual_for_action={force_dual_for_action}, use_dual_mode={use_dual_mode}")
+            logger.info(f"🐛 self.openai_client exists: {self.openai_client is not None}")
+            
+            if use_dual_mode:
+                if force_dual_for_action:
+                    logger.info("🔄 Forcing dual model mode for action mode (thinking + tool calls)")
+                else:
+                    logger.info("🔄 Using dual model mode with GPT-4.1 comparison")
+                    
+                if use_action_mode:
+                    logger.info(f"🎯 Action mode detected! Mentioned servers: {mentioned_servers}")
+                    # For action mode, we'll create a dual response version that handles tools
+                    await self.stream_dual_action_response(websocket, messages, mentioned_servers, model, temperature, max_tokens, task_id)
+                else:
+                    logger.info("💬 Standard chat mode")
+                    await self.stream_dual_response(websocket, messages, model, temperature, max_tokens, task_id)
             else:
-                logger.info("💬 Standard chat mode")
-                await self.stream_chat_response(websocket, messages, model, temperature, max_tokens, task_id)
+                logger.info("🚫 NOT using dual model mode")
+                if dual_model or force_dual_for_action:
+                    if force_dual_for_action:
+                        logger.warning("⚠️ Action mode requires dual model but OpenAI client not available - falling back to single model")
+                    else:
+                        logger.warning("⚠️ Dual model requested but OpenAI client not available - falling back to single model")
+                
+                if use_action_mode:
+                    logger.info(f"🎯 Action mode detected! Mentioned servers: {mentioned_servers}")
+                    await self.stream_action_response(websocket, messages, mentioned_servers, model, temperature, max_tokens, task_id)
+                else:
+                    logger.info("💬 Standard chat mode")
+                    await self.stream_chat_response(websocket, messages, model, temperature, max_tokens, task_id)
                 
         except Exception as e:
             console.print(Panel(
@@ -832,7 +1616,7 @@ class DarkRLLLMServer:
             style="bold magenta",
             border_style="magenta"
         ))
-        
+            
         # Stream response from actual LLM using chat format
         accumulated_response = ""
         chunk_count = 0
@@ -919,7 +1703,7 @@ class DarkRLLLMServer:
                         logger.warning("WebSocket connection closed while sending chunk")
                         break
                 logger.info(f"Regular generator completed with {chunk_count} chunks")
-            
+                
             # Send final chunk only if connection is still open
             if websocket.close_code is None:
                 final_chunk = {
@@ -935,15 +1719,15 @@ class DarkRLLLMServer:
                 # Save assistant response to database if task_id provided
                 if task_id and accumulated_response:
                     self.task_manager.add_message(task_id, 'assistant', accumulated_response)
-                    
-                    console.print(Panel(
-                        f"💾 Saved chat response to task: {task_id}\n"
-                        f"📏 Length: {len(accumulated_response)} characters\n"
-                        f"📊 Total chunks: {chunk_count}",
-                        title="✅ CHAT STREAMING COMPLETED",
-                        style="bold green",
-                        border_style="green"
-                    ))
+                
+                console.print(Panel(
+                    f"💾 Saved chat response to task: {task_id}\n"
+                    f"📏 Length: {len(accumulated_response)} characters\n"
+                    f"📊 Total chunks: {chunk_count}",
+                    title="✅ CHAT STREAMING COMPLETED",
+                    style="bold green",
+                    border_style="green"
+                ))
             else:
                 console.print(Panel(
                     f"⚠️ Streaming stopped due to closed connection\n"
@@ -975,7 +1759,7 @@ class DarkRLLLMServer:
                 except:
                     pass  # Connection might be closed
             raise stream_error
-
+            
     async def stream_action_response(self, websocket, messages: list, mentioned_servers: List[str], model: str, temperature: float, max_tokens: int, task_id: str = None):
         """Stream action-based response using Qwen chat template with tools"""
         
@@ -1002,10 +1786,10 @@ class DarkRLLLMServer:
             
             # Create sampling parameters optimized for tool calling
             sampling_params = SamplingParams(
-                temperature=0.3,  # Slightly higher temperature to encourage tool calling over safe responses
-                max_tokens=min(max_tokens, 800),  # More tokens for thinking + tool calls
+                temperature=max(0.3, min(temperature, 0.7)),  # Increase minimum temperature to prevent repetition
+                max_tokens=min(max_tokens, 600),  # More tokens for thinking + tool calls
                 n=1,
-                presence_penalty=0.0,  # No presence penalty to allow tool call patterns
+                presence_penalty=0.1,  # Reduce presence penalty to prevent over-constraint
                 ignore_eos=False
             )
             
@@ -1175,6 +1959,42 @@ class DarkRLLLMServer:
                     accumulated_response += chunk
                     chunk_count += 1
                     
+                    # Check for repetitive content and stop if detected
+                    if len(accumulated_response) > 100:
+                        # Multiple checks for repetitive patterns (similar to garbage filtering)
+                        if (accumulated_response.count('"') > 50 or  # Too many quotes
+                            accumulated_response.count('</tool_call>') > 2 or  # Repeated closing tags
+                            accumulated_response.count('.com') > 15 or  # Repetitive domain patterns
+                            accumulated_response.count('://') > 10):  # Too many URLs
+                            console.print("🚫 Repetitive garbage content detected, stopping generation")
+                            stream_chunk = {
+                                "choices": [{
+                                    "delta": {},
+                                    "finish_reason": "stop"
+                                }]
+                            }
+                            try:
+                                await websocket.send(json.dumps(stream_chunk))
+                            except:
+                                pass
+                            break
+                        
+                        # Check for repeated short patterns
+                        last_100_chars = accumulated_response[-100:]
+                        if len(set(last_100_chars)) < 8:  # Too few unique characters  
+                            console.print("⚠️ Repetitive character patterns detected, stopping generation")
+                            stream_chunk = {
+                                "choices": [{
+                                    "delta": {},
+                                    "finish_reason": "stop"
+                                }]
+                            }
+                            try:
+                                await websocket.send(json.dumps(stream_chunk))
+                            except:
+                                pass
+                            break
+                    
                     # Check if we hit a tool call that needs user approval
                     if ("<tool_call>" in accumulated_response and 
                         "</tool_call>" in accumulated_response and
@@ -1288,6 +2108,158 @@ class DarkRLLLMServer:
                 except:
                     pass
 
+    async def continue_task_conversation(self, websocket, task_id: str):
+        """Continue the conversation for a task until 'end' action is reached"""
+        try:
+            logger.info(f"🐛 continue_task_conversation called with task_id={task_id}")
+            
+            # Get current task messages
+            task_data = self.get_task(task_id)
+            if task_data.get('error'):
+                console.print(Panel(
+                    f"❌ Task not found: {task_id}",
+                    title="🚨 TASK NOT FOUND",
+                    style="bold red",
+                    border_style="red"
+                ))
+                return
+            
+            messages = task_data.get('messages', [])
+            task_model = task_data.get('task', {}).get('model', 'qwen2.5-vl')
+            mentioned_servers = task_data.get('task', {}).get('mcp_servers', [])
+            
+            console.print(Panel(
+                f"🔄 **Continuing task conversation**\n"
+                f"🎯 **Task ID:** {task_id}\n"
+                f"🤖 **Model:** {task_model}\n"
+                f"📊 **Message count:** {len(messages)}\n"
+                f"🛠️ **MCP Servers:** {mentioned_servers}",
+                title="🚀 TASK CONTINUATION",
+                style="bold cyan",
+                border_style="cyan"
+            ))
+            
+            # Build message history for the model
+            message_history = []
+            for msg in messages:
+                # Skip obviously broken assistant messages (repetitive garbage)
+                if msg['role'] == 'assistant':
+                    content = msg['content']
+                    # Check for repetitive patterns that indicate garbage output
+                    if (content.count('"') > 20 or  # Too many quotes
+                        content.count('</tool_call>') > 2 or  # Repeated closing tags
+                        content.count('.com') > 10 or  # Repetitive domain patterns
+                        len(content) > 1000 and len(set(content.split())) < 10):  # Very repetitive words
+                        logger.warning(f"⚠️ Skipping garbage assistant message: {content[:100]}...")
+                        continue
+                
+                # Handle different message types
+                if msg['role'] == 'tool':
+                    # Skip 'tool' role messages - they're now handled as structured user messages
+                    # or convert legacy tool responses for backward compatibility
+                    if len(message_history) > 0 and message_history[-1]['role'] == 'user' and '<tool_response>' in message_history[-1]['content']:
+                        # Tool response already included as structured user message, skip the 'tool' role duplicate
+                        logger.debug(f"⏭️ Skipping tool message - already included as structured user message")
+                        continue
+                    else:
+                        # Legacy tool response - convert for backward compatibility
+                        try:
+                            tool_result = json.loads(msg['content'])
+                            if tool_result.get('success', True):
+                                content_str = str(tool_result.get('content', tool_result))
+                                if len(content_str) > 1000:
+                                    content_str = content_str[:1000] + "... [truncated]"
+                                context_msg = f"<tool_response>\n{content_str}\n</tool_response>"
+                            else:
+                                context_msg = f"<tool_response>\nTool execution failed: {tool_result.get('error', 'Unknown error')}\n</tool_response>"
+                        except:
+                            tool_content = msg['content'][:500] + "..." if len(msg['content']) > 500 else msg['content']
+                            context_msg = f"<tool_response>\n{tool_content}\n</tool_response>"
+                        
+                        message_history.append({
+                            'role': 'user',
+                            'content': context_msg
+                        })
+                        logger.debug(f"🔄 Converted legacy tool response to structured user message: {len(context_msg)} chars")
+                else:
+                    # Include regular messages as-is
+                    message_history.append({
+                        'role': msg['role'],
+                        'content': msg['content']
+                    })
+                    logger.debug(f"➕ Added {msg['role']} message: {len(msg['content'])} chars")
+            
+            # Check if the last message indicates we should end
+            # Look for specific end patterns, not just any occurrence of "end"
+            end_patterns = [
+                r'<tool_call>\s*\{\s*"name":\s*"end"',  # end tool call
+                r'action.*end',  # end action
+                r'task.*complet',  # task complete/completed
+                r'finished.*task',  # finished task
+                r'end.*task',  # end task
+                r'stop.*here',  # stop here
+                r'done.*with.*task'  # done with task
+            ]
+            
+            import re
+            should_end = False
+            if messages:
+                for msg in messages[-3:]:
+                    if msg['role'] == 'assistant':
+                        content_lower = msg['content'].lower()
+                        for pattern in end_patterns:
+                            if re.search(pattern, content_lower):
+                                should_end = True
+                                break
+                        if should_end:
+                            break
+            
+            if should_end:
+                console.print(Panel(
+                    "🎯 Task appears to be completed (detected end pattern)",
+                    title="✅ TASK COMPLETED",
+                    style="bold green",
+                    border_style="green"
+                ))
+                return
+            
+            # Continue working on the task - agent should make more tool calls until 'end' action
+            
+
+            
+            # Ensure we have enough context to continue
+            if len(message_history) < 2:
+                logger.warning("⚠️ Insufficient message history for continuation, stopping")
+                return
+            
+            # Log the message history being sent for debugging
+            logger.info(f"📋 Sending {len(message_history)} messages to model for continuation:")
+            for i, msg in enumerate(message_history[-3:]):  # Show last 3 messages
+                content_preview = msg['content'][:100] + "..." if len(msg['content']) > 100 else msg['content']
+                logger.info(f"  {i}: {msg['role']} - {content_preview}")
+            
+            # Continue the conversation using stream_response with dual_model disabled
+            logger.info(f"🐛 Calling stream_response with dual_model=False for task continuation")
+            await self.stream_response(
+                websocket=websocket,
+                messages=message_history,
+                model=task_model,
+                temperature=0.5,  # Slightly higher temperature to encourage generation
+                max_tokens=500,   # Increased token limit for better responses
+                task_id=task_id,
+                dual_model=False  # Disable dual model mode for continuations
+            )
+            
+        except Exception as e:
+            console.print(Panel(
+                f"❌ Error continuing task conversation: {str(e)}",
+                title="🚨 TASK CONTINUATION ERROR",
+                style="bold red",
+                border_style="red"
+            ))
+            import traceback
+            traceback.print_exc()
+
 async def handle_client(websocket):
     """Handle WebSocket client connections"""
     client_addr = websocket.remote_address
@@ -1299,6 +2271,17 @@ async def handle_client(websocket):
         border_style="blue"
     ))
     
+    # Use global LLM server instance (loaded at startup)
+    llm_server = global_llm_server
+    
+    # Fallback: create new instance if global server failed to initialize
+    if llm_server is None:
+        console.print(Panel(
+            "⚠️ Global model not available, creating new instance...",
+            title="🔄 FALLBACK INITIALIZATION",
+            style="bold yellow",
+            border_style="yellow"
+        ))
     llm_server = DarkRLLLMServer()
     
     try:
@@ -1482,30 +2465,31 @@ async def handle_client(websocket):
                             border_style="green"
                         ))
                         
-                        # Format tool response in Qwen format  
-                        tool_response_content = f"<tool_response>\n{json.dumps(action_result, indent=2)}\n</tool_response>"
+                        # Save tool response in structured format as user message
+                        tool_response_content = json.dumps(action_result, indent=2)
+                        structured_response = f"<tool_response>\n{tool_response_content}\n</tool_response>"
+                        llm_server.task_manager.add_message(task_id, 'user', structured_response)
                         
-                        # Stream the tool response as a separate assistant message
+                        console.print(Panel(
+                            f"💾 **Tool response saved as user message**\n\n"
+                            f"**Result:**\n```json\n{tool_response_content}\n```\n\n"
+                            f"**Saved as:** `<tool_response>...</tool_response>`",
+                            title="🔧 TOOL RESPONSE SAVED",
+                            style="bold green",
+                            border_style="green"
+                        ))
+                        
+                        # Stream just a completion message to close the tool execution
                         tool_response_chunk = {
                             "choices": [{
                                 "delta": {
-                                    "content": tool_response_content
+                                    "content": "\n\n✅ Tool executed successfully."
                                 },
-                                "finish_reason": "stop"  # End the tool response message
+                                "finish_reason": "stop"  # End the message
                             }]
                         }
                         
                         await websocket.send(json.dumps(tool_response_chunk))
-                        
-                        # Save tool response as separate assistant message
-                        if task_id:
-                            llm_server.task_manager.add_message(task_id, 'assistant', tool_response_content)
-                            console.print(Panel(
-                                f"💾 Saved tool response message to task: {task_id}",
-                                title="📚 TOOL RESPONSE SAVED",
-                                style="bold cyan",
-                                border_style="cyan"
-                            ))
                         
                         # Now generate the final assistant response after the tool execution
                         # Build a fresh context for the final response (without the complex tool context)
@@ -1697,7 +2681,7 @@ async def handle_client(websocket):
                     await websocket.send(json.dumps(response))
                     continue
 
-                # Handle enhanced correction requests  
+                # Handle enhanced correction requests (NEW SIMPLIFIED WORKFLOW)
                 if request.get('type') == 'correction_with_execution':
                     console.print(Panel(
                         f"🔧 Received correction request",
@@ -1711,7 +2695,6 @@ async def handle_client(websocket):
                         message_index = request.get('message_index')  # Index of bad response to replace
                         corrected_tool_call = request.get('corrected_tool_call')  # {"name": "tool", "arguments": {...}}
                         thought = request.get('thought', '')  # Reasoning for the correction
-                        should_execute = request.get('should_execute', False)  # Whether to execute the correction
                         
                         if not task_id or corrected_tool_call is None:
                             error_response = {
@@ -1725,8 +2708,7 @@ async def handle_client(websocket):
                             f"🎯 **Task ID:** {task_id}\n"
                             f"🔧 **Corrected Tool:** {corrected_tool_call.get('name', 'unknown')}\n"
                             f"⚙️ **Parameters:** {json.dumps(corrected_tool_call.get('arguments', {}), indent=2)}\n"
-                            f"🧠 **Thought:** {thought}\n"
-                            f"🚀 **Execute:** {'Yes' if should_execute else 'No'}",
+                            f"🧠 **Thought:** {thought}",
                             title="📋 CORRECTION DETAILS",
                             style="bold cyan",
                             border_style="cyan"
@@ -1737,7 +2719,20 @@ async def handle_client(websocket):
                         if thought:
                             corrected_response += f"<think>\n{thought}\n</think>\n\n"
                         
-                        corrected_response += f"<tool_call>\n{json.dumps(corrected_tool_call, indent=2)}\n</tool_call>"
+                        # Extract the actual tool name without server prefix for the corrected response
+                        tool_name_full = corrected_tool_call.get('name')
+                        if '.' in tool_name_full:
+                            _, actual_tool_name = tool_name_full.split('.', 1)
+                        else:
+                            actual_tool_name = tool_name_full
+                        
+                        # Use the unprefixed tool name in the saved response
+                        corrected_tool_call_clean = {
+                            "name": actual_tool_name,
+                            "arguments": corrected_tool_call.get('arguments', {})
+                        }
+                        
+                        corrected_response += f"<tool_call>\n{json.dumps(corrected_tool_call_clean, indent=2)}\n</tool_call>"
                         
                         console.print(Panel(
                             corrected_response,
@@ -1746,56 +2741,10 @@ async def handle_client(websocket):
                             border_style="green"
                         ))
                         
-                        # Execute the corrected action if requested
-                        execution_result = None
-                        if should_execute:
-                            console.print(Panel(
-                                "🚀 Executing corrected action...",
-                                title="⚡ EXECUTION STARTED",
-                                style="bold blue",
-                                border_style="blue"
-                            ))
-                            
-                            tool_name = corrected_tool_call.get('name')
-                            parameters = corrected_tool_call.get('arguments', {})
-                            
-                            # Find which server this tool belongs to
-                            server_id = None
-                            server_actions = await llm_server.get_mcp_server_actions(['playwright', 'filesystem', 'sequential-thinking'])
-                            for sid, actions in server_actions.items():
-                                for action in actions:
-                                    if action.get('name') == tool_name:
-                                        server_id = sid
-                                        break
-                                if server_id:
-                                    break
-                            
-                            if server_id:
-                                execution_result = await llm_server.execute_mcp_action(server_id, tool_name, parameters)
-                                
-                                console.print(Panel(
-                                    f"✅ **Execution successful!**\n\n"
-                                    f"**Result:**\n```json\n{json.dumps(execution_result, indent=2)}\n```",
-                                    title="🎉 EXECUTION COMPLETED",
-                                    style="bold green",
-                                    border_style="green"
-                                ))
-                                
-                                # Add tool response to corrected response
-                                tool_response_content = f"\n\n<tool_response>\n{json.dumps(execution_result, indent=2)}\n</tool_response>"
-                                corrected_response += tool_response_content
-                            else:
-                                console.print(Panel(
-                                    f"❌ Could not find server for tool: {tool_name}",
-                                    title="🚨 EXECUTION ERROR",
-                                    style="bold red",
-                                    border_style="red"
-                                ))
-                        
-                        # Replace the bad response in the task
+                        # 1. Replace the bad response in the task
                         task_data = llm_server.get_task(task_id)
+                        success = False
                         if not task_data.get('error'):
-                            # Update the specific message
                             success = llm_server.task_manager.replace_message(task_id, message_index, corrected_response)
                             
                             if success:
@@ -1807,15 +2756,8 @@ async def handle_client(websocket):
                                     style="bold purple",
                                     border_style="purple"
                                 ))
-                            else:
-                                console.print(Panel(
-                                    f"❌ Failed to replace message at index {message_index}",
-                                    title="🚨 REPLACEMENT ERROR",
-                                    style="bold red",
-                                    border_style="red"
-                                ))
                         
-                        # Apply learning from the correction
+                        # 2. Apply learning from the correction
                         if task_data and not task_data.get('error'):
                             messages = task_data.get('messages', [])
                             # Find the user prompt that led to the bad response
@@ -1827,13 +2769,11 @@ async def handle_client(websocket):
                                         break
                             
                             if user_prompt:
-                                # Ensure we're using the same model as the task (OnlineLLM handles both inference and training)
+                                # Ensure we're using the same model as the task
                                 task_model = task_data.get('task', {}).get('model', 'qwen2.5-vl')
                                 if llm_server.current_model != task_model:
                                     logger.info(f"Switching model for correction learning: {llm_server.current_model} -> {task_model}")
                                     await llm_server.initialize_model(task_model)
-                                else:
-                                    logger.info(f"Using existing model for correction learning: {task_model}")
                                 
                                 # Create learning example with the corrected response
                                 learning_example = [
@@ -1843,12 +2783,12 @@ async def handle_client(websocket):
                                 
                                 # Pretty print the correction learning example
                                 console.print(Panel(
-                                    f"📚 **Learning from CORRECTED RESPONSE via Modal**\n\n"
+                                    f"📚 **Learning from CORRECTED RESPONSE**\n\n"
                                     f"**JSON Messages:**\n```json\n{json.dumps(learning_example, indent=2)}\n```\n\n"
                                     f"**Processed as Plain Text:**\n"
                                     f"👤 **User:** {user_prompt}\n\n"
                                     f"🤖 **Corrected Assistant:** {corrected_response}",
-                                    title="🔧 CORRECTION MODAL LEARNING",
+                                    title="🔧 CORRECTIVE LEARNING EXAMPLE",
                                     style="bold cyan",
                                     border_style="cyan"
                                 ))
@@ -1868,13 +2808,74 @@ async def handle_client(websocket):
                                     border_style="magenta"
                                 ))
                         
+                        # 3. Execute the corrected tool
+                        tool_name_full = corrected_tool_call.get('name')
+                        parameters = corrected_tool_call.get('arguments', {})
+                        
+                        # Extract server_id and tool_name from the full tool name (e.g., "playwright.browser_navigate")
+                        if '.' in tool_name_full:
+                            server_id, tool_name = tool_name_full.split('.', 1)
+                            logger.info(f"🔧 Extracted server_id: {server_id}, tool_name: {tool_name}")
+                        else:
+                            # Fallback: try to find the server by searching
+                            tool_name = tool_name_full
+                            server_id = None
+                            server_actions = await llm_server.get_mcp_server_actions(['playwright', 'filesystem', 'sequential-thinking'])
+                            for sid, actions in server_actions.items():
+                                for action in actions:
+                                    if action.get('name') == tool_name:
+                                        server_id = sid
+                                        break
+                                if server_id:
+                                    break
+                            logger.info(f"🔍 Fallback search found server_id: {server_id}, tool_name: {tool_name}")
+                        
+                        if server_id:
+                            logger.info(f"🚀 Executing corrected tool: {tool_name} on server {server_id}")
+                            execution_result = await llm_server.execute_mcp_action(server_id, tool_name, parameters)
+                            logger.info(f"✅ Corrected tool execution completed")
+                            
+                            # Test JSON serialization before saving
+                            try:
+                                tool_response_content = json.dumps(execution_result, indent=2)
+                                logger.debug("✅ Corrected tool result is JSON serializable")
+                            except Exception as json_error:
+                                logger.error(f"❌ Corrected tool result is NOT JSON serializable: {json_error}")
+                                # Fallback to string representation
+                                tool_response_content = str(execution_result)
+                                logger.warning("🔄 Using string fallback for corrected tool result")
+                            
+                            # 4. Add structured tool response as user message
+                            structured_response = f"<tool_response>\n{tool_response_content}\n</tool_response>"
+                            llm_server.task_manager.add_message(task_id, 'user', structured_response)
+                            logger.debug(f"💾 Added corrected tool response as user message: {len(structured_response)} characters")
+                            
+                            console.print(Panel(
+                                f"✅ **Corrected tool executed**\n\n"
+                                f"**Result:**\n```json\n{tool_response_content}\n```\n\n"
+                                f"**Saved as user message:** `<tool_response>...</tool_response>`",
+                                title="🎉 EXECUTION COMPLETED",
+                                style="bold green",
+                                border_style="green"
+                            ))
+                            
+                            # 5. Continue the task conversation
+                            await llm_server.continue_task_conversation(websocket, task_id)
+                        else:
+                            logger.error(f"❌ Could not find server for corrected tool: {tool_name}")
+                            console.print(Panel(
+                                f"❌ Could not find server for tool: {tool_name}",
+                                title="🚨 EXECUTION ERROR",
+                                style="bold red",
+                                border_style="red"
+                            ))
+                        
                         # Send response back to frontend
                         response = {
                             'type': 'correction_processed',
                             'success': True,
                             'corrected_response': corrected_response,
-                            'execution_result': execution_result,
-                            'message_replaced': success if 'success' in locals() else False
+                            'message_replaced': success
                         }
                         await websocket.send(json.dumps(response))
                         
@@ -1894,7 +2895,129 @@ async def handle_client(websocket):
                     
                     continue
 
-                # Handle learning feedback requests
+                # Handle model selection from dual response
+                if request.get('type') == 'model_selection':
+                    try:
+                        task_id = request.get('task_id', '')
+                        selected_model = request.get('selected_model', '')  # 'local' or 'gpt'
+                        local_response = request.get('local_response', '')
+                        gpt_response = request.get('gpt_response', '')
+                        
+                        logger.info(f"🐛 Model selection received: selected={selected_model}, task_id={task_id}")
+                        logger.info(f"🎯 Model selection received: selected={selected_model}, task_id={task_id}")
+                        
+                        # Save the selected response to the task
+                        if task_id and selected_model:
+                            selected_content = local_response if selected_model == 'local' else gpt_response
+                            if selected_content:
+                                llm_server.task_manager.add_message(task_id, 'assistant', selected_content)
+                                logger.info(f"💾 Saved selected {selected_model} response to task {task_id}")
+                                
+                                # Save user preference for analytics and learning
+                                try:
+                                    # Get the last user message to associate with this preference
+                                    task_data = llm_server.get_task(task_id)
+                                    if task_data and not task_data.get('error'):
+                                        messages = task_data.get('messages', [])
+                                        user_prompt = ""
+                                        for msg in reversed(messages):
+                                            if msg['role'] == 'user':
+                                                user_prompt = msg['content']
+                                                break
+                                        
+                                        if user_prompt:
+                                            preference_id = llm_server.task_manager.save_response_preference(
+                                                task_id=task_id,
+                                                user_prompt=user_prompt,
+                                                local_response=local_response,
+                                                gpt_response=gpt_response, 
+                                                preferred_model=selected_model,
+                                                local_model_name=request.get('local_model_name', 'qwen2.5-vl'),
+                                                gpt_model_name=request.get('gpt_model_name', 'gpt-4')
+                                            )
+                                            logger.info(f"📊 Saved response preference {preference_id}: user preferred {selected_model}")
+                                except Exception as e:
+                                    logger.error(f"❌ Error saving response preference: {e}")
+                                
+                                # Check if the selected response contains a tool call
+                                if "<tool_call>" in selected_content and "</tool_call>" in selected_content:
+                                    logger.info(f"🐛 Selected response contains tool call - will execute and continue conversation")
+                                    try:
+                                        console.print(Panel(
+                                            f"🔍 Selected {selected_model} response contains tool call - parsing and executing...",
+                                            title="🔧 TOOL CALL DETECTED",
+                                            style="bold yellow",
+                                            border_style="yellow"
+                                        ))
+                                        
+                                        tool_call_match = selected_content.split('<tool_call>')[1].split('</tool_call>')[0]
+                                        tool_call_data = json.loads(tool_call_match)
+                                        
+                                        # Find which server this tool belongs to
+                                        server_id = None
+                                        server_actions = await llm_server.get_mcp_server_actions(['playwright', 'filesystem', 'sequential-thinking'])
+                                        
+                                        for sid, actions in server_actions.items():
+                                            for action in actions:
+                                                if action.get('name') == tool_call_data.get('name'):
+                                                    server_id = sid
+                                                    break
+                                            if server_id:
+                                                break
+                                        
+                                        if server_id:
+                                            # Execute the tool
+                                            execution_result = await llm_server.execute_mcp_action(
+                                                server_id, 
+                                                tool_call_data.get('name'), 
+                                                tool_call_data.get('arguments', {})
+                                            )
+                                            
+                                            # Create structured tool response
+                                            tool_response_content = json.dumps(execution_result, indent=2)
+                                            structured_response = f"<tool_response>\n{tool_response_content}\n</tool_response>"
+                                            
+                                            # Add tool response as user message
+                                            llm_server.task_manager.add_message(task_id, 'user', structured_response)
+                                            
+                                            console.print(Panel(
+                                                f"✅ Tool executed successfully from selected {selected_model} response",
+                                                title="🎉 TOOL EXECUTION COMPLETED",
+                                                style="bold green",
+                                                border_style="green"
+                                            ))
+                                            
+                                            # Continue the conversation after tool execution
+                                            logger.info(f"🐛 About to call continue_task_conversation for task {task_id}")
+                                            await llm_server.continue_task_conversation(websocket, task_id)
+                                        else:
+                                            logger.error(f"❌ Could not find server for tool: {tool_call_data.get('name')}")
+                                            
+                                    except Exception as tool_error:
+                                        logger.error(f"❌ Error executing tool from selected response: {tool_error}")
+                                else:
+                                    logger.info(f"🐛 Selected response does not contain tool call - no continuation needed")
+                        
+                        # Send confirmation
+                        selection_response = {
+                            "type": "model_selection_response",
+                            "success": True,
+                            "selected_model": selected_model,
+                            "task_id": task_id
+                        }
+                        await websocket.send(json.dumps(selection_response))
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing model selection: {e}")
+                        error_response = {
+                            "type": "model_selection_response",
+                            "success": False,
+                            "error": str(e)
+                        }
+                        await websocket.send(json.dumps(error_response))
+                    continue
+                
+                # Handle learning feedback requests (NEW SIMPLIFIED WORKFLOW)
                 if request.get('type') == 'learning_feedback':
                     logger.info(f"Received learning_feedback request: {request}")
                     
@@ -1902,11 +3025,12 @@ async def handle_client(websocket):
                     message = request.get('message')
                     task_id = request.get('task_id')
                     user_comment = request.get('user_comment')
+                    message_index = request.get('message_index')
                     
                     logger.info(f"Learning feedback: {feedback_type} for task {task_id}")
                     
                     try:
-                        # Get task and message history for context first to determine correct model
+                        # Get task and message history for context
                         task_data = llm_server.get_task(task_id)
                         if task_data.get('error'):
                             await websocket.send(json.dumps({
@@ -1915,7 +3039,7 @@ async def handle_client(websocket):
                             }))
                             continue
                         
-                        # Ensure we're using the same model as the task (OnlineLLM handles both inference and training)
+                        # Ensure we're using the same model as the task
                         task_model = task_data.get('task', {}).get('model', 'qwen2.5-vl')
                         if llm_server.current_model != task_model:
                             logger.info(f"Switching model for learning: {llm_server.current_model} -> {task_model}")
@@ -1923,41 +3047,26 @@ async def handle_client(websocket):
                         else:
                             logger.info(f"Using existing model for learning: {task_model}")
                         
-                        # Get all messages for this task to build context
                         messages = task_data.get('messages', [])
                         
-                        # Build conversation context
-                        conversation_context = []
-                        for msg in messages:
-                            conversation_context.append({
-                                "role": msg['role'],
-                                "content": msg['content']
-                            })
-                        
-                        # Apply learning based on feedback type (following train_one_vl.py logic)
                         if feedback_type == 'approve':
-                            # Positive reinforcement learning
-                            logger.info("Learning from approved response...")
-                            
-                            # Find the user message that led to this assistant response
+                            # 1. Train on the approved example
                             user_prompt = None
-                            for i, msg in enumerate(conversation_context):
+                            for i, msg in enumerate(messages):
                                 if msg['role'] == 'assistant' and msg['content'] == message['content']:
                                     # Find the previous user message
                                     for j in range(i-1, -1, -1):
-                                        if conversation_context[j]['role'] == 'user':
-                                            user_prompt = conversation_context[j]['content']
+                                        if messages[j]['role'] == 'user':
+                                            user_prompt = messages[j]['content']
                                             break
                                     break
                             
                             if user_prompt:
-                                # Create learning example
                                 learning_example = [
                                     {"role": "user", "content": user_prompt},
                                     {"role": "assistant", "content": message['content']}
                                 ]
                                 
-                                # Pretty print the learning example
                                 console.print(Panel(
                                     f"📚 **Learning from APPROVED response**\n\n"
                                     f"**JSON Messages:**\n```json\n{json.dumps(learning_example, indent=2)}\n```\n\n"
@@ -1969,7 +3078,6 @@ async def handle_client(websocket):
                                     border_style="green"
                                 ))
                                 
-                                # Apply positive learning (from train_one_vl.py: OPTIMAL_LEARNING_STEPS=10, OPTIMAL_LEARNING_RATE=1e-4)
                                 await llm_server.llm.learn(
                                     learning_example,
                                     adapter="task_learning",
@@ -1977,117 +3085,130 @@ async def handle_client(websocket):
                                     lr=1e-4
                                 )
                                 
-                                logger.info("✓ Learning completed for approved response")
-                        
-                        elif feedback_type == 'deny':
-                            # Negative learning with user feedback
-                            logger.info("Learning from denied response...")
-                            
-                            if user_comment:
-                                # Create critique context (following train_one_vl.py critique_context)
-                                critique_context = f"You are tasked with determining if an action taken by an agent to accomplish a task is correct. The task was: {task_data['task']['title']}. The response was: {message['content']}. The user feedback was: {user_comment}. Please output a critique of the response."
-                                
-                                critique_example = [{"role": "user", "content": critique_context}, {"role": "assistant", "content": user_comment}]
-                                
-                                # Pretty print the learning example
-                                console.print(Panel(
-                                    f"📚 **Learning from DENIED response**\n\n"
-                                    f"**JSON Messages:**\n```json\n{json.dumps(critique_example, indent=2)}\n```\n\n"
-                                    f"**Processed as Plain Text:**\n"
-                                    f"👤 **Critique Context:** {critique_context}\n\n"
-                                    f"🤖 **Expected Response:** {user_comment}",
-                                    title="❌ NEGATIVE LEARNING EXAMPLE",
-                                    style="bold red",
-                                    border_style="red"
-                                ))
-                                
-                                # Apply negative learning
-                                await llm_server.llm.learn(
-                                    critique_example,
-                                    adapter="critique_learning",
-                                    steps=10,
-                                    lr=1e-4
-                                )
-                                
-                                logger.info("✓ Learning completed for denied response")
-                        
-                        elif feedback_type == 'correct':
-                            # Learning with correction
-                            logger.info("Learning from corrected response...")
-                            
-                            if user_comment:
-                                # Find the user message that led to this assistant response
-                                user_prompt = None
-                                for i, msg in enumerate(conversation_context):
-                                    if msg['role'] == 'assistant' and msg['content'] == message['content']:
-                                        # Find the previous user message
-                                        for j in range(i-1, -1, -1):
-                                            if conversation_context[j]['role'] == 'user':
-                                                user_prompt = conversation_context[j]['content']
-                                                break
-                                        break
-                                
-                                if user_prompt:
-                                    # Create corrected learning example
-                                    corrected_example = [
-                                        {"role": "user", "content": user_prompt},
-                                        {"role": "assistant", "content": user_comment}  # Use user's correction as the right answer
-                                    ]
-                                    
-                                    # Pretty print the learning example
+                            # 2. Check if there's a tool call to execute
+                            tool_call_executed = False
+                            if "<tool_call>" in message['content'] and "</tool_call>" in message['content']:
+                                try:
                                     console.print(Panel(
-                                        f"📚 **Learning from CORRECTED response**\n\n"
-                                        f"**Original bad response:** {message['content']}\n\n"
-                                        f"**JSON Messages:**\n```json\n{json.dumps(corrected_example, indent=2)}\n```\n\n"
-                                        f"**Processed as Plain Text:**\n"
-                                        f"👤 **User:** {user_prompt}\n\n"
-                                        f"🤖 **Corrected Assistant:** {user_comment}",
-                                        title="🔧 CORRECTIVE LEARNING EXAMPLE",
-                                        style="bold blue",
-                                        border_style="blue"
+                                        "🔍 Parsing tool call from approved message...",
+                                        title="🔧 TOOL CALL PARSING",
+                                        style="bold yellow",
+                                        border_style="yellow"
                                     ))
                                     
-                                    # Apply corrective learning
-                                    await llm_server.llm.learn(
-                                        corrected_example,
-                                        adapter="task_learning",
-                                        steps=10,
-                                        lr=1e-4
-                                    )
+                                    tool_call_match = message['content'].split('<tool_call>')[1].split('</tool_call>')[0]
+                                    logger.debug(f"🔍 Extracted tool call JSON: {tool_call_match}")
                                     
-                                    logger.info("✓ Learning completed for corrected response")
+                                    tool_call_data = json.loads(tool_call_match)
+                                    logger.info(f"✅ Parsed tool call: {tool_call_data}")
+                                    
+                                    console.print(Panel(
+                                        f"🎯 **Tool to execute:** {tool_call_data.get('name')}\n"
+                                        f"⚙️ **Arguments:** {json.dumps(tool_call_data.get('arguments', {}), indent=2)}",
+                                        title="🔧 TOOL CALL DETAILS",
+                                        style="bold cyan",
+                                        border_style="cyan"
+                                    ))
+                                    
+                                    # Find which server this tool belongs to
+                                    server_id = None
+                                    logger.debug("🔍 Finding server for tool...")
+                                    server_actions = await llm_server.get_mcp_server_actions(['playwright', 'filesystem', 'sequential-thinking'])
+                                    logger.debug(f"📋 Available servers: {list(server_actions.keys())}")
+                                    
+                                    for sid, actions in server_actions.items():
+                                        logger.debug(f"🔍 Checking server {sid} with {len(actions)} actions")
+                                        for action in actions:
+                                            if action.get('name') == tool_call_data.get('name'):
+                                                server_id = sid
+                                                logger.info(f"✅ Found tool {tool_call_data.get('name')} on server {sid}")
+                                                break
+                                        if server_id:
+                                            break
+                                
+                                    if server_id:
+                                        console.print(Panel(
+                                            f"🚀 Executing tool on server: {server_id}",
+                                            title="⚡ TOOL EXECUTION STARTING",
+                                            style="bold blue",
+                                            border_style="blue"
+                                        ))
+                                        
+                                        # Execute the tool
+                                        execution_result = await llm_server.execute_mcp_action(
+                                            server_id, 
+                                            tool_call_data.get('name'), 
+                                            tool_call_data.get('arguments', {})
+                                        )
+                                        
+                                        logger.info(f"✅ Tool execution completed with result: {execution_result}")
+                                        
+                                        # Create structured tool response for user message
+                                        tool_response_content = json.dumps(execution_result, indent=2)
+                                        structured_response = f"<tool_response>\n{tool_response_content}\n</tool_response>"
+                                        
+                                        # Add structured tool response as user message
+                                        llm_server.task_manager.add_message(task_id, 'user', structured_response)
+                                        logger.debug(f"💾 Added structured tool response as user message: {len(structured_response)} characters")
+                                        tool_call_executed = True
+                                        
+                                        console.print(Panel(
+                                            f"🛠️ **Tool executed after approval**\n\n"
+                                            f"**Result:**\n```json\n{tool_response_content}\n```\n\n"
+                                            f"**Saved as user message:** `<tool_response>...</tool_response>`",
+                                            title="⚡ TOOL EXECUTION COMPLETED",
+                                            style="bold blue",
+                                            border_style="blue"
+                                        ))
+                                    else:
+                                        logger.error(f"❌ Could not find server for tool: {tool_call_data.get('name')}")
+                                        console.print(Panel(
+                                            f"❌ Could not find server for tool: {tool_call_data.get('name')}\n"
+                                            f"📋 Available servers: {list(server_actions.keys())}\n"
+                                            f"🔍 Tool name: {tool_call_data.get('name')}",
+                                            title="🚨 SERVER NOT FOUND",
+                                            style="bold red",
+                                            border_style="red"
+                                        ))
+                                        
+                                except Exception as e:
+                                    logger.error(f"❌ Error executing approved tool: {str(e)}")
+                                    import traceback
+                                    logger.error(f"❌ Full traceback: {traceback.format_exc()}")
+                                    
+                                    console.print(Panel(
+                                        f"❌ Error executing approved tool: {str(e)}\n\n"
+                                        f"**Full error details:**\n{traceback.format_exc()}",
+                                        title="🚨 TOOL EXECUTION ERROR",
+                                        style="bold red",
+                                        border_style="red"
+                                    ))
+                            
+                            # 3. Continue the task if tool was executed
+                            if tool_call_executed:
+                                # Trigger continuation of the conversation
+                                await llm_server.continue_task_conversation(websocket, task_id)
+                        
+                        elif feedback_type == 'correct':
+                            # Only show correction modal - actual correction handled by separate endpoint
+                            pass
                         
                         elif feedback_type == 'comment':
-                            # General feedback/comment
-                            logger.info("Processing general feedback...")
-                            
+                            # Add comment to chat history under user role (no tool execution)
                             if user_comment:
-                                # Store feedback for future reference
-                                feedback_context = f"Task: {task_data['task']['title']}. Response: {message['content']}. User feedback: {user_comment}. Consider this feedback for future responses."
+                                llm_server.task_manager.add_message(task_id, 'user', user_comment)
                                 
-                                feedback_example = [{"role": "user", "content": feedback_context}, {"role": "assistant", "content": "I understand and will consider this feedback."}]
-                                
-                                # Pretty print the learning example
                                 console.print(Panel(
-                                    f"📚 **Learning from GENERAL COMMENT**\n\n"
-                                    f"**JSON Messages:**\n```json\n{json.dumps(feedback_example, indent=2)}\n```\n\n"
-                                    f"**Processed as Plain Text:**\n"
-                                    f"👤 **Feedback Context:** {feedback_context}\n\n"
-                                    f"🤖 **Expected Response:** I understand and will consider this feedback.",
-                                    title="💬 GENERAL FEEDBACK LEARNING",
+                                    f"💬 **User comment added to chat history**\n\n"
+                                    f"**Comment:** {user_comment}\n\n"
+                                    f"**Note:** Tool call was NOT executed - continuing with comment",
+                                    title="📝 COMMENT ADDED",
                                     style="bold purple",
                                     border_style="purple"
                                 ))
                                 
-                                # Light learning from general feedback
-                                await llm_server.llm.learn(
-                                    feedback_example,
-                                    adapter="general_feedback",
-                                    steps=5,  # Less intensive for general feedback
-                                    lr=5e-5   # Lower learning rate for general feedback
-                                )
-                                
-                                logger.info("✓ General feedback processed")
+                                # Continue the task after comment (no tool execution)
+                                await llm_server.continue_task_conversation(websocket, task_id)
                         
                         # Send confirmation
                         await websocket.send(json.dumps({
@@ -2116,6 +3237,8 @@ async def handle_client(websocket):
                 task_id = request.get('task_id')  # Optional task ID for persistence
                 auto_response = request.get('auto_response', False)  # Flag for auto-responses
                 
+                logger.info(f"🐛 Main handler received request: auto_response={auto_response}, task_id={task_id}")
+
                 if not messages:
                     error_response = {
                         "error": {
@@ -2125,7 +3248,7 @@ async def handle_client(websocket):
                     }
                     await websocket.send(json.dumps(error_response))
                     continue
-                
+
                 # Save user message to task if task_id provided and not an auto-response
                 if task_id and messages and not auto_response:
                     latest_message = messages[-1]  # Get the most recent message
@@ -2134,7 +3257,7 @@ async def handle_client(websocket):
                         logger.info(f"Saved user message to task {task_id}")
                 elif auto_response:
                     logger.info(f"Auto-response request for task {task_id} - not saving user message")
-                
+
                 if not stream:
                     # Non-streaming response (fallback)
                     await llm_server.initialize_model(model)
@@ -2154,6 +3277,7 @@ async def handle_client(websocket):
                     await websocket.send(json.dumps(response))
                 else:
                     # Streaming response
+                    logger.info(f"🐛 Main handler calling stream_response with default dual_model=True for task {task_id}")
                     await llm_server.stream_response(
                         websocket, 
                         messages, 
@@ -2212,6 +3336,36 @@ async def main():
         border_style="green"
     ))
     
+    # Initialize global LLM server and load model during startup
+    global global_llm_server
+    console.print(Panel(
+        "🧠 Initializing AI model...\n"
+        "This may take a moment on first startup",
+        title="🔄 MODEL LOADING",
+        style="bold yellow",
+        border_style="yellow"
+    ))
+    
+    global_llm_server = DarkRLLLMServer()
+    try:
+        await global_llm_server.initialize_model("qwen2.5-vl")  # Load default model
+        console.print(Panel(
+            "✅ AI model loaded successfully!\n"
+            "🎯 Ready for immediate responses",
+            title="🧠 MODEL READY",
+            style="bold green",
+            border_style="green"
+        ))
+    except Exception as e:
+        console.print(Panel(
+            f"❌ Failed to load model: {str(e)}\n"
+            "⚠️ Model will be loaded on first request",
+            title="🚨 MODEL LOADING ERROR",
+            style="bold red",
+            border_style="red"
+        ))
+        # Continue with server startup even if model loading fails
+    
     # Start server on root path
     async with websockets.serve(handle_client, host, port):
         console.print(Panel(
@@ -2233,6 +3387,13 @@ if __name__ == "__main__":
             style="bold yellow",
             border_style="yellow"
         ))
+        # Clean up global resources
+        if global_llm_server is not None:
+            try:
+                # Cleanup MCP connections
+                asyncio.run(global_llm_server.cleanup_mcp_connections())
+            except:
+                pass
     except Exception as e:
         console.print(Panel(
             f"❌ Server error: {str(e)}",

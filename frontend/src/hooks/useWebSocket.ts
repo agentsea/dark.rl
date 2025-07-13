@@ -90,10 +90,21 @@ export default function useWebSocket({
     const [mcpServerActions, setMcpServerActions] = useState<Record<string, MCPServerAction[]>>({})
     const [loadingMcpServerActions, setLoadingMcpServerActions] = useState(false)
 
+    // Dual response state
+    const [isDualResponse, setIsDualResponse] = useState(false)
+    const [localResponse, setLocalResponse] = useState('')
+    const [gptResponse, setGptResponse] = useState('')
+    const [localModel, setLocalModel] = useState('')
+    const [gptModel, setGptModel] = useState('')
+    const [localFinished, setLocalFinished] = useState(false)
+    const [gptFinished, setGptFinished] = useState(false)
+
     const wsRef = useRef<WebSocket | null>(null)
     const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
     const reconnectCountRef = useRef(0)
     const currentResponseRef = useRef('')
+    const localResponseRef = useRef('')
+    const gptResponseRef = useRef('')
 
     const connect = useCallback(() => {
         if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -135,7 +146,57 @@ export default function useWebSocket({
                         return
                     }
 
-                    // Handle streaming response
+                    // Handle dual response start
+                    if (data.type === 'dual_response_start') {
+                        console.log('Dual response started:', data)
+                        setIsDualResponse(true)
+                        setLocalModel(data.local_model)
+                        setGptModel(data.gpt_model)
+                        setLocalResponse('')
+                        setGptResponse('')
+                        setLocalFinished(false)
+                        setGptFinished(false)
+                        localResponseRef.current = ''
+                        gptResponseRef.current = ''
+                        setIsStreaming(true)
+                        return
+                    }
+
+                    // Handle dual response chunks
+                    if (data.type === 'dual_response_chunk') {
+                        console.log('Dual response chunk:', data.source, data.choices[0].delta?.content)
+
+                        if (data.source === 'local') {
+                            if (data.choices[0].delta?.content) {
+                                localResponseRef.current += data.choices[0].delta.content
+                                setLocalResponse(localResponseRef.current)
+                            }
+                            if (data.choices[0].finish_reason === 'stop') {
+                                console.log('Local response finished')
+                                setLocalFinished(true)
+                            }
+                        } else if (data.source === 'gpt') {
+                            if (data.choices[0].delta?.content) {
+                                gptResponseRef.current += data.choices[0].delta.content
+                                setGptResponse(gptResponseRef.current)
+                            }
+                            if (data.choices[0].finish_reason === 'stop') {
+                                console.log('GPT response finished')
+                                setGptFinished(true)
+                            }
+                        }
+                        return
+                    }
+
+                    // Handle dual response complete
+                    if (data.type === 'dual_response_complete') {
+                        console.log('Dual response complete:', data)
+                        setIsStreaming(false)
+                        // Don't clear responses yet - let user choose
+                        return
+                    }
+
+                    // Handle streaming response (single model)
                     const streamData = data as StreamResponse
                     if (streamData.choices && streamData.choices[0]) {
                         const choice = streamData.choices[0]
@@ -251,8 +312,9 @@ export default function useWebSocket({
     }, [])
 
     const sendMessage = useCallback((content: string, model = 'default', customMessages?: Message[], taskId?: string, isAutoResponse = false) => {
+        console.log(`🐛 [useWebSocket] sendMessage called with content="${content}", model=${model}, taskId=${taskId}, isAutoResponse=${isAutoResponse}`)
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-            console.error('WebSocket not connected for sending message')
+            console.error('🐛 [useWebSocket] WebSocket not connected for sending message')
             return
         }
 
@@ -281,6 +343,8 @@ export default function useWebSocket({
             ...(isAutoResponse && { auto_response: true })
         }
 
+        console.log(`🐛 [useWebSocket] Sending message request:`, request)
+
         // Send to WebSocket
         wsRef.current.send(JSON.stringify(request))
         currentResponseRef.current = ''
@@ -299,6 +363,84 @@ export default function useWebSocket({
         currentResponseRef.current = ''
         setCurrentResponse('')
     }, [])
+
+    const clearDualResponse = useCallback(() => {
+        setIsDualResponse(false)
+        setLocalResponse('')
+        setGptResponse('')
+        setLocalModel('')
+        setGptModel('')
+        setLocalFinished(false)
+        setGptFinished(false)
+        localResponseRef.current = ''
+        gptResponseRef.current = ''
+    }, [])
+
+    const selectModel = useCallback(async (selectedModel: 'local' | 'gpt', taskId?: string) => {
+        console.log(`🐛 [useWebSocket] selectModel called with model=${selectedModel}, taskId=${taskId}`)
+
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            console.error('🐛 [useWebSocket] WebSocket not connected for model selection')
+            return
+        }
+
+        const request = {
+            type: 'model_selection',
+            selected_model: selectedModel,
+            local_response: localResponseRef.current,
+            gpt_response: gptResponseRef.current,
+            local_model_name: localModel,
+            gpt_model_name: gptModel,
+            task_id: taskId
+        }
+
+        console.log(`🐛 [useWebSocket] Sending model selection request:`, request)
+
+        return new Promise((resolve, reject) => {
+            const originalOnMessage = wsRef.current?.onmessage
+
+            const handleResponse = (event: MessageEvent) => {
+                try {
+                    const data = JSON.parse(event.data)
+                    console.log(`🐛 [useWebSocket] Received response in selectModel:`, data.type)
+
+                    if (data.type === 'model_selection_response') {
+                        console.log(`🐛 [useWebSocket] Model selection response received, success=${data.success}`)
+                        // Restore original handler
+                        if (wsRef.current && originalOnMessage) {
+                            wsRef.current.onmessage = originalOnMessage
+                        }
+                        resolve(data)
+                        return
+                    }
+                } catch (error) {
+                    console.error('🐛 [useWebSocket] Error parsing selectModel response:', error)
+                }
+
+                // Pass other messages to original handler
+                if (originalOnMessage) {
+                    originalOnMessage(event)
+                }
+            }
+
+            // Set temporary handler
+            if (wsRef.current) {
+                wsRef.current.onmessage = handleResponse
+            }
+
+            // Send the request
+            wsRef.current.send(JSON.stringify(request))
+            console.log(`🐛 [useWebSocket] Model selection request sent`)
+
+            // Set timeout for response
+            setTimeout(() => {
+                if (wsRef.current && originalOnMessage) {
+                    wsRef.current.onmessage = originalOnMessage
+                }
+                reject(new Error('Model selection timeout'))
+            }, 5000)
+        })
+    }, [localModel, gptModel])
 
     const getMcpServers = useCallback((query = '') => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
@@ -406,6 +548,8 @@ export default function useWebSocket({
     }, [connectionStatus])
 
     const getTask = useCallback(async (taskId: string): Promise<any> => {
+        console.log(`🐛 [useWebSocket] getTask called with taskId=${taskId}`)
+
         // Wait for connection if it's still connecting
         let retries = 0
         const maxRetries = 30 // 3 seconds with 100ms intervals
@@ -416,7 +560,7 @@ export default function useWebSocket({
             }
             if (wsRef.current?.readyState === WebSocket.CLOSED ||
                 wsRef.current?.readyState === WebSocket.CLOSING) {
-                console.error('WebSocket connection failed for task retrieval')
+                console.error('🐛 [useWebSocket] WebSocket connection failed for task retrieval')
                 return null
             }
             await new Promise(resolve => setTimeout(resolve, 100))
@@ -424,7 +568,7 @@ export default function useWebSocket({
         }
 
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-            console.error('WebSocket not connected for task retrieval after waiting')
+            console.error('🐛 [useWebSocket] WebSocket not connected for task retrieval after waiting')
             return null
         }
 
@@ -434,6 +578,8 @@ export default function useWebSocket({
                 task_id: taskId
             }
 
+            console.log(`🐛 [useWebSocket] Sending getTask request:`, request)
+
             // Set up one-time listener for task data response
             const ws = wsRef.current!
             const originalOnMessage = ws.onmessage
@@ -441,8 +587,10 @@ export default function useWebSocket({
             ws.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data)
+                    console.log(`🐛 [useWebSocket] Received response in getTask:`, data.type)
 
                     if (data.type === 'task_data') {
+                        console.log(`🐛 [useWebSocket] Task data received, messages count=${data.messages?.length || 0}`)
                         // Restore original message handler
                         if (wsRef.current) {
                             wsRef.current.onmessage = originalOnMessage
@@ -452,7 +600,7 @@ export default function useWebSocket({
                     }
 
                     if (data.type === 'error') {
-                        console.error('Task retrieval error:', data.error)
+                        console.error('🐛 [useWebSocket] Task retrieval error:', data.error)
                         if (wsRef.current) {
                             wsRef.current.onmessage = originalOnMessage
                         }
@@ -465,7 +613,7 @@ export default function useWebSocket({
                         originalOnMessage.call(ws, event)
                     }
                 } catch (error) {
-                    console.error('Error parsing task retrieval response:', error)
+                    console.error('🐛 [useWebSocket] Error parsing task retrieval response:', error)
                     if (wsRef.current) {
                         wsRef.current.onmessage = originalOnMessage
                     }
@@ -487,7 +635,7 @@ export default function useWebSocket({
         }
     }, [autoConnect, connect, disconnect])
 
-    const sendLearningFeedback = useCallback(async (type: string, message: any, taskId: string, userComment?: string): Promise<void> => {
+    const sendLearningFeedback = useCallback(async (type: string, message: any, taskId: string, userComment?: string, messageIndex?: number): Promise<void> => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
             console.error('WebSocket not connected for learning feedback')
             return
@@ -498,6 +646,7 @@ export default function useWebSocket({
             feedback_type: type,
             message: message,
             task_id: taskId,
+            message_index: messageIndex,
             user_comment: userComment
         }
 
@@ -657,6 +806,14 @@ export default function useWebSocket({
         loadingMcpServers,
         mcpServerActions,
         loadingMcpServerActions,
+        // Dual response state
+        isDualResponse,
+        localResponse,
+        gptResponse,
+        localModel,
+        gptModel,
+        localFinished,
+        gptFinished,
         connect,
         disconnect,
         sendMessage,
@@ -666,6 +823,8 @@ export default function useWebSocket({
         createTask,
         getTask,
         clearCurrentResponse,
+        clearDualResponse,
+        selectModel,
         sendLearningFeedback,
         executeMcpAction,
         executeToolAndContinue,

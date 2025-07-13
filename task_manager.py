@@ -56,6 +56,22 @@ class TaskManager:
                 ON messages (timestamp)
             """)
             
+            # New table for storing response preferences
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS response_preferences (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    user_prompt TEXT NOT NULL,
+                    local_response TEXT NOT NULL,
+                    gpt_response TEXT NOT NULL,
+                    preferred_model TEXT NOT NULL,  -- 'local' or 'gpt'
+                    local_model_name TEXT,
+                    gpt_model_name TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (task_id) REFERENCES tasks (id)
+                )
+            """)
+            
             conn.commit()
     
     def create_task(self, initial_prompt: str, model: str = "qwen2.5-vl") -> str:
@@ -237,3 +253,33 @@ class TaskManager:
         
         # Remove duplicates and return
         return list(set(matches)) 
+
+    def save_response_preference(self, task_id: str, user_prompt: str, local_response: str, 
+                               gpt_response: str, preferred_model: str, local_model_name: str = None, 
+                               gpt_model_name: str = None) -> int:
+        """Save user's response preference for analytics and learning"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                INSERT INTO response_preferences 
+                (task_id, user_prompt, local_response, gpt_response, preferred_model, local_model_name, gpt_model_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (task_id, user_prompt, local_response, gpt_response, preferred_model, local_model_name, gpt_model_name))
+            
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_response_preferences(self, task_id: str = None) -> list:
+        """Get response preferences, optionally filtered by task_id"""
+        with sqlite3.connect(self.db_path) as conn:
+            if task_id:
+                cursor = conn.execute("""
+                    SELECT * FROM response_preferences WHERE task_id = ?
+                    ORDER BY created_at DESC
+                """, (task_id,))
+            else:
+                cursor = conn.execute("""
+                    SELECT * FROM response_preferences
+                    ORDER BY created_at DESC
+                """)
+            
+            return [dict(row) for row in cursor.fetchall()] 

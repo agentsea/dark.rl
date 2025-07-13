@@ -40,7 +40,7 @@ export default function CorrectionModal({
     const [selectedTool, setSelectedTool] = useState<string>('')
     const [parameters, setParameters] = useState<Record<string, any>>({})
     const [thought, setThought] = useState<string>('')
-    const [shouldExecute, setShouldExecute] = useState<boolean>(false)
+
     const [submitting, setSubmitting] = useState<boolean>(false)
 
     // Debug logging
@@ -53,7 +53,6 @@ export default function CorrectionModal({
             setSelectedTool('')
             setParameters({})
             setThought('')
-            setShouldExecute(false)
             setSubmitting(false)
         }
     }, [isOpen])
@@ -127,7 +126,7 @@ export default function CorrectionModal({
             messageIndex,
             toolCall: { name: selectedTool, arguments: parameters },
             thought,
-            shouldExecute
+            shouldExecute: true
         })
 
         setSubmitting(true)
@@ -138,7 +137,7 @@ export default function CorrectionModal({
                 messageIndex,
                 { name: selectedTool, arguments: parameters },
                 thought,
-                shouldExecute
+                true // Always execute after correction
             )
 
             console.log('🔄 onSubmitCorrection result:', result)
@@ -346,20 +345,7 @@ export default function CorrectionModal({
                         />
                     </div>
 
-                    {/* Execute Option */}
-                    <div className="flex items-center space-x-3">
-                        <input
-                            type="checkbox"
-                            id="shouldExecute"
-                            checked={shouldExecute}
-                            onChange={(e) => setShouldExecute(e.target.checked)}
-                            className="h-4 w-4 rounded"
-                            style={{ accentColor: '#61FDFC' }}
-                        />
-                        <label htmlFor="shouldExecute" className="text-sm font-mono" style={{ color: '#9CA3AF' }}>
-                            Execute this tool immediately after correction
-                        </label>
-                    </div>
+
                 </div>
 
                 {/* Footer */}
@@ -390,15 +376,10 @@ export default function CorrectionModal({
                                 <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
                                 <span>Submitting...</span>
                             </>
-                        ) : shouldExecute ? (
+                        ) : (
                             <>
                                 <span>▶️</span>
                                 <span>Submit & Execute</span>
-                            </>
-                        ) : (
-                            <>
-                                <span>💾</span>
-                                <span>Submit Correction</span>
                             </>
                         )}
                     </button>
