@@ -434,6 +434,7 @@ function TaskPage() {
         gptModel,
         localFinished,
         gptFinished,
+        dualSessionId,
         connect,
         sendMessage,
         getMcpServers,
@@ -443,7 +444,9 @@ function TaskPage() {
         clearDualResponse,
         selectModel,
         sendLearningFeedback,
-        sendCorrectionWithExecution
+        sendCorrectionWithExecution,
+        isDualTransitioning,
+        isTransitioningRef
     } = useWebSocket({
         url: 'ws://localhost:8000',
         autoConnect: true,
@@ -920,14 +923,14 @@ function TaskPage() {
             setTaskMessages(prev => [...prev, newMessage])
             console.log(`🐛 [Frontend] Added selected message to task messages`)
 
-            // Clear the dual response state immediately
-            clearDualResponse()
-            console.log(`🐛 [Frontend] Cleared dual response state`)
-
-            // Send the selection to the backend (will handle tool execution if needed)
+            // Send the selection to the backend FIRST (before clearing the dual response state)
             console.log(`🐛 [Frontend] About to call selectModel...`)
             await selectModel(selectedModel, id)
             console.log(`🐛 [Frontend] selectModel completed`)
+
+            // Clear the dual response state AFTER sending to backend
+            clearDualResponse()
+            console.log(`🐛 [Frontend] Cleared dual response state`)
 
             // Reload task messages after a short delay to get any additional updates (like tool execution results)
             setTimeout(async () => {
@@ -1233,217 +1236,224 @@ function TaskPage() {
                                             }
                                             return true;
                                         })
-                                        .map((message, index) => (
-                                            <div
-                                                key={index}
-                                                className="text-base font-mono glow whitespace-pre-wrap leading-relaxed"
-                                                style={{ marginBottom: '40px' }}
-                                            >
-                                                {message.role === 'user' ? (
-                                                    <div className="text-cyan-300 mb-2">User</div>
-                                                ) : message.role === 'tool' ? (
-                                                    <div className="text-orange-300 mb-2">Tool Response</div>
-                                                ) : (
-                                                    <div className="text-green-300 mb-2">Assistant</div>
-                                                )}
-                                                <div className="border-l ml-2" style={{ paddingLeft: '20px', fontWeight: '300', color: '#E5E7EB', fontSize: '0.9rem', borderLeftColor: '#61FDFC', borderLeftWidth: '2px' }}>
-                                                    {message.role === 'tool' ? (
-                                                        <ToolResponseDisplay content={message.content} />
+                                        .map((message, index) => {
+                                            // Check if this is a tool response (user message with <tool_response> tags)
+                                            const isToolResponse = message.role === 'user' && message.content.includes('<tool_response>');
+
+                                            return (
+                                                <div
+                                                    key={index}
+                                                    className="text-base font-mono glow whitespace-pre-wrap leading-relaxed"
+                                                    style={{ marginBottom: '40px' }}
+                                                >
+                                                    {isToolResponse ? (
+                                                        <div className="text-orange-300 mb-2">🛠️ Tool Response</div>
+                                                    ) : message.role === 'user' ? (
+                                                        <div className="text-cyan-300 mb-2">User</div>
+                                                    ) : message.role === 'tool' ? (
+                                                        <div className="text-orange-300 mb-2">Tool Response</div>
                                                     ) : (
-                                                        parseContent(message.content)
+                                                        <div className="text-green-300 mb-2">Assistant</div>
                                                     )}
-                                                </div>
-
-                                                {/* Learning buttons for assistant messages - SIMPLIFIED */}
-                                                {message.role === 'assistant' && (
-                                                    <>
-                                                        <div className="flex gap-4 mb-2" style={{ marginTop: '16px', marginLeft: '24px' }}>
-                                                            <button
-                                                                onClick={() => handleLearningFeedback('approve', message, index)}
-                                                                onMouseEnter={() => setHoveredButton(getButtonId(index, 'approve'))}
-                                                                onMouseLeave={() => setHoveredButton(null)}
-                                                                className="text-xs font-mono border transition-all duration-200 hover:scale-105"
-                                                                style={{
-                                                                    backgroundColor: 'rgba(0, 0, 0, 0.2)',
-                                                                    borderColor: (hoveredButton === getButtonId(index, 'approve') || clickedButtons.has(getButtonId(index, 'approve'))) ? '#61FDFC' : 'rgba(107, 114, 128, 0.3)',
-                                                                    color: '#9CA3AF',
-                                                                    borderRadius: '12px',
-                                                                    padding: '16px 32px',
-                                                                    cursor: 'pointer'
-                                                                }}
-                                                            >
-                                                                <span style={{ color: '#22c55e' }}>✓</span> Approve
-                                                            </button>
-                                                            <button
-                                                                onClick={() => handleLearningFeedback('correct', message, index)}
-                                                                onMouseEnter={() => setHoveredButton(getButtonId(index, 'correct'))}
-                                                                onMouseLeave={() => setHoveredButton(null)}
-                                                                className="text-xs font-mono border transition-all duration-200 hover:scale-105"
-                                                                style={{
-                                                                    backgroundColor: 'rgba(0, 0, 0, 0.2)',
-                                                                    borderColor: (hoveredButton === getButtonId(index, 'correct') || clickedButtons.has(getButtonId(index, 'correct'))) ? '#61FDFC' : 'rgba(107, 114, 128, 0.3)',
-                                                                    color: '#9CA3AF',
-                                                                    borderRadius: '12px',
-                                                                    padding: '16px 32px',
-                                                                    cursor: 'pointer'
-                                                                }}
-                                                            >
-                                                                <span style={{ color: '#3b82f6' }}>✎</span> Correct
-                                                            </button>
-                                                        </div>
-
-                                                        {/* Inline comment box for historical messages */}
-                                                        {activeCommentBox === getButtonId(index, 'comment') && (
-                                                            <div style={{ marginTop: '16px', marginLeft: '24px' }}>
-                                                                <textarea
-                                                                    value={commentText}
-                                                                    onChange={(e) => setCommentText(e.target.value)}
-                                                                    placeholder="Add your comment..."
-                                                                    className="form-textarea min-h-[80px] w-full glow resize-none font-mono text-sm"
-                                                                    style={{ maxWidth: '500px' }}
-                                                                />
-                                                                <div className="flex gap-2 mt-2">
-                                                                    <button
-                                                                        onClick={() => handleCommentSubmit(activeCommentBox!, index, message)}
-                                                                        className="text-xs font-mono border transition-all duration-200 hover:scale-105"
-                                                                        style={{
-                                                                            backgroundColor: 'rgba(34, 197, 94, 0.2)',
-                                                                            borderColor: 'rgba(34, 197, 94, 0.4)',
-                                                                            color: '#22c55e',
-                                                                            borderRadius: '8px',
-                                                                            padding: '8px 16px',
-                                                                            cursor: 'pointer'
-                                                                        }}
-                                                                    >
-                                                                        Submit
-                                                                    </button>
-                                                                    <button
-                                                                        onClick={handleCommentCancel}
-                                                                        className="text-xs font-mono border transition-all duration-200 hover:scale-105"
-                                                                        style={{
-                                                                            backgroundColor: 'rgba(107, 114, 128, 0.2)',
-                                                                            borderColor: 'rgba(107, 114, 128, 0.3)',
-                                                                            color: '#9CA3AF',
-                                                                            borderRadius: '8px',
-                                                                            padding: '8px 16px',
-                                                                            cursor: 'pointer'
-                                                                        }}
-                                                                    >
-                                                                        Cancel
-                                                                    </button>
-                                                                </div>
-                                                            </div>
+                                                    <div className="border-l ml-2" style={{ paddingLeft: '20px', fontWeight: '300', color: '#E5E7EB', fontSize: '0.9rem', borderLeftColor: '#61FDFC', borderLeftWidth: '2px' }}>
+                                                        {message.role === 'tool' ? (
+                                                            <ToolResponseDisplay content={message.content} />
+                                                        ) : (
+                                                            parseContent(message.content)
                                                         )}
+                                                    </div>
 
-                                                        {/* MCP Server Actions selection box for historical messages */}
-                                                        {showMcpActionsBox === getButtonId(index, 'correct') && (
-                                                            <div style={{ marginTop: '16px', marginLeft: '24px' }}>
-                                                                <div className="font-mono text-sm glow mb-2" style={{ color: '#61FDFC' }}>
-                                                                    Select the correct action from available MCP servers:
-                                                                </div>
-
-                                                                {loadingMcpServerActions ? (
-                                                                    <div style={{ color: '#9CA3AF', fontSize: '12px' }}>Loading actions...</div>
-                                                                ) : (
-                                                                    <div style={{
-                                                                        maxHeight: '200px',
-                                                                        overflowY: 'auto',
-                                                                        backgroundColor: 'rgba(0, 0, 0, 0.3)',
-                                                                        border: '1px solid rgba(107, 114, 128, 0.3)',
-                                                                        borderRadius: '8px',
-                                                                        padding: '8px',
-                                                                        maxWidth: '500px'
-                                                                    }}>
-                                                                        {task?.mcp_servers && task.mcp_servers.map(serverId => (
-                                                                            <div key={serverId} style={{ marginBottom: '12px' }}>
-                                                                                <div style={{ color: '#3B82F6', fontSize: '12px', marginBottom: '4px', fontWeight: 'bold' }}>
-                                                                                    {serverId}
-                                                                                </div>
-                                                                                {mcpServerActions[serverId]?.map(action => (
-                                                                                    <button
-                                                                                        key={action.name}
-                                                                                        onClick={() => setSelectedAction({ serverId, actionName: action.name, description: action.description })}
-                                                                                        className="text-xs font-mono border transition-all duration-200 hover:scale-105 block w-full text-left mb-1"
-                                                                                        style={{
-                                                                                            backgroundColor: selectedAction?.serverId === serverId && selectedAction?.actionName === action.name
-                                                                                                ? 'rgba(59, 130, 246, 0.2)' : 'rgba(0, 0, 0, 0.2)',
-                                                                                            borderColor: selectedAction?.serverId === serverId && selectedAction?.actionName === action.name
-                                                                                                ? '#3B82F6' : 'rgba(107, 114, 128, 0.3)',
-                                                                                            color: '#E5E7EB',
-                                                                                            borderRadius: '4px',
-                                                                                            padding: '8px',
-                                                                                            cursor: 'pointer'
-                                                                                        }}
-                                                                                    >
-                                                                                        <div style={{ fontWeight: 'bold' }}>{action.name}</div>
-                                                                                        <div style={{ fontSize: '10px', opacity: 0.8 }}>{action.description}</div>
-                                                                                    </button>
-                                                                                ))}
-                                                                            </div>
-                                                                        ))}
-                                                                    </div>
-                                                                )}
-
-                                                                <div className="flex gap-2 mt-2">
-                                                                    <button
-                                                                        onClick={() => handleMcpActionSelect(showMcpActionsBox!, index, message)}
-                                                                        disabled={!selectedAction}
-                                                                        className="text-xs font-mono border transition-all duration-200 hover:scale-105"
-                                                                        style={{
-                                                                            backgroundColor: selectedAction ? 'rgba(34, 197, 94, 0.2)' : 'rgba(107, 114, 128, 0.1)',
-                                                                            borderColor: selectedAction ? 'rgba(34, 197, 94, 0.4)' : 'rgba(107, 114, 128, 0.3)',
-                                                                            color: selectedAction ? '#22c55e' : '#6B7280',
-                                                                            borderRadius: '8px',
-                                                                            padding: '8px 16px',
-                                                                            cursor: selectedAction ? 'pointer' : 'not-allowed'
-                                                                        }}
-                                                                    >
-                                                                        Use Selected Action
-                                                                    </button>
-                                                                    <button
-                                                                        onClick={handleMcpActionCancel}
-                                                                        className="text-xs font-mono border transition-all duration-200 hover:scale-105"
-                                                                        style={{
-                                                                            backgroundColor: 'rgba(107, 114, 128, 0.2)',
-                                                                            borderColor: 'rgba(107, 114, 128, 0.3)',
-                                                                            color: '#9CA3AF',
-                                                                            borderRadius: '8px',
-                                                                            padding: '8px 16px',
-                                                                            cursor: 'pointer'
-                                                                        }}
-                                                                    >
-                                                                        Cancel
-                                                                    </button>
-                                                                </div>
-                                                            </div>
-                                                        )}
-
-                                                        {/* Display submitted comments for historical messages */}
-                                                        {submittedComments[getButtonId(index, 'comment')] && (
-                                                            <div style={{ marginTop: '16px', marginLeft: '24px' }}>
-                                                                <div
-                                                                    className="font-mono text-sm glow"
+                                                    {/* Learning buttons for assistant messages - SIMPLIFIED */}
+                                                    {message.role === 'assistant' && (
+                                                        <>
+                                                            <div className="flex gap-4 mb-2" style={{ marginTop: '16px', marginLeft: '24px' }}>
+                                                                <button
+                                                                    onClick={() => handleLearningFeedback('approve', message, index)}
+                                                                    onMouseEnter={() => setHoveredButton(getButtonId(index, 'approve'))}
+                                                                    onMouseLeave={() => setHoveredButton(null)}
+                                                                    className="text-xs font-mono border transition-all duration-200 hover:scale-105"
                                                                     style={{
-                                                                        backgroundColor: 'rgba(0, 0, 0, 0.3)',
-                                                                        borderLeft: '3px solid #61FDFC',
-                                                                        padding: '12px 16px',
-                                                                        borderRadius: '8px',
-                                                                        maxWidth: '500px'
+                                                                        backgroundColor: 'rgba(0, 0, 0, 0.2)',
+                                                                        borderColor: (hoveredButton === getButtonId(index, 'approve') || clickedButtons.has(getButtonId(index, 'approve'))) ? '#61FDFC' : 'rgba(107, 114, 128, 0.3)',
+                                                                        color: '#9CA3AF',
+                                                                        borderRadius: '12px',
+                                                                        padding: '16px 32px',
+                                                                        cursor: 'pointer'
                                                                     }}
                                                                 >
-                                                                    <div style={{ color: '#61FDFC', fontSize: '11px', marginBottom: '4px' }}>
-                                                                        COMMENT
-                                                                    </div>
-                                                                    <div style={{ color: '#E5E7EB' }}>
-                                                                        {submittedComments[getButtonId(index, 'comment')]}
+                                                                    <span style={{ color: '#22c55e' }}>✓</span> Approve
+                                                                </button>
+                                                                <button
+                                                                    onClick={() => handleLearningFeedback('correct', message, index)}
+                                                                    onMouseEnter={() => setHoveredButton(getButtonId(index, 'correct'))}
+                                                                    onMouseLeave={() => setHoveredButton(null)}
+                                                                    className="text-xs font-mono border transition-all duration-200 hover:scale-105"
+                                                                    style={{
+                                                                        backgroundColor: 'rgba(0, 0, 0, 0.2)',
+                                                                        borderColor: (hoveredButton === getButtonId(index, 'correct') || clickedButtons.has(getButtonId(index, 'correct'))) ? '#61FDFC' : 'rgba(107, 114, 128, 0.3)',
+                                                                        color: '#9CA3AF',
+                                                                        borderRadius: '12px',
+                                                                        padding: '16px 32px',
+                                                                        cursor: 'pointer'
+                                                                    }}
+                                                                >
+                                                                    <span style={{ color: '#3b82f6' }}>✎</span> Correct
+                                                                </button>
+                                                            </div>
+
+                                                            {/* Inline comment box for historical messages */}
+                                                            {activeCommentBox === getButtonId(index, 'comment') && (
+                                                                <div style={{ marginTop: '16px', marginLeft: '24px' }}>
+                                                                    <textarea
+                                                                        value={commentText}
+                                                                        onChange={(e) => setCommentText(e.target.value)}
+                                                                        placeholder="Add your comment..."
+                                                                        className="form-textarea min-h-[80px] w-full glow resize-none font-mono text-sm"
+                                                                        style={{ maxWidth: '500px' }}
+                                                                    />
+                                                                    <div className="flex gap-2 mt-2">
+                                                                        <button
+                                                                            onClick={() => handleCommentSubmit(activeCommentBox!, index, message)}
+                                                                            className="text-xs font-mono border transition-all duration-200 hover:scale-105"
+                                                                            style={{
+                                                                                backgroundColor: 'rgba(34, 197, 94, 0.2)',
+                                                                                borderColor: 'rgba(34, 197, 94, 0.4)',
+                                                                                color: '#22c55e',
+                                                                                borderRadius: '8px',
+                                                                                padding: '8px 16px',
+                                                                                cursor: 'pointer'
+                                                                            }}
+                                                                        >
+                                                                            Submit
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={handleCommentCancel}
+                                                                            className="text-xs font-mono border transition-all duration-200 hover:scale-105"
+                                                                            style={{
+                                                                                backgroundColor: 'rgba(107, 114, 128, 0.2)',
+                                                                                borderColor: 'rgba(107, 114, 128, 0.3)',
+                                                                                color: '#9CA3AF',
+                                                                                borderRadius: '8px',
+                                                                                padding: '8px 16px',
+                                                                                cursor: 'pointer'
+                                                                            }}
+                                                                        >
+                                                                            Cancel
+                                                                        </button>
                                                                     </div>
                                                                 </div>
-                                                            </div>
-                                                        )}
-                                                    </>
-                                                )}
-                                            </div>
-                                        ))}
+                                                            )}
+
+                                                            {/* MCP Server Actions selection box for historical messages */}
+                                                            {showMcpActionsBox === getButtonId(index, 'correct') && (
+                                                                <div style={{ marginTop: '16px', marginLeft: '24px' }}>
+                                                                    <div className="font-mono text-sm glow mb-2" style={{ color: '#61FDFC' }}>
+                                                                        Select the correct action from available MCP servers:
+                                                                    </div>
+
+                                                                    {loadingMcpServerActions ? (
+                                                                        <div style={{ color: '#9CA3AF', fontSize: '12px' }}>Loading actions...</div>
+                                                                    ) : (
+                                                                        <div style={{
+                                                                            maxHeight: '200px',
+                                                                            overflowY: 'auto',
+                                                                            backgroundColor: 'rgba(0, 0, 0, 0.3)',
+                                                                            border: '1px solid rgba(107, 114, 128, 0.3)',
+                                                                            borderRadius: '8px',
+                                                                            padding: '8px',
+                                                                            maxWidth: '500px'
+                                                                        }}>
+                                                                            {task?.mcp_servers && task.mcp_servers.map(serverId => (
+                                                                                <div key={serverId} style={{ marginBottom: '12px' }}>
+                                                                                    <div style={{ color: '#3B82F6', fontSize: '12px', marginBottom: '4px', fontWeight: 'bold' }}>
+                                                                                        {serverId}
+                                                                                    </div>
+                                                                                    {mcpServerActions[serverId]?.map(action => (
+                                                                                        <button
+                                                                                            key={action.name}
+                                                                                            onClick={() => setSelectedAction({ serverId, actionName: action.name, description: action.description })}
+                                                                                            className="text-xs font-mono border transition-all duration-200 hover:scale-105 block w-full text-left mb-1"
+                                                                                            style={{
+                                                                                                backgroundColor: selectedAction?.serverId === serverId && selectedAction?.actionName === action.name
+                                                                                                    ? 'rgba(59, 130, 246, 0.2)' : 'rgba(0, 0, 0, 0.2)',
+                                                                                                borderColor: selectedAction?.serverId === serverId && selectedAction?.actionName === action.name
+                                                                                                    ? '#3B82F6' : 'rgba(107, 114, 128, 0.3)',
+                                                                                                color: '#E5E7EB',
+                                                                                                borderRadius: '4px',
+                                                                                                padding: '8px',
+                                                                                                cursor: 'pointer'
+                                                                                            }}
+                                                                                        >
+                                                                                            <div style={{ fontWeight: 'bold' }}>{action.name}</div>
+                                                                                            <div style={{ fontSize: '10px', opacity: 0.8 }}>{action.description}</div>
+                                                                                        </button>
+                                                                                    ))}
+                                                                                </div>
+                                                                            ))}
+                                                                        </div>
+                                                                    )}
+
+                                                                    <div className="flex gap-2 mt-2">
+                                                                        <button
+                                                                            onClick={() => handleMcpActionSelect(showMcpActionsBox!, index, message)}
+                                                                            disabled={!selectedAction}
+                                                                            className="text-xs font-mono border transition-all duration-200 hover:scale-105"
+                                                                            style={{
+                                                                                backgroundColor: selectedAction ? 'rgba(34, 197, 94, 0.2)' : 'rgba(107, 114, 128, 0.1)',
+                                                                                borderColor: selectedAction ? 'rgba(34, 197, 94, 0.4)' : 'rgba(107, 114, 128, 0.3)',
+                                                                                color: selectedAction ? '#22c55e' : '#6B7280',
+                                                                                borderRadius: '8px',
+                                                                                padding: '8px 16px',
+                                                                                cursor: selectedAction ? 'pointer' : 'not-allowed'
+                                                                            }}
+                                                                        >
+                                                                            Use Selected Action
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={handleMcpActionCancel}
+                                                                            className="text-xs font-mono border transition-all duration-200 hover:scale-105"
+                                                                            style={{
+                                                                                backgroundColor: 'rgba(107, 114, 128, 0.2)',
+                                                                                borderColor: 'rgba(107, 114, 128, 0.3)',
+                                                                                color: '#9CA3AF',
+                                                                                borderRadius: '8px',
+                                                                                padding: '8px 16px',
+                                                                                cursor: 'pointer'
+                                                                            }}
+                                                                        >
+                                                                            Cancel
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                            )}
+
+                                                            {/* Display submitted comments for historical messages */}
+                                                            {submittedComments[getButtonId(index, 'comment')] && (
+                                                                <div style={{ marginTop: '16px', marginLeft: '24px' }}>
+                                                                    <div
+                                                                        className="font-mono text-sm glow"
+                                                                        style={{
+                                                                            backgroundColor: 'rgba(0, 0, 0, 0.3)',
+                                                                            borderLeft: '3px solid #61FDFC',
+                                                                            padding: '12px 16px',
+                                                                            borderRadius: '8px',
+                                                                            maxWidth: '500px'
+                                                                        }}
+                                                                    >
+                                                                        <div style={{ color: '#61FDFC', fontSize: '11px', marginBottom: '4px' }}>
+                                                                            COMMENT
+                                                                        </div>
+                                                                        <div style={{ color: '#E5E7EB' }}>
+                                                                            {submittedComments[getButtonId(index, 'comment')]}
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                            )}
+                                                        </>
+                                                    )}
+                                                </div>
+                                            )
+                                        })}
                                 </div>
                             </motion.div>
                         )}
@@ -1453,7 +1463,7 @@ function TaskPage() {
                             <div className="text-base font-mono glow" style={{ marginBottom: '40px' }}>
                                 <div className="text-green-300 mb-4">Choose the better action:</div>
 
-                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                <div key={dualSessionId} className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                     {/* Local Model Response */}
                                     <div
                                         className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${localFinished
@@ -1468,8 +1478,27 @@ function TaskPage() {
                                         </div>
                                         <div className="border-l ml-2" style={{ paddingLeft: '20px', fontWeight: '300', color: '#E5E7EB', fontSize: '0.9rem', borderLeftColor: '#61FDFC', borderLeftWidth: '2px' }}>
                                             <span className="max-w-full break-words">
-                                                {parseContentWithConsistentFormatting(localResponse)}
-                                                {!localFinished && (
+                                                {(() => {
+                                                    console.log('🔥 RENDERING LOCAL RESPONSE:')
+                                                    console.log('🔥   - dualSessionId:', dualSessionId)
+                                                    console.log('🔥   - isDualResponse:', isDualResponse)
+                                                    console.log('🔥   - isDualTransitioning:', isDualTransitioning)
+                                                    console.log('🔥   - localResponse length:', localResponse?.length || 0)
+                                                    console.log('🔥   - localResponse content:', localResponse?.substring(0, 100) + '...')
+                                                    console.log('🔥   - localFinished:', localFinished)
+                                                    console.log('🔥   - isStreaming:', isStreaming)
+
+                                                    // 🔥 CRITICAL FIX: Hide content during transitions to prevent old text flash
+                                                    if (isDualTransitioning || isTransitioningRef.current) {
+                                                        console.log('🔥   - HIDING LOCAL CONTENT: transition state or ref is true')
+                                                        console.log('🔥   - isDualTransitioning:', isDualTransitioning)
+                                                        console.log('🔥   - isTransitioningRef.current:', isTransitioningRef.current)
+                                                        return null
+                                                    }
+
+                                                    return localResponse && parseContentWithConsistentFormatting(localResponse)
+                                                })()}
+                                                {!localFinished && isStreaming && !isDualTransitioning && !isTransitioningRef.current && (
                                                     <motion.span
                                                         className="typing-cursor inline"
                                                         animate={{ opacity: [1, 0] }}
@@ -1494,8 +1523,27 @@ function TaskPage() {
                                         </div>
                                         <div className="border-l ml-2" style={{ paddingLeft: '20px', fontWeight: '300', color: '#E5E7EB', fontSize: '0.9rem', borderLeftColor: '#61FDFC', borderLeftWidth: '2px' }}>
                                             <span className="max-w-full break-words">
-                                                {parseContentWithConsistentFormatting(gptResponse)}
-                                                {!gptFinished && (
+                                                {(() => {
+                                                    console.log('🔥 RENDERING GPT RESPONSE:')
+                                                    console.log('🔥   - dualSessionId:', dualSessionId)
+                                                    console.log('🔥   - isDualResponse:', isDualResponse)
+                                                    console.log('🔥   - isDualTransitioning:', isDualTransitioning)
+                                                    console.log('🔥   - gptResponse length:', gptResponse?.length || 0)
+                                                    console.log('🔥   - gptResponse content:', gptResponse?.substring(0, 100) + '...')
+                                                    console.log('🔥   - gptFinished:', gptFinished)
+                                                    console.log('🔥   - isStreaming:', isStreaming)
+
+                                                    // 🔥 CRITICAL FIX: Hide content during transitions to prevent old text flash
+                                                    if (isDualTransitioning || isTransitioningRef.current) {
+                                                        console.log('🔥   - HIDING GPT CONTENT: transition state or ref is true')
+                                                        console.log('🔥   - isDualTransitioning:', isDualTransitioning)
+                                                        console.log('🔥   - isTransitioningRef.current:', isTransitioningRef.current)
+                                                        return null
+                                                    }
+
+                                                    return gptResponse && parseContentWithConsistentFormatting(gptResponse)
+                                                })()}
+                                                {!gptFinished && isStreaming && !isDualTransitioning && !isTransitioningRef.current && (
                                                     <motion.span
                                                         className="typing-cursor inline"
                                                         animate={{ opacity: [1, 0] }}

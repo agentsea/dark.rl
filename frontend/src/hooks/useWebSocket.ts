@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { flushSync } from 'react-dom'
+import React from 'react'
 
 export interface Message {
     role: 'user' | 'assistant' | 'system'
@@ -91,20 +93,26 @@ export default function useWebSocket({
     const [loadingMcpServerActions, setLoadingMcpServerActions] = useState(false)
 
     // Dual response state
-    const [isDualResponse, setIsDualResponse] = useState(false)
-    const [localResponse, setLocalResponse] = useState('')
-    const [gptResponse, setGptResponse] = useState('')
-    const [localModel, setLocalModel] = useState('')
-    const [gptModel, setGptModel] = useState('')
-    const [localFinished, setLocalFinished] = useState(false)
-    const [gptFinished, setGptFinished] = useState(false)
+    const [isDualResponse, setIsDualResponse] = useState(false);
+    const [isDualTransitioning, setIsDualTransitioning] = useState(false);
+    const [localResponse, setLocalResponse] = useState('');
+    const [gptResponse, setGptResponse] = useState('');
+    const [localFinished, setLocalFinished] = useState(false);
+    const [gptFinished, setGptFinished] = useState(false);
+    const [dualSessionId, setDualSessionId] = useState(0);
+    const [localModel, setLocalModel] = useState('');
+    const [gptModel, setGptModel] = useState('');
+
+    // Refs for immediate updates
+    const localResponseRef = useRef('');
+    const gptResponseRef = useRef('');
+    const currentSessionIdRef = useRef(0); // Add ref for immediate session ID updates
+    const isTransitioningRef = useRef(false); // Add ref for immediate transition state
 
     const wsRef = useRef<WebSocket | null>(null)
     const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
     const reconnectCountRef = useRef(0)
     const currentResponseRef = useRef('')
-    const localResponseRef = useRef('')
-    const gptResponseRef = useRef('')
 
     const connect = useCallback(() => {
         if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -148,52 +156,170 @@ export default function useWebSocket({
 
                     // Handle dual response start
                     if (data.type === 'dual_response_start') {
-                        console.log('Dual response started:', data)
-                        setIsDualResponse(true)
-                        setLocalModel(data.local_model)
-                        setGptModel(data.gpt_model)
-                        setLocalResponse('')
-                        setGptResponse('')
-                        setLocalFinished(false)
-                        setGptFinished(false)
-                        localResponseRef.current = ''
-                        gptResponseRef.current = ''
-                        setIsStreaming(true)
-                        return
+                        // CRITICAL: IMMEDIATELY hide any existing content before doing ANYTHING else
+                        isTransitioningRef.current = true; // Set ref synchronously
+                        setIsDualTransitioning(true); // Set state asynchronously
+                        console.log('🔥 DUAL RESPONSE START - CONTENT IMMEDIATELY HIDDEN')
+
+                        console.log('🔥 DUAL RESPONSE START DEBUG:')
+                        console.log('🔥 Previous state before clearing:')
+                        console.log('🔥   - dualSessionId:', dualSessionId)
+                        console.log('🔥   - isDualResponse:', isDualResponse)
+                        console.log('🔥   - localResponse length:', localResponse.length)
+                        console.log('🔥   - localResponse content:', localResponse.substring(0, 100) + '...')
+                        console.log('🔥   - gptResponse length:', gptResponse.length)
+                        console.log('🔥   - gptResponse content:', gptResponse.substring(0, 100) + '...')
+                        console.log('🔥   - localFinished:', localFinished)
+                        console.log('🔥   - gptFinished:', gptFinished)
+                        console.log('🔥   - localResponseRef.current length:', localResponseRef.current.length)
+                        console.log('🔥   - gptResponseRef.current length:', gptResponseRef.current.length)
+
+                        // Extract session ID from backend message
+                        const newSessionId = data.session_id || Date.now();
+                        console.log('🔥   - newSessionId from backend:', newSessionId)
+
+                        // CRITICAL: Update session ref IMMEDIATELY before any other updates
+                        currentSessionIdRef.current = newSessionId;
+                        console.log('🔥   - currentSessionIdRef.current set to:', currentSessionIdRef.current)
+
+                        // Clear refs immediately
+                        localResponseRef.current = '';
+                        gptResponseRef.current = '';
+                        console.log('🔥   - Refs cleared')
+
+                        // Then clear state with flushSync to force immediate update
+                        flushSync(() => {
+                            setIsDualResponse(true);
+                            setLocalResponse('');
+                            setGptResponse('');
+                            setLocalFinished(false);
+                            setGptFinished(false);
+                            setLocalModel(data.local_model || 'local');
+                            setGptModel(data.gpt_model || 'gpt-4.1');
+                            setIsStreaming(true);
+
+                            // Use session ID from backend and ensure state is updated
+                            const newSessionId = data.session_id || Date.now();
+                            console.log('🔥   - Setting dualSessionId: ', dualSessionId, ' -> ', newSessionId);
+                            setDualSessionId(newSessionId);
+                        });
+
+                        // Log state after flushSync to verify it was updated
+                        console.log('🔥 State after flushSync:')
+                        console.log('🔥   - isDualResponse should be true')
+                        console.log('🔥   - localResponse should be empty')
+                        console.log('🔥   - gptResponse should be empty')
+                        console.log('🔥   - dualSessionId should be updated to:', data.session_id)
+                        console.log('🔥   - currentSessionIdRef.current:', currentSessionIdRef.current)
+
+                        // End transition after a very short delay to ensure state is fully updated
+                        // This prevents old content from flashing before new chunks arrive
+                        setTimeout(() => {
+                            console.log('🔥   - Ending dual transition after timeout')
+                            isTransitioningRef.current = false; // Clear ref
+                            setIsDualTransitioning(false); // Clear state
+                        }, 50);
+
+                        return;
                     }
 
-                    // Handle dual response chunks
+                    // Handle all dual response chunks first - BEFORE session validation for debugging
                     if (data.type === 'dual_response_chunk') {
-                        console.log('Dual response chunk:', data.source, data.choices[0].delta?.content)
+                        console.log('🔥 RAW CHUNK RECEIVED:')
+                        console.log('🔥   - source:', data.source)
+                        console.log('🔥   - content:', data.choices?.[0]?.delta?.content)
+                        console.log('🔥   - finish_reason:', data.choices?.[0]?.finish_reason)
+                        console.log('🔥   - chunkSessionId:', data.session_id)
+                        console.log('🔥   - dualSessionId (state):', dualSessionId)
+                        console.log('🔥   - currentSessionIdRef.current:', currentSessionIdRef.current)
+
+                        // CRITICAL: Ignore chunks from old sessions to prevent flash of old content
+                        const chunkSessionId = data.session_id || 0;
+                        if (chunkSessionId !== currentSessionIdRef.current) {
+                            console.log('🔥 IGNORING OLD CHUNK: session', chunkSessionId, 'vs current', currentSessionIdRef.current);
+                            return;
+                        }
+
+                        const content = data.choices[0].delta?.content
+                        console.log('🔥 PROCESSING CHUNK:')
+                        console.log('🔥   - source:', data.source)
+                        console.log('🔥   - content:', content)
+                        console.log('🔥   - finish_reason:', data.choices[0].finish_reason)
 
                         if (data.source === 'local') {
-                            if (data.choices[0].delta?.content) {
-                                localResponseRef.current += data.choices[0].delta.content
-                                setLocalResponse(localResponseRef.current)
+                            if (content) {
+                                // End transition on first content chunk to show new content immediately
+                                if (isDualTransitioning) {
+                                    console.log('🔥   - Ending transition on first LOCAL chunk')
+                                    isTransitioningRef.current = false; // Clear ref
+                                    setIsDualTransitioning(false); // Clear state
+                                }
+
+                                localResponseRef.current += content;
+                                console.log('🔥   - localResponseRef updated: ', localResponse.length, ' -> ', localResponseRef.current.length);
+                                console.log('🔥   - localResponseRef new content:', localResponseRef.current.substring(0, 200) + '...');
+                                setLocalResponse(localResponseRef.current);
                             }
-                            if (data.choices[0].finish_reason === 'stop') {
-                                console.log('Local response finished')
-                                setLocalFinished(true)
+                            if (data.choices[0].finish_reason) {
+                                console.log('🔥 LOCAL RESPONSE FINISHED with reason:', data.choices[0].finish_reason);
+                                console.log('🔥   - Setting localFinished to TRUE');
+                                setLocalFinished(true);
                             }
                         } else if (data.source === 'gpt') {
-                            if (data.choices[0].delta?.content) {
-                                gptResponseRef.current += data.choices[0].delta.content
-                                setGptResponse(gptResponseRef.current)
+                            if (content) {
+                                // End transition on first content chunk to show new content immediately
+                                if (isDualTransitioning) {
+                                    console.log('🔥   - Ending transition on first GPT chunk')
+                                    isTransitioningRef.current = false; // Clear ref
+                                    setIsDualTransitioning(false); // Clear state
+                                }
+
+                                gptResponseRef.current += content;
+                                console.log('🔥   - gptResponseRef updated: ', gptResponse.length, ' -> ', gptResponseRef.current.length);
+                                console.log('🔥   - gptResponseRef new content:', gptResponseRef.current.substring(0, 200) + '...');
+                                setGptResponse(gptResponseRef.current);
                             }
-                            if (data.choices[0].finish_reason === 'stop') {
-                                console.log('GPT response finished')
-                                setGptFinished(true)
+                            if (data.choices[0].finish_reason) {
+                                console.log('🔥 GPT RESPONSE FINISHED with reason:', data.choices[0].finish_reason);
+                                console.log('🔥   - Setting gptFinished to TRUE');
+                                setGptFinished(true);
                             }
                         }
-                        return
+                        return;
                     }
 
                     // Handle dual response complete
                     if (data.type === 'dual_response_complete') {
-                        console.log('Dual response complete:', data)
-                        setIsStreaming(false)
-                        // Don't clear responses yet - let user choose
-                        return
+                        // CRITICAL: Ignore completion messages from old sessions
+                        const completionSessionId = data.session_id || 0;
+                        if (completionSessionId !== currentSessionIdRef.current) {
+                            console.log('🔥 IGNORING OLD COMPLETION: session', completionSessionId, 'vs current', currentSessionIdRef.current);
+                            return;
+                        }
+
+                        console.log('🔥 DUAL RESPONSE COMPLETE DEBUG:')
+                        console.log('🔥   - localResponse final length:', localResponse.length)
+                        console.log('🔥   - gptResponse final length:', gptResponse.length)
+                        console.log('🔥   - localFinished before:', localFinished)
+                        console.log('🔥   - gptFinished before:', gptFinished)
+                        console.log('🔥   - backend reports local_finished:', data.local_finished)
+                        console.log('🔥   - backend reports gpt_finished:', data.gpt_finished)
+                        console.log('🔥   - session_id:', data.session_id)
+
+                        // Force set finished states based on backend completion
+                        if (data.local_finished !== undefined) {
+                            console.log('🔥   - Force setting localFinished to:', data.local_finished);
+                            setLocalFinished(data.local_finished);
+                        }
+                        if (data.gpt_finished !== undefined) {
+                            console.log('🔥   - Force setting gptFinished to:', data.gpt_finished);
+                            setGptFinished(data.gpt_finished);
+                        }
+
+                        setIsStreaming(false);
+                        console.log('🔥   - Set isStreaming to false')
+                        console.log('🔥   - Dual response completion processing done')
+                        return;
                     }
 
                     // Handle streaming response (single model)
@@ -365,16 +491,45 @@ export default function useWebSocket({
     }, [])
 
     const clearDualResponse = useCallback(() => {
-        setIsDualResponse(false)
-        setLocalResponse('')
-        setGptResponse('')
-        setLocalModel('')
-        setGptModel('')
-        setLocalFinished(false)
-        setGptFinished(false)
-        localResponseRef.current = ''
-        gptResponseRef.current = ''
-    }, [])
+        console.log('🔥 CLEAR DUAL RESPONSE DEBUG:')
+        console.log('🔥 State before clearing:')
+        console.log('🔥   - isDualResponse:', isDualResponse)
+        console.log('🔥   - localResponse length:', localResponse.length)
+        console.log('🔥   - gptResponse length:', gptResponse.length)
+        console.log('🔥   - localModel:', localModel)
+        console.log('🔥   - gptModel:', gptModel)
+        console.log('🔥   - localFinished:', localFinished)
+        console.log('🔥   - gptFinished:', gptFinished)
+        console.log('🔥   - localResponseRef.current length:', localResponseRef.current.length)
+        console.log('🔥   - gptResponseRef.current length:', gptResponseRef.current.length)
+
+        // Start transition
+        setIsDualTransitioning(true);
+
+        // Clear refs immediately
+        localResponseRef.current = '';
+        gptResponseRef.current = '';
+        currentSessionIdRef.current = 0; // Reset session ref too
+
+        // End transition state
+        setIsDualTransitioning(false);
+
+        // Clear state
+        setIsDualResponse(false);
+        setLocalResponse('');
+        setGptResponse('');
+        setLocalFinished(false);
+        setGptFinished(false);
+        setDualSessionId(0);
+        setLocalModel('');
+        setGptModel('');
+        setIsStreaming(false);
+
+        console.log('🔥 State after clearing:')
+        console.log('🔥   - isDualResponse:', false)
+        console.log('🔥   - localResponseRef.current length:', localResponseRef.current.length)
+        console.log('🔥   - gptResponseRef.current length:', gptResponseRef.current.length)
+    }, [isDualResponse, localResponse.length, gptResponse.length, localModel, gptModel, localFinished, gptFinished, localResponseRef, gptResponseRef]);
 
     const selectModel = useCallback(async (selectedModel: 'local' | 'gpt', taskId?: string) => {
         console.log(`🐛 [useWebSocket] selectModel called with model=${selectedModel}, taskId=${taskId}`)
@@ -384,11 +539,27 @@ export default function useWebSocket({
             return
         }
 
+        // 🔥 CRITICAL FIX: Capture current responses BEFORE clearing
+        const currentLocalResponse = localResponseRef.current
+        const currentGptResponse = gptResponseRef.current
+
+        // 🔥 CRITICAL FIX: Clear content IMMEDIATELY when user selects to prevent flash
+        console.log('🔥 IMMEDIATE CLEAR: Clearing all content before sending request')
+        setLocalResponse('')
+        setGptResponse('')
+        localResponseRef.current = ''
+        gptResponseRef.current = ''
+        setLocalFinished(false)
+        setGptFinished(false)
+        setIsDualResponse(false)
+        setIsDualTransitioning(true)
+        isTransitioningRef.current = true
+
         const request = {
             type: 'model_selection',
             selected_model: selectedModel,
-            local_response: localResponseRef.current,
-            gpt_response: gptResponseRef.current,
+            local_response: currentLocalResponse,
+            gpt_response: currentGptResponse,
             local_model_name: localModel,
             gpt_model_name: gptModel,
             task_id: taskId
@@ -625,6 +796,7 @@ export default function useWebSocket({
         })
     }, [connectionStatus])
 
+    // WebSocket connection and message handling
     useEffect(() => {
         if (autoConnect) {
             connect()
@@ -807,13 +979,16 @@ export default function useWebSocket({
         mcpServerActions,
         loadingMcpServerActions,
         // Dual response state
-        isDualResponse,
+        isDualResponse: isDualResponse && !isDualTransitioning, // Hide during transition
+        isDualTransitioning,
+        isTransitioningRef, // Add ref for immediate transition checking
         localResponse,
         gptResponse,
         localModel,
         gptModel,
         localFinished,
         gptFinished,
+        dualSessionId,
         connect,
         disconnect,
         sendMessage,

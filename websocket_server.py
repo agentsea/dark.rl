@@ -11,6 +11,7 @@ import logging
 import websockets
 import os
 import re
+import time
 from typing import Dict, Any, List
 from pathlib import Path
 import openai
@@ -235,17 +236,29 @@ class DarkRLLLMServer:
     async def stream_dual_response(self, websocket, messages: list, model: str = "qwen3", temperature: float = 0.7, max_tokens: int = 2048, task_id: str = None):
         """Stream responses from both local model and GPT-4.1 simultaneously"""
         
+        console.print("🔥 BACKEND: Starting dual response")
+        console.print(f"🔥   - model: {model}")
+        console.print(f"🔥   - task_id: {task_id}")
+        console.print(f"🔥   - messages count: {len(messages)}")
+        console.print(f"🔥   - last message: {messages[-1]['content'][:100] if messages else 'None'}...")
+        
+        # Generate unique session ID for this dual response
+        session_id = int(time.time() * 1000)  # millisecond timestamp as session ID
+        console.print(f"🔥   - session_id: {session_id}")
+        
         # Send initial dual response header
         dual_start = {
             "type": "dual_response_start",
             "local_model": model,
-            "gpt_model": "gpt-4.1"
+            "gpt_model": "gpt-4.1",
+            "session_id": session_id
         }
         await websocket.send(json.dumps(dual_start))
+        console.print("🔥 BACKEND: Sent dual_response_start")
         
         # Create tasks for both models
-        local_task = asyncio.create_task(self._stream_local_response(websocket, messages, model, temperature, max_tokens, task_id))
-        gpt_task = asyncio.create_task(self._stream_gpt_response(websocket, messages, temperature, max_tokens))
+        local_task = asyncio.create_task(self._stream_local_response(websocket, messages, model, temperature, max_tokens, task_id, session_id))
+        gpt_task = asyncio.create_task(self._stream_gpt_response(websocket, messages, temperature, max_tokens, session_id))
         
         # Wait for both to complete
         local_response, gpt_response = await asyncio.gather(local_task, gpt_task, return_exceptions=True)
@@ -254,22 +267,37 @@ class DarkRLLLMServer:
         dual_complete = {
             "type": "dual_response_complete",
             "local_finished": not isinstance(local_response, Exception),
-            "gpt_finished": not isinstance(gpt_response, Exception)
+            "gpt_finished": not isinstance(gpt_response, Exception),
+            "session_id": session_id
         }
         await websocket.send(json.dumps(dual_complete))
+        console.print("🔥 BACKEND: Sent dual_response_complete")
         
         return local_response, gpt_response
 
     async def stream_dual_action_response(self, websocket, messages: list, mentioned_servers: List[str], model: str = "qwen3", temperature: float = 0.7, max_tokens: int = 2048, task_id: str = None):
         """Stream responses from both local model (with tools) and GPT-4.1 (with tools) simultaneously"""
         
+        console.print("🔥 BACKEND: Starting dual action response")
+        console.print(f"🔥   - model: {model}")
+        console.print(f"🔥   - task_id: {task_id}")
+        console.print(f"🔥   - mentioned_servers: {mentioned_servers}")
+        console.print(f"🔥   - messages count: {len(messages)}")
+        console.print(f"🔥   - last message: {messages[-1]['content'][:100] if messages else 'None'}...")
+        
+        # Generate unique session ID for this dual response
+        session_id = int(time.time() * 1000)  # millisecond timestamp as session ID
+        console.print(f"🔥   - session_id: {session_id}")
+        
         # Send initial dual response header
         dual_start = {
             "type": "dual_response_start",
             "local_model": f"{model} (with tools)",
-            "gpt_model": "gpt-4.1 (reasoning only)"
+            "gpt_model": "gpt-4.1 (reasoning only)",
+            "session_id": session_id
         }
         await websocket.send(json.dumps(dual_start))
+        console.print("🔥 BACKEND: Sent dual_response_start for action mode")
         
         # Build tools schema for mentioned servers - BOTH models get the same context
         tools = await self.build_tools_schema(mentioned_servers)
@@ -302,10 +330,10 @@ class DarkRLLLMServer:
         
         # Create tasks for both models
         # Local model gets full tool context
-        local_task = asyncio.create_task(self._stream_local_action_response(websocket, messages, mentioned_servers, model, temperature, max_tokens, task_id))
+        local_task = asyncio.create_task(self._stream_local_action_response(websocket, messages, mentioned_servers, model, temperature, max_tokens, task_id, session_id))
         
         # GPT-4.1 gets the EXACT SAME prompt as the local model for fair comparison
-        gpt_task = asyncio.create_task(self._stream_gpt_with_same_prompt(websocket, actual_prompt, temperature, max_tokens))
+        gpt_task = asyncio.create_task(self._stream_gpt_with_same_prompt(websocket, actual_prompt, temperature, max_tokens, session_id))
         
         # Wait for both to complete
         local_response, gpt_response = await asyncio.gather(local_task, gpt_task, return_exceptions=True)
@@ -314,16 +342,18 @@ class DarkRLLLMServer:
         dual_complete = {
             "type": "dual_response_complete",
             "local_finished": not isinstance(local_response, Exception),
-            "gpt_finished": not isinstance(gpt_response, Exception)
+            "gpt_finished": not isinstance(gpt_response, Exception),
+            "session_id": session_id
         }
         await websocket.send(json.dumps(dual_complete))
+        console.print("🔥 BACKEND: Sent dual_response_complete for action mode")
         
         # IMPORTANT: Don't auto-continue after dual response - wait for user to select which response they prefer
         # This prevents the infinite loop
         
         return local_response, gpt_response
 
-    async def _stream_local_response(self, websocket, messages: list, model: str, temperature: float, max_tokens: int, task_id: str) -> str:
+    async def _stream_local_response(self, websocket, messages: list, model: str, temperature: float, max_tokens: int, task_id: str, session_id: int) -> str:
         """Stream local model response with dual response format"""
         await self.initialize_model(model)
         
@@ -377,6 +407,7 @@ class DarkRLLLMServer:
                         "type": "dual_response_chunk",
                         "source": "local",
                         "model": model,
+                        "session_id": session_id,
                         "choices": [{
                             "delta": {
                                 "content": chunk
@@ -399,6 +430,7 @@ class DarkRLLLMServer:
                         "type": "dual_response_chunk",
                         "source": "local",
                         "model": model,
+                        "session_id": session_id,
                         "choices": [{
                             "delta": {
                                 "content": chunk
@@ -416,6 +448,7 @@ class DarkRLLLMServer:
                     "type": "dual_response_chunk",
                     "source": "local",
                     "model": model,
+                    "session_id": session_id,
                     "choices": [{
                         "delta": {},
                         "finish_reason": "stop"
@@ -435,6 +468,7 @@ class DarkRLLLMServer:
                 "type": "dual_response_chunk",
                 "source": "local",
                 "model": model,
+                "session_id": session_id,
                 "choices": [{
                     "delta": {
                         "content": f"[Local Error: {str(e)}]"
@@ -445,13 +479,14 @@ class DarkRLLLMServer:
             await websocket.send(json.dumps(error_chunk))
             return f"[Local Error: {str(e)}]"
     
-    async def _stream_gpt_response(self, websocket, messages: list, temperature: float, max_tokens: int) -> str:
+    async def _stream_gpt_response(self, websocket, messages: list, temperature: float, max_tokens: int, session_id: int) -> str:
         """Stream GPT-4.1 response with dual response format"""
         if not self.openai_client:
             error_chunk = {
                 "type": "dual_response_chunk",
                 "source": "gpt",
                 "model": "gpt-4.1",
+                "session_id": session_id,
                 "choices": [{
                     "delta": {
                         "content": "[GPT Error: OpenAI API key not configured]"
@@ -498,6 +533,7 @@ class DarkRLLLMServer:
                         "type": "dual_response_chunk",
                         "source": "gpt",
                         "model": "gpt-4.1",
+                        "session_id": session_id,
                         "choices": [{
                             "delta": {
                                 "content": content
@@ -515,6 +551,7 @@ class DarkRLLLMServer:
                     "type": "dual_response_chunk",
                     "source": "gpt",
                     "model": "gpt-4.1",
+                    "session_id": session_id,
                     "choices": [{
                         "delta": {},
                         "finish_reason": "stop"
@@ -530,6 +567,7 @@ class DarkRLLLMServer:
                 "type": "dual_response_chunk",
                 "source": "gpt",
                 "model": "gpt-4.1",
+                "session_id": session_id,
                 "choices": [{
                     "delta": {
                         "content": f"[GPT Error: {str(e)}]"
@@ -540,7 +578,7 @@ class DarkRLLLMServer:
             await websocket.send(json.dumps(error_chunk))
             return f"[GPT Error: {str(e)}]"
 
-    async def _stream_local_action_response(self, websocket, messages: list, mentioned_servers: List[str], model: str, temperature: float, max_tokens: int, task_id: str) -> str:
+    async def _stream_local_action_response(self, websocket, messages: list, mentioned_servers: List[str], model: str, temperature: float, max_tokens: int, task_id: str, session_id: int) -> str:
         """Stream local model response with full tool capabilities in dual response format"""
         try:
             await self.initialize_model(model)
@@ -551,7 +589,7 @@ class DarkRLLLMServer:
             if not tools:
                 # No tools found, fall back to chat mode
                 logger.warning(f"No tools found for servers: {mentioned_servers}")
-                return await self._stream_local_response(websocket, messages, model, temperature, max_tokens, task_id)
+                return await self._stream_local_response(websocket, messages, model, temperature, max_tokens, task_id, session_id)
             
             # Build Qwen chat messages with tools
             chat_messages = self.build_qwen_chat_messages(messages, tools)
@@ -592,6 +630,7 @@ class DarkRLLLMServer:
                         "type": "dual_response_chunk",
                         "source": "local",
                         "model": f"{model} (with tools)",
+                        "session_id": session_id,
                         "choices": [{
                             "delta": {
                                 "content": chunk
@@ -614,6 +653,7 @@ class DarkRLLLMServer:
                         "type": "dual_response_chunk",
                         "source": "local",
                         "model": f"{model} (with tools)",
+                        "session_id": session_id,
                         "choices": [{
                             "delta": {
                                 "content": chunk
@@ -658,13 +698,14 @@ class DarkRLLLMServer:
 
 
     
-    async def _stream_gpt_with_same_prompt(self, websocket, actual_prompt: str, temperature: float, max_tokens: int) -> str:
+    async def _stream_gpt_with_same_prompt(self, websocket, actual_prompt: str, temperature: float, max_tokens: int, session_id: int) -> str:
         """Stream GPT-4.1 response using the exact same prompt as the local model"""
         if not self.openai_client:
             error_chunk = {
                 "type": "dual_response_chunk",
                 "source": "gpt",
                 "model": "gpt-4.1 (reasoning only)",
+                "session_id": session_id,
                 "choices": [{
                     "delta": {
                         "content": "[GPT Error: OpenAI API key not configured]"
@@ -708,7 +749,7 @@ class DarkRLLLMServer:
             
             # Create streaming response
             response = await self.openai_client.chat.completions.create(
-                model="gpt-4",  # Use gpt-4 instead of gpt-4.1 as it's more widely available
+                model="gpt-4.1",  # Use gpt-4.1 for larger context window (1M tokens vs 8K for gpt-4)
                 messages=openai_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -729,6 +770,7 @@ class DarkRLLLMServer:
                         "type": "dual_response_chunk",
                         "source": "gpt",
                         "model": "gpt-4.1 (reasoning only)",
+                        "session_id": session_id,
                         "choices": [{
                             "delta": {
                                 "content": content
@@ -746,6 +788,7 @@ class DarkRLLLMServer:
                     "type": "dual_response_chunk",
                     "source": "gpt",
                     "model": "gpt-4.1 (reasoning only)",
+                    "session_id": session_id,
                     "choices": [{
                         "delta": {},
                         "finish_reason": "stop"
@@ -761,6 +804,7 @@ class DarkRLLLMServer:
                 "type": "dual_response_chunk",
                 "source": "gpt",
                 "model": "gpt-4.1 (reasoning only)",
+                "session_id": session_id,
                 "choices": [{
                     "delta": {
                         "content": f"[GPT Error: {str(e)}]"
@@ -1526,8 +1570,9 @@ class DarkRLLLMServer:
             use_action_mode, mentioned_servers = await self.should_use_action_mode(messages, task_id)
             logger.info(f"🐛 use_action_mode={use_action_mode}, mentioned_servers={mentioned_servers}")
             
-            # Only force dual model mode for action mode if dual_model is not explicitly set to False
-            force_dual_for_action = use_action_mode and self.openai_client and dual_model is not False
+            # Dual mode should always be active when OpenAI client is available
+            # Force dual model mode for action mode
+            force_dual_for_action = use_action_mode and self.openai_client
             use_dual_mode = force_dual_for_action or (dual_model and self.openai_client)
             
             logger.info(f"🐛 force_dual_for_action={force_dual_for_action}, use_dual_mode={use_dual_mode}")
@@ -2141,7 +2186,11 @@ class DarkRLLLMServer:
             
             # Build message history for the model
             message_history = []
-            for msg in messages:
+            logger.info(f"🐛 Building message history from {len(messages)} messages")
+            
+            for i, msg in enumerate(messages):
+                logger.info(f"🐛 Processing message {i}: {msg['role']} - {msg['content'][:100]}...")
+                
                 # Skip obviously broken assistant messages (repetitive garbage)
                 if msg['role'] == 'assistant':
                     content = msg['content']
@@ -2188,6 +2237,10 @@ class DarkRLLLMServer:
                         'content': msg['content']
                     })
                     logger.debug(f"➕ Added {msg['role']} message: {len(msg['content'])} chars")
+            
+            logger.info(f"🐛 Final message history has {len(message_history)} messages:")
+            for i, msg in enumerate(message_history):
+                logger.info(f"🐛   {i}: {msg['role']} - {msg['content'][:200]}...")
             
             # Check if the last message indicates we should end
             # Look for specific end patterns, not just any occurrence of "end"
@@ -2238,16 +2291,17 @@ class DarkRLLLMServer:
                 content_preview = msg['content'][:100] + "..." if len(msg['content']) > 100 else msg['content']
                 logger.info(f"  {i}: {msg['role']} - {content_preview}")
             
-            # Continue the conversation using stream_response with dual_model disabled
-            logger.info(f"🐛 Calling stream_response with dual_model=False for task continuation")
+            # Continue the conversation using stream_response
+            logger.info(f"🐛 Calling stream_response for task continuation")
+            logger.info(f"🐛 Message history length: {len(message_history)}")
+            logger.info(f"🐛 Task model: {task_model}")
             await self.stream_response(
                 websocket=websocket,
                 messages=message_history,
                 model=task_model,
                 temperature=0.5,  # Slightly higher temperature to encourage generation
                 max_tokens=500,   # Increased token limit for better responses
-                task_id=task_id,
-                dual_model=False  # Disable dual model mode for continuations
+                task_id=task_id
             )
             
         except Exception as e:
@@ -2904,7 +2958,15 @@ async def handle_client(websocket):
                         gpt_response = request.get('gpt_response', '')
                         
                         logger.info(f"🐛 Model selection received: selected={selected_model}, task_id={task_id}")
-                        logger.info(f"🎯 Model selection received: selected={selected_model}, task_id={task_id}")
+                        logger.info(f"🐛 Local response length: {len(local_response)}")
+                        logger.info(f"🐛 GPT response length: {len(gpt_response)}")
+                        
+                        # Get current task state before making changes
+                        task_data_before = llm_server.get_task(task_id)
+                        messages_before = task_data_before.get('messages', []) if task_data_before and not task_data_before.get('error') else []
+                        logger.info(f"🐛 Messages before selection: {len(messages_before)}")
+                        for i, msg in enumerate(messages_before[-3:]):  # Show last 3 messages
+                            logger.info(f"🐛   Message {i}: {msg['role']} - {msg['content'][:100]}...")
                         
                         # Save the selected response to the task
                         if task_id and selected_model:
@@ -2942,6 +3004,8 @@ async def handle_client(websocket):
                                 # Check if the selected response contains a tool call
                                 if "<tool_call>" in selected_content and "</tool_call>" in selected_content:
                                     logger.info(f"🐛 Selected response contains tool call - will execute and continue conversation")
+                                    logger.info(f"🐛 Tool call content: {selected_content[selected_content.find('<tool_call>'):selected_content.find('</tool_call>')+12]}")
+                                    
                                     try:
                                         console.print(Panel(
                                             f"🔍 Selected {selected_model} response contains tool call - parsing and executing...",
@@ -2952,6 +3016,7 @@ async def handle_client(websocket):
                                         
                                         tool_call_match = selected_content.split('<tool_call>')[1].split('</tool_call>')[0]
                                         tool_call_data = json.loads(tool_call_match)
+                                        logger.info(f"🐛 Parsed tool call: {tool_call_data}")
                                         
                                         # Find which server this tool belongs to
                                         server_id = None
@@ -2965,6 +3030,8 @@ async def handle_client(websocket):
                                             if server_id:
                                                 break
                                         
+                                        logger.info(f"🐛 Found tool on server: {server_id}")
+                                        
                                         if server_id:
                                             # Execute the tool
                                             execution_result = await llm_server.execute_mcp_action(
@@ -2973,12 +3040,22 @@ async def handle_client(websocket):
                                                 tool_call_data.get('arguments', {})
                                             )
                                             
+                                            logger.info(f"🐛 Tool execution result: {execution_result}")
+                                            
                                             # Create structured tool response
                                             tool_response_content = json.dumps(execution_result, indent=2)
                                             structured_response = f"<tool_response>\n{tool_response_content}\n</tool_response>"
                                             
                                             # Add tool response as user message
                                             llm_server.task_manager.add_message(task_id, 'user', structured_response)
+                                            logger.info(f"🐛 Added tool response as user message: {len(structured_response)} chars")
+                                            
+                                            # Get task state after tool execution
+                                            task_data_after = llm_server.get_task(task_id)
+                                            messages_after = task_data_after.get('messages', []) if task_data_after and not task_data_after.get('error') else []
+                                            logger.info(f"🐛 Messages after tool execution: {len(messages_after)}")
+                                            for i, msg in enumerate(messages_after[-3:]):  # Show last 3 messages
+                                                logger.info(f"🐛   Message {i}: {msg['role']} - {msg['content'][:100]}...")
                                             
                                             console.print(Panel(
                                                 f"✅ Tool executed successfully from selected {selected_model} response",
@@ -2995,6 +3072,8 @@ async def handle_client(websocket):
                                             
                                     except Exception as tool_error:
                                         logger.error(f"❌ Error executing tool from selected response: {tool_error}")
+                                        import traceback
+                                        logger.error(f"❌ Full traceback: {traceback.format_exc()}")
                                 else:
                                     logger.info(f"🐛 Selected response does not contain tool call - no continuation needed")
                         
@@ -3009,6 +3088,8 @@ async def handle_client(websocket):
                         
                     except Exception as e:
                         logger.error(f"Error processing model selection: {e}")
+                        import traceback
+                        logger.error(f"Full traceback: {traceback.format_exc()}")
                         error_response = {
                             "type": "model_selection_response",
                             "success": False,
@@ -3277,7 +3358,11 @@ async def handle_client(websocket):
                     await websocket.send(json.dumps(response))
                 else:
                     # Streaming response
-                    logger.info(f"🐛 Main handler calling stream_response with default dual_model=True for task {task_id}")
+                    if auto_response:
+                        logger.info(f"🐛 Main handler: AUTO-RESPONSE for task {task_id}")
+                    else:
+                        logger.info(f"🐛 Main handler: USER-INITIATED request for task {task_id}")
+                    
                     await llm_server.stream_response(
                         websocket, 
                         messages, 
