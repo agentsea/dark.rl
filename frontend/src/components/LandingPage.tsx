@@ -24,12 +24,12 @@ function LandingPage() {
     const examples = useMemo(() => [
         "Use @playwright to find the best restaurants in Boulder and put them in @GoogleDocs",
         "Help me @research quantum computing trends and @summarize them",
-        "Use @calculator to compute my monthly budget and @email the results",
-        "@translate this document to Spanish and @save it to my desktop",
-        "Find @weather forecast for next week and @schedule my outdoor activities",
-        "@scrape product prices from Amazon and @compare them in a spreadsheet",
-        "Use @github to find trending AI repositories and @bookmark the top 10",
-        "@analyze my stock portfolio performance and @generate a report"
+        "Use @playwright to take a screenshot of dark.rl website",
+        "Plan a trip to Japan using @flight-search and @hotel-booking",
+        "Analyze my @github repositories and @create a portfolio website",
+        "Use @weather-api to check forecast and @send reminder emails",
+        "Search @arxiv for ML papers and @create a reading list",
+        "Use @calendar to schedule meetings and @send invitations"
     ], [])
 
     const {

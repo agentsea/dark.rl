@@ -37,15 +37,13 @@ export default function CorrectionModal({
     messageIndex,
     onSubmitCorrection
 }: CorrectionModalProps) {
+    console.log('🔧 CorrectionModal render - isOpen:', isOpen, 'taskId:', currentTaskId, 'messageIndex:', messageIndex)
+    // Remove the repetitive logs about available tools count that show on every render
+
     const [selectedTool, setSelectedTool] = useState<string>('')
     const [parameters, setParameters] = useState<Record<string, any>>({})
     const [thought, setThought] = useState<string>('')
-
     const [submitting, setSubmitting] = useState<boolean>(false)
-
-    // Debug logging
-    console.log('🔧 CorrectionModal render - isOpen:', isOpen, 'taskId:', currentTaskId, 'messageIndex:', messageIndex)
-    console.log('🛠️ CorrectionModal available tools:', availableTools.length, availableTools)
 
     // Reset state when modal opens
     useEffect(() => {
@@ -169,7 +167,7 @@ export default function CorrectionModal({
     }
 
     if (!isOpen) {
-        console.log('🚫 CorrectionModal not rendering - isOpen is false')
+        // Remove noisy log that shows on every render when modal is closed
         return null
     }
 

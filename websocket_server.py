@@ -15,6 +15,7 @@ import time
 from typing import Dict, Any, List
 from pathlib import Path
 import openai
+import datetime
 
 # Rich imports for beautiful logging
 from rich.console import Console
@@ -45,6 +46,12 @@ console = Console()
 
 # Global LLM server instance (loaded at startup)
 global_llm_server = None
+
+async def log_websocket_send(websocket, data_dict, prefix="SEND"):
+    """Log and send WebSocket message"""
+    json_str = json.dumps(data_dict)
+    logger.debug(f"🔥 {prefix}: {json_str[:200]}...")
+    await websocket.send(json_str)
 
 def load_local_api_keys() -> Dict[str, str]:
     """Load API keys from local ~/.agentsea/api_keys.json file"""
@@ -234,7 +241,7 @@ class DarkRLLLMServer:
             return f"[GPT Error: {str(e)}]"
     
     async def stream_dual_response(self, websocket, messages: list, model: str = "qwen3", temperature: float = 0.7, max_tokens: int = 2048, task_id: str = None):
-        """Stream responses from both local model and GPT-4.1 simultaneously"""
+        """Stream responses from both local model and GPT-4.1 simultaneously with simplified state management"""
         
         console.print("🔥 BACKEND: Starting dual response")
         console.print(f"🔥   - model: {model}")
@@ -246,29 +253,55 @@ class DarkRLLLMServer:
         session_id = int(time.time() * 1000)  # millisecond timestamp as session ID
         console.print(f"🔥   - session_id: {session_id}")
         
+        # Set task state to streaming_dual
+        if task_id:
+            self.task_manager.set_task_state(task_id, 'streaming_dual')
+        
+        # Initialize empty dual responses in database
+        if task_id:
+            self.task_manager.set_pending_dual_responses(
+                task_id=task_id,
+                local_response="",
+                gpt_response="",
+                local_model=model,
+                gpt_model="gpt-4.1",
+                session_id=session_id
+            )
+        
         # Send initial dual response header
         dual_start = {
             "type": "dual_response_start",
             "local_model": model,
-            "gpt_model": "gpt-4.1",
-            "session_id": session_id
+            "gpt_model": "gpt-4.1", 
+            "session_id": session_id,
+            "task_id": task_id,
+            "is_continuation": task_id is not None  # Flag continuation when we have a task_id
         }
+        console.print(f"🔥 BACKEND: About to send dual_response_start: {json.dumps(dual_start)}")
         await websocket.send(json.dumps(dual_start))
-        console.print("🔥 BACKEND: Sent dual_response_start")
+        console.print("🔥 BACKEND: Successfully sent dual_response_start")
+        
+        # Add a small delay to ensure message is sent before chunks start
+        await asyncio.sleep(0.01)
         
         # Create tasks for both models
         local_task = asyncio.create_task(self._stream_local_response(websocket, messages, model, temperature, max_tokens, task_id, session_id))
-        gpt_task = asyncio.create_task(self._stream_gpt_response(websocket, messages, temperature, max_tokens, session_id))
+        gpt_task = asyncio.create_task(self._stream_gpt_response(websocket, messages, temperature, max_tokens, session_id, task_id))
         
         # Wait for both to complete
         local_response, gpt_response = await asyncio.gather(local_task, gpt_task, return_exceptions=True)
+        
+        # Update task state to awaiting_dual_selection
+        if task_id:
+            self.task_manager.set_task_state(task_id, 'awaiting_dual_selection')
         
         # Send completion marker
         dual_complete = {
             "type": "dual_response_complete",
             "local_finished": not isinstance(local_response, Exception),
             "gpt_finished": not isinstance(gpt_response, Exception),
-            "session_id": session_id
+            "session_id": session_id,
+            "task_id": task_id
         }
         await websocket.send(json.dumps(dual_complete))
         console.print("🔥 BACKEND: Sent dual_response_complete")
@@ -294,10 +327,15 @@ class DarkRLLLMServer:
             "type": "dual_response_start",
             "local_model": f"{model} (with tools)",
             "gpt_model": "gpt-4.1 (reasoning only)",
-            "session_id": session_id
+            "session_id": session_id,
+            "is_continuation": task_id is not None  # Flag continuation when we have a task_id
         }
+        console.print(f"🔥 BACKEND: About to send dual_response_start: {json.dumps(dual_start)}")
         await websocket.send(json.dumps(dual_start))
-        console.print("🔥 BACKEND: Sent dual_response_start for action mode")
+        console.print("🔥 BACKEND: Successfully sent dual_response_start for action mode")
+        
+        # Add a small delay to ensure message is sent before chunks start
+        await asyncio.sleep(0.01)
         
         # Build tools schema for mentioned servers - BOTH models get the same context
         tools = await self.build_tools_schema(mentioned_servers)
@@ -329,14 +367,48 @@ class DarkRLLLMServer:
             actual_prompt += "<|im_start|>assistant\n"
         
         # Create tasks for both models
+        console.print(f"🔥 BACKEND: Creating tasks for both models...")
+        console.print(f"🔥   - About to create local_task")
+        
         # Local model gets full tool context
         local_task = asyncio.create_task(self._stream_local_action_response(websocket, messages, mentioned_servers, model, temperature, max_tokens, task_id, session_id))
+        console.print(f"🔥   - Local task created: {local_task}")
+        console.print(f"🔥   - About to create gpt_task")
         
         # GPT-4.1 gets the EXACT SAME prompt as the local model for fair comparison
         gpt_task = asyncio.create_task(self._stream_gpt_with_same_prompt(websocket, actual_prompt, temperature, max_tokens, session_id))
+        console.print(f"🔥   - GPT task created: {gpt_task}")
+        console.print(f"🔥   - Both tasks created, waiting for completion...")
+        console.print(f"🔥   - Local task done: {local_task.done()}")
+        console.print(f"🔥   - GPT task done: {gpt_task.done()}")
         
-        # Wait for both to complete
-        local_response, gpt_response = await asyncio.gather(local_task, gpt_task, return_exceptions=True)
+        # Wait for both to complete with timeout
+        try:
+            local_response, gpt_response = await asyncio.wait_for(
+                asyncio.gather(local_task, gpt_task, return_exceptions=True),
+                timeout=120.0  # 2 minute timeout for both tasks
+            )
+            console.print(f"🔥   - Tasks completed successfully")
+        except asyncio.TimeoutError:
+            console.print(f"🔥   - Tasks timed out after 2 minutes")
+            logger.error(f"Dual response tasks timeout for session {session_id}")
+            
+            # Cancel tasks if they're still running
+            if not local_task.done():
+                local_task.cancel()
+            if not gpt_task.done():
+                gpt_task.cancel()
+            
+            # Return timeout responses
+            local_response = "[Local timeout: Task took too long to complete]"
+            gpt_response = "[GPT timeout: Task took too long to complete]"
+        console.print(f"🔥   - Tasks completed:")
+        console.print(f"🔥     - local_response type: {type(local_response)}")
+        console.print(f"🔥     - gpt_response type: {type(gpt_response)}")
+        if isinstance(local_response, Exception):
+            console.print(f"🔥     - local_response ERROR: {local_response}")
+        if isinstance(gpt_response, Exception):
+            console.print(f"🔥     - gpt_response ERROR: {gpt_response}")
         
         # Send completion marker
         dual_complete = {
@@ -402,12 +474,17 @@ class DarkRLLLMServer:
                     
                     accumulated_response += chunk
                     
+                    # Update database with streaming progress
+                    if task_id:
+                        self.task_manager.update_dual_response_progress(task_id, 'local', accumulated_response)
+                    
                     # Send local model chunk
                     stream_chunk = {
                         "type": "dual_response_chunk",
                         "source": "local",
                         "model": model,
                         "session_id": session_id,
+                        "task_id": task_id,
                         "choices": [{
                             "delta": {
                                 "content": chunk
@@ -416,7 +493,9 @@ class DarkRLLLMServer:
                         }]
                     }
                     
-                    await websocket.send(json.dumps(stream_chunk))
+                    chunk_json = json.dumps(stream_chunk)
+                    logger.debug(f"🔥 LOCAL ASYNC CHUNK: '{chunk}' -> {chunk_json[:200]}...")
+                    await websocket.send(chunk_json)
                     await asyncio.sleep(0.02)
             else:
                 for chunk in stream_iterator:
@@ -425,12 +504,17 @@ class DarkRLLLMServer:
                     
                     accumulated_response += chunk
                     
+                    # Update database with streaming progress
+                    if task_id:
+                        self.task_manager.update_dual_response_progress(task_id, 'local', accumulated_response)
+                    
                     # Send local model chunk
                     stream_chunk = {
                         "type": "dual_response_chunk",
                         "source": "local",
                         "model": model,
                         "session_id": session_id,
+                        "task_id": task_id,
                         "choices": [{
                             "delta": {
                                 "content": chunk
@@ -439,16 +523,23 @@ class DarkRLLLMServer:
                         }]
                     }
                     
-                    await websocket.send(json.dumps(stream_chunk))
+                    chunk_json = json.dumps(stream_chunk)
+                    logger.debug(f"🔥 LOCAL SYNC CHUNK: '{chunk}' -> {chunk_json[:200]}...")
+                    await websocket.send(chunk_json)
                     await asyncio.sleep(0.02)
             
             # Send local completion
             if websocket.close_code is None:
+                # Mark as finished in database
+                if task_id:
+                    self.task_manager.update_dual_response_progress(task_id, 'local', accumulated_response, finished=True)
+                
                 local_complete = {
                     "type": "dual_response_chunk",
                     "source": "local",
                     "model": model,
                     "session_id": session_id,
+                    "task_id": task_id,
                     "choices": [{
                         "delta": {},
                         "finish_reason": "stop"
@@ -456,9 +547,7 @@ class DarkRLLLMServer:
                 }
                 await websocket.send(json.dumps(local_complete))
                 
-                # Save to task if provided
-                if task_id and accumulated_response:
-                    self.task_manager.add_message(task_id, 'assistant', accumulated_response)
+                # Note: Don't save to task messages yet - wait for user selection
             
             return accumulated_response
             
@@ -479,7 +568,7 @@ class DarkRLLLMServer:
             await websocket.send(json.dumps(error_chunk))
             return f"[Local Error: {str(e)}]"
     
-    async def _stream_gpt_response(self, websocket, messages: list, temperature: float, max_tokens: int, session_id: int) -> str:
+    async def _stream_gpt_response(self, websocket, messages: list, temperature: float, max_tokens: int, session_id: int, task_id: str = None) -> str:
         """Stream GPT-4.1 response with dual response format"""
         if not self.openai_client:
             error_chunk = {
@@ -528,12 +617,17 @@ class DarkRLLLMServer:
                     content = chunk.choices[0].delta.content
                     accumulated_response += content
                     
+                    # Update database with streaming progress
+                    if task_id:
+                        self.task_manager.update_dual_response_progress(task_id, 'gpt', accumulated_response)
+                    
                     # Send GPT chunk
                     stream_chunk = {
                         "type": "dual_response_chunk",
                         "source": "gpt",
                         "model": "gpt-4.1",
                         "session_id": session_id,
+                        "task_id": task_id,
                         "choices": [{
                             "delta": {
                                 "content": content
@@ -542,16 +636,23 @@ class DarkRLLLMServer:
                         }]
                     }
                     
-                    await websocket.send(json.dumps(stream_chunk))
+                    chunk_json = json.dumps(stream_chunk)
+                    logger.debug(f"🔥 GPT CHUNK: '{content}' -> {chunk_json[:200]}...")
+                    await websocket.send(chunk_json)
                     await asyncio.sleep(0.02)
             
             # Send GPT completion
             if websocket.close_code is None:
+                # Mark as finished in database
+                if task_id:
+                    self.task_manager.update_dual_response_progress(task_id, 'gpt', accumulated_response, finished=True)
+                
                 gpt_complete = {
                     "type": "dual_response_chunk",
                     "source": "gpt",
                     "model": "gpt-4.1",
                     "session_id": session_id,
+                    "task_id": task_id,
                     "choices": [{
                         "delta": {},
                         "finish_reason": "stop"
@@ -581,7 +682,15 @@ class DarkRLLLMServer:
     async def _stream_local_action_response(self, websocket, messages: list, mentioned_servers: List[str], model: str, temperature: float, max_tokens: int, task_id: str, session_id: int) -> str:
         """Stream local model response with full tool capabilities in dual response format"""
         try:
+            console.print(f"🔥 LOCAL_ACTION: Starting local action response streaming")
+            console.print(f"🔥   - session_id: {session_id}")
+            console.print(f"🔥   - model: {model}")
+            console.print(f"🔥   - mentioned_servers: {mentioned_servers}")
             await self.initialize_model(model)
+            console.print(f"🔥   - Model initialized successfully")
+            console.print(f"🔥   - Model type: {type(self.llm)}")
+            console.print(f"🔥   - Model has chat_stream: {hasattr(self.llm, 'chat_stream')}")
+            console.print(f"🔥   - Model has stream: {hasattr(self.llm, 'stream')}")
             
             # Build tools schema for mentioned servers
             tools = await self.build_tools_schema(mentioned_servers)
@@ -606,41 +715,113 @@ class DarkRLLLMServer:
             accumulated_response = ""
             
             # Use streaming
+            console.print(f"🔥 LOCAL_ACTION: Setting up streaming...")
+            console.print(f"🔥   - self.llm type: {type(self.llm)}")
+            console.print(f"🔥   - has chat_stream: {hasattr(self.llm, 'chat_stream')}")
+            
             if hasattr(self.llm, 'chat_stream'):
+                console.print(f"🔥 LOCAL_ACTION: Using chat_stream method")
                 import inspect
                 sig = inspect.signature(self.llm.chat_stream)
                 if 'sampling_params' in sig.parameters:
-                    stream_iterator = self.llm.chat_stream(chat_messages, sampling_params=sampling_params)
+                    console.print(f"🔥 LOCAL_ACTION: chat_stream accepts sampling_params")
+                    console.print(f"🔥 LOCAL_ACTION: About to call chat_stream with sampling_params")
+                    console.print(f"🔥   - messages: {len(chat_messages)} messages")
+                    console.print(f"🔥   - sampling_params: {sampling_params}")
+                    try:
+                        stream_iterator = self.llm.chat_stream(chat_messages, sampling_params=sampling_params)
+                        console.print(f"🔥 LOCAL_ACTION: chat_stream call successful")
+                    except Exception as chat_error:
+                        console.print(f"🔥 LOCAL_ACTION: Error in chat_stream call: {chat_error}")
+                        console.print(f"🔥 LOCAL_ACTION: Chat error type: {type(chat_error)}")
+                        import traceback
+                        console.print(f"🔥 LOCAL_ACTION: Chat traceback: {traceback.format_exc()}")
+                        raise
                 else:
-                    stream_iterator = self.llm.chat_stream(chat_messages)
+                    console.print(f"🔥 LOCAL_ACTION: chat_stream does NOT accept sampling_params")
+                    console.print(f"🔥 LOCAL_ACTION: About to call chat_stream without sampling_params")
+                    console.print(f"🔥   - messages: {len(chat_messages)} messages")
+                    try:
+                        stream_iterator = self.llm.chat_stream(chat_messages)
+                        console.print(f"🔥 LOCAL_ACTION: chat_stream call successful")
+                    except Exception as chat_error:
+                        console.print(f"🔥 LOCAL_ACTION: Error in chat_stream call: {chat_error}")
+                        console.print(f"🔥 LOCAL_ACTION: Chat error type: {type(chat_error)}")
+                        import traceback
+                        console.print(f"🔥 LOCAL_ACTION: Chat traceback: {traceback.format_exc()}")
+                        raise
             else:
+                console.print(f"🔥 LOCAL_ACTION: Using fallback _messages_to_prompt method")
                 prompt = self.llm._messages_to_prompt(chat_messages)
                 stream_iterator = self.llm.stream(prompt, sampling_params=sampling_params)
             
+            console.print(f"🔥 LOCAL_ACTION: Stream iterator created: {type(stream_iterator)}")
+            
             # Handle streaming
+            console.print(f"🔥 LOCAL_ACTION: About to start streaming...")
+            console.print(f"🔥   - stream_iterator type: {type(stream_iterator)}")
+            console.print(f"🔥   - has __aiter__: {hasattr(stream_iterator, '__aiter__')}")
+            console.print(f"🔥   - stream_iterator object: {stream_iterator}")
+            
             if hasattr(stream_iterator, '__aiter__'):
-                async for chunk in stream_iterator:
-                    if websocket.close_code is not None:
-                        break
+                console.print(f"🔥 LOCAL_ACTION: Using async iterator")
+                chunk_count = 0
+                
+                # Add timeout to prevent hanging
+                async def stream_with_timeout():
+                    nonlocal accumulated_response, chunk_count
+                    console.print(f"🔥 LOCAL_ACTION: About to enter async for loop with stream_iterator")
+                    console.print(f"🔥 LOCAL_ACTION: stream_iterator object: {stream_iterator}")
+                    console.print(f"🔥 LOCAL_ACTION: stream_iterator type: {type(stream_iterator)}")
+                    console.print(f"🔥 LOCAL_ACTION: stream_iterator dir: {dir(stream_iterator)}")
                     
-                    accumulated_response += chunk
-                    
-                    # Send chunk without tool execution in dual mode
-                    stream_chunk = {
-                        "type": "dual_response_chunk",
-                        "source": "local",
-                        "model": f"{model} (with tools)",
-                        "session_id": session_id,
-                        "choices": [{
-                            "delta": {
-                                "content": chunk
-                            },
-                            "finish_reason": None
-                        }]
-                    }
-                    
-                    await websocket.send(json.dumps(stream_chunk))
-                    await asyncio.sleep(0.02)
+                    try:
+                        async for chunk in stream_iterator:
+                            chunk_count += 1
+                            if chunk_count <= 5:  # Log first 5 chunks
+                                console.print(f"🔥 LOCAL_ACTION: Chunk {chunk_count}: '{chunk}' ({len(chunk)} chars)")
+                            elif chunk_count == 6:
+                                console.print(f"🔥 LOCAL_ACTION: ... continuing streaming (will only log important events)")
+                            
+                            if websocket.close_code is not None:
+                                console.print(f"🔥 LOCAL_ACTION: WebSocket closed, breaking")
+                                break
+                            
+                            accumulated_response += chunk
+                            
+                            # Send chunk without tool execution in dual mode
+                            stream_chunk = {
+                                "type": "dual_response_chunk",
+                                "source": "local",
+                                "model": f"{model} (with tools)",
+                                "session_id": session_id,
+                                "choices": [{
+                                    "delta": {
+                                        "content": chunk
+                                    },
+                                    "finish_reason": None
+                                }]
+                            }
+                            
+                            await websocket.send(json.dumps(stream_chunk))
+                            await asyncio.sleep(0.02)
+                        
+                        console.print(f"🔥 LOCAL_ACTION: Async streaming completed with {chunk_count} chunks")
+                        
+                    except Exception as loop_error:
+                        console.print(f"🔥 LOCAL_ACTION: Error in async for loop: {loop_error}")
+                        console.print(f"🔥 LOCAL_ACTION: Loop error type: {type(loop_error)}")
+                        import traceback
+                        console.print(f"🔥 LOCAL_ACTION: Loop traceback: {traceback.format_exc()}")
+                        raise
+                
+                try:
+                    await asyncio.wait_for(stream_with_timeout(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    console.print(f"🔥 LOCAL_ACTION: Streaming timeout after 30 seconds")
+                    logger.error(f"Local streaming timeout for session {session_id}")
+                    if not accumulated_response:
+                        accumulated_response = "[Local Error: Streaming timeout - model took too long to respond]"
             else:
                 for chunk in stream_iterator:
                     if websocket.close_code is not None:
@@ -700,7 +881,13 @@ class DarkRLLLMServer:
     
     async def _stream_gpt_with_same_prompt(self, websocket, actual_prompt: str, temperature: float, max_tokens: int, session_id: int) -> str:
         """Stream GPT-4.1 response using the exact same prompt as the local model"""
+        console.print(f"🔥 GPT_ACTION: Starting GPT action response streaming")
+        console.print(f"🔥   - session_id: {session_id}")
+        console.print(f"🔥   - actual_prompt length: {len(actual_prompt)}")
+        console.print(f"🔥   - actual_prompt preview: {actual_prompt[:200]}...")
+        
         if not self.openai_client:
+            console.print(f"🔥 GPT_ACTION: ERROR - No OpenAI client configured")
             error_chunk = {
                 "type": "dual_response_chunk",
                 "source": "gpt",
@@ -717,6 +904,7 @@ class DarkRLLLMServer:
             return "[GPT Error: OpenAI API key not configured]"
         
         try:
+            console.print(f"🔥 GPT_ACTION: OpenAI client available, starting processing...")
             # Convert the Qwen prompt format to OpenAI messages format
             # Parse the actual_prompt to extract the conversation
             import re
@@ -757,30 +945,55 @@ class DarkRLLLMServer:
             )
             
             accumulated_response = ""
-            async for chunk in response:
-                if websocket.close_code is not None:
-                    break
-                
-                if chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    accumulated_response += content
+            console.print(f"🔥 GPT_ACTION: About to start streaming from OpenAI...")
+            chunk_count = 0
+            
+            # Add timeout to prevent hanging for GPT streaming too
+            async def gpt_stream_with_timeout():
+                nonlocal accumulated_response, chunk_count
+                async for chunk in response:
+                    chunk_count += 1
+                    if chunk_count <= 5:  # Log first 5 chunks
+                        console.print(f"🔥 GPT_ACTION: Chunk {chunk_count}: {chunk}")
+                    elif chunk_count == 6:
+                        console.print(f"🔥 GPT_ACTION: ... continuing streaming (will only log important events)")
                     
-                    # Send GPT chunk
-                    stream_chunk = {
-                        "type": "dual_response_chunk",
-                        "source": "gpt",
-                        "model": "gpt-4.1 (reasoning only)",
-                        "session_id": session_id,
-                        "choices": [{
-                            "delta": {
-                                "content": content
-                            },
-                            "finish_reason": None
-                        }]
-                    }
+                    if websocket.close_code is not None:
+                        console.print(f"🔥 GPT_ACTION: WebSocket closed, breaking")
+                        break
                     
-                    await websocket.send(json.dumps(stream_chunk))
-                    await asyncio.sleep(0.02)
+                    if chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        accumulated_response += content
+                        
+                        if chunk_count <= 5:  # Log first 5 chunks
+                            console.print(f"🔥 GPT_ACTION: Sending chunk {chunk_count}: '{content}' ({len(content)} chars)")
+                        
+                        # Send GPT chunk
+                        stream_chunk = {
+                            "type": "dual_response_chunk",
+                            "source": "gpt",
+                            "model": "gpt-4.1 (reasoning only)",
+                            "session_id": session_id,
+                            "choices": [{
+                                "delta": {
+                                    "content": content
+                                },
+                                "finish_reason": None
+                            }]
+                        }
+                        
+                        await websocket.send(json.dumps(stream_chunk))
+                        await asyncio.sleep(0.02)
+                console.print(f"🔥 GPT_ACTION: Streaming completed with {chunk_count} chunks")
+            
+            try:
+                await asyncio.wait_for(gpt_stream_with_timeout(), timeout=60.0)
+            except asyncio.TimeoutError:
+                console.print(f"🔥 GPT_ACTION: Streaming timeout after 60 seconds")
+                logger.error(f"GPT streaming timeout for session {session_id}")
+                if not accumulated_response:
+                    accumulated_response = "[GPT Error: Streaming timeout - model took too long to respond]"
             
             # Send GPT completion
             if websocket.close_code is None:
@@ -1541,15 +1754,24 @@ class DarkRLLLMServer:
         return self.task_manager.create_task(initial_prompt, model)
     
     def get_task(self, task_id: str) -> dict:
-        """Get task details by ID"""
+        """Get task details by ID with current state"""
         task = self.task_manager.get_task(task_id)
         if not task:
             return {"error": "Task not found"}
         
         messages = self.task_manager.get_task_messages(task_id)
+        
+        # Get current task state (idle, streaming_single, streaming_dual, awaiting_dual_selection)
+        current_state = self.task_manager.get_task_state(task_id)
+        
+        # Get pending dual responses if any
+        pending_dual = self.task_manager.get_pending_dual_responses(task_id)
+        
         return {
             "task": task,
-            "messages": messages
+            "messages": messages,
+            "current_state": current_state,
+            "pending_dual": pending_dual
         }
     
     def get_recent_tasks(self) -> list:
@@ -1810,16 +2032,21 @@ class DarkRLLLMServer:
         
         try:
             # Build tools schema for mentioned servers
+            console.print(f"🔥 LOCAL_ACTION: Building tools schema for servers: {mentioned_servers}")
             tools = await self.build_tools_schema(mentioned_servers)
+            console.print(f"🔥 LOCAL_ACTION: Built {len(tools)} tools")
             
             if not tools:
                 # No tools found, fall back to chat mode
                 logger.warning(f"No tools found for servers: {mentioned_servers}")
+                console.print(f"🔥 LOCAL_ACTION: No tools found, falling back to chat mode")
                 await self.stream_chat_response(websocket, messages, model, temperature, max_tokens, task_id)
                 return
             
             # Build Qwen chat messages with tools
+            console.print(f"🔥 LOCAL_ACTION: Building Qwen chat messages with tools...")
             chat_messages = self.build_qwen_chat_messages(messages, tools)
+            console.print(f"🔥 LOCAL_ACTION: Built {len(chat_messages)} chat messages")
             
             console.print(Panel(
                 f"🛠️ Built Qwen chat with {len(tools)} tools\n"
@@ -2343,7 +2570,8 @@ async def handle_client(websocket):
             try:
                 # Parse request
                 request = json.loads(message)
-                logger.info(f"Received request from {client_addr}")
+                logger.info(f"🔥 RECEIVED REQUEST from {client_addr}: type={request.get('type', 'unknown')}")
+                logger.debug(f"🔥 FULL REQUEST: {json.dumps(request, indent=2)[:500]}...")
                 
                 # Handle MCP server list requests
                 if request.get('type') == 'list_mcp_servers':
@@ -2949,147 +3177,177 @@ async def handle_client(websocket):
                     
                     continue
 
-                # Handle model selection from dual response
+                # Handle model selection from dual response - SIMPLIFIED
                 if request.get('type') == 'model_selection':
                     try:
                         task_id = request.get('task_id', '')
                         selected_model = request.get('selected_model', '')  # 'local' or 'gpt'
+                        
+                        # NEW: Get the selected content directly from the request (streaming approach)
                         local_response = request.get('local_response', '')
                         gpt_response = request.get('gpt_response', '')
                         
-                        logger.info(f"🐛 Model selection received: selected={selected_model}, task_id={task_id}")
-                        logger.info(f"🐛 Local response length: {len(local_response)}")
-                        logger.info(f"🐛 GPT response length: {len(gpt_response)}")
+                        console.print(Panel(
+                            f"🔥 MODEL SELECTION REQUEST RECEIVED!\n"
+                            f"📍 **Client:** {client_addr}\n"
+                            f"🎯 **Task ID:** {task_id}\n"
+                            f"🔹 **Selected Model:** {selected_model}\n"
+                            f"📊 **Local Response Length:** {len(local_response)} chars\n"
+                            f"📊 **GPT Response Length:** {len(gpt_response)} chars",
+                            title="🎪 USER MODEL SELECTION",
+                            style="bold blue",
+                            border_style="blue"
+                        ))
                         
-                        # Get current task state before making changes
-                        task_data_before = llm_server.get_task(task_id)
-                        messages_before = task_data_before.get('messages', []) if task_data_before and not task_data_before.get('error') else []
-                        logger.info(f"🐛 Messages before selection: {len(messages_before)}")
-                        for i, msg in enumerate(messages_before[-3:]):  # Show last 3 messages
-                            logger.info(f"🐛   Message {i}: {msg['role']} - {msg['content'][:100]}...")
+                        # Get selected content from the request (not from database)
+                        selected_content = local_response if selected_model == 'local' else gpt_response
+                        
+                        if not selected_content:
+                            error_response = {
+                                "type": "model_selection_response",
+                                "success": False,
+                                "error": f"No {selected_model} response content found"
+                            }
+                            await websocket.send(json.dumps(error_response))
+                            continue
                         
                         # Save the selected response to the task
-                        if task_id and selected_model:
-                            selected_content = local_response if selected_model == 'local' else gpt_response
-                            if selected_content:
-                                llm_server.task_manager.add_message(task_id, 'assistant', selected_content)
-                                logger.info(f"💾 Saved selected {selected_model} response to task {task_id}")
-                                
-                                # Save user preference for analytics and learning
-                                try:
-                                    # Get the last user message to associate with this preference
-                                    task_data = llm_server.get_task(task_id)
-                                    if task_data and not task_data.get('error'):
-                                        messages = task_data.get('messages', [])
-                                        user_prompt = ""
-                                        for msg in reversed(messages):
-                                            if msg['role'] == 'user':
-                                                user_prompt = msg['content']
-                                                break
-                                        
-                                        if user_prompt:
-                                            preference_id = llm_server.task_manager.save_response_preference(
-                                                task_id=task_id,
-                                                user_prompt=user_prompt,
-                                                local_response=local_response,
-                                                gpt_response=gpt_response, 
-                                                preferred_model=selected_model,
-                                                local_model_name=request.get('local_model_name', 'qwen2.5-vl'),
-                                                gpt_model_name=request.get('gpt_model_name', 'gpt-4')
-                                            )
-                                            logger.info(f"📊 Saved response preference {preference_id}: user preferred {selected_model}")
-                                except Exception as e:
-                                    logger.error(f"❌ Error saving response preference: {e}")
-                                
-                                # Check if the selected response contains a tool call
-                                if "<tool_call>" in selected_content and "</tool_call>" in selected_content:
-                                    logger.info(f"🐛 Selected response contains tool call - will execute and continue conversation")
-                                    logger.info(f"🐛 Tool call content: {selected_content[selected_content.find('<tool_call>'):selected_content.find('</tool_call>')+12]}")
+                        if task_id and selected_model and selected_content:
+                            llm_server.task_manager.add_message(task_id, 'assistant', selected_content)
+                            logger.info(f"💾 Saved selected {selected_model} response to task {task_id}")
+                            
+                            # Save user preference for analytics and learning
+                            try:
+                                # Get the last user message to associate with this preference
+                                task_data = llm_server.get_task(task_id)
+                                if task_data and not task_data.get('error'):
+                                    messages = task_data.get('messages', [])
+                                    user_prompt = ""
+                                    for msg in reversed(messages):
+                                        if msg['role'] == 'user':
+                                            user_prompt = msg['content']
+                                            break
                                     
-                                    try:
-                                        console.print(Panel(
-                                            f"🔍 Selected {selected_model} response contains tool call - parsing and executing...",
-                                            title="🔧 TOOL CALL DETECTED",
-                                            style="bold yellow",
-                                            border_style="yellow"
-                                        ))
-                                        
-                                        tool_call_match = selected_content.split('<tool_call>')[1].split('</tool_call>')[0]
-                                        tool_call_data = json.loads(tool_call_match)
-                                        logger.info(f"🐛 Parsed tool call: {tool_call_data}")
-                                        
-                                        # Find which server this tool belongs to
-                                        server_id = None
-                                        server_actions = await llm_server.get_mcp_server_actions(['playwright', 'filesystem', 'sequential-thinking'])
-                                        
-                                        for sid, actions in server_actions.items():
-                                            for action in actions:
-                                                if action.get('name') == tool_call_data.get('name'):
-                                                    server_id = sid
-                                                    break
-                                            if server_id:
-                                                break
-                                        
-                                        logger.info(f"🐛 Found tool on server: {server_id}")
-                                        
-                                        if server_id:
-                                            # Execute the tool
-                                            execution_result = await llm_server.execute_mcp_action(
-                                                server_id, 
-                                                tool_call_data.get('name'), 
-                                                tool_call_data.get('arguments', {})
-                                            )
-                                            
-                                            logger.info(f"🐛 Tool execution result: {execution_result}")
-                                            
-                                            # Create structured tool response
-                                            tool_response_content = json.dumps(execution_result, indent=2)
-                                            structured_response = f"<tool_response>\n{tool_response_content}\n</tool_response>"
-                                            
-                                            # Add tool response as user message
-                                            llm_server.task_manager.add_message(task_id, 'user', structured_response)
-                                            logger.info(f"🐛 Added tool response as user message: {len(structured_response)} chars")
-                                            
-                                            # Get task state after tool execution
-                                            task_data_after = llm_server.get_task(task_id)
-                                            messages_after = task_data_after.get('messages', []) if task_data_after and not task_data_after.get('error') else []
-                                            logger.info(f"🐛 Messages after tool execution: {len(messages_after)}")
-                                            for i, msg in enumerate(messages_after[-3:]):  # Show last 3 messages
-                                                logger.info(f"🐛   Message {i}: {msg['role']} - {msg['content'][:100]}...")
-                                            
-                                            console.print(Panel(
-                                                f"✅ Tool executed successfully from selected {selected_model} response",
-                                                title="🎉 TOOL EXECUTION COMPLETED",
-                                                style="bold green",
-                                                border_style="green"
-                                            ))
-                                            
-                                            # Continue the conversation after tool execution
-                                            logger.info(f"🐛 About to call continue_task_conversation for task {task_id}")
-                                            await llm_server.continue_task_conversation(websocket, task_id)
-                                        else:
-                                            logger.error(f"❌ Could not find server for tool: {tool_call_data.get('name')}")
-                                            
-                                    except Exception as tool_error:
-                                        logger.error(f"❌ Error executing tool from selected response: {tool_error}")
-                                        import traceback
-                                        logger.error(f"❌ Full traceback: {traceback.format_exc()}")
-                                else:
-                                    logger.info(f"🐛 Selected response does not contain tool call - no continuation needed")
+                                    if user_prompt:
+                                        preference_id = llm_server.task_manager.save_response_preference(
+                                            task_id=task_id,
+                                            user_prompt=user_prompt,
+                                            local_response=local_response,
+                                            gpt_response=gpt_response, 
+                                            preferred_model=selected_model,
+                                            local_model_name=request.get('local_model_name', 'qwen3'),
+                                            gpt_model_name=request.get('gpt_model_name', 'gpt-4.1')
+                                        )
+                                        logger.info(f"📊 Saved response preference {preference_id}: user preferred {selected_model}")
+                            except Exception as e:
+                                logger.error(f"❌ Error saving response preference: {e}")
                         
-                        # Send confirmation
+                        # Set task state to processing (not idle yet)
+                        llm_server.task_manager.set_task_state(task_id, 'processing')
+                        
+                        # ALWAYS add the selected response to the task messages first
+                        console.print(Panel(
+                            f"📝 Adding selected response to task messages\\n"
+                            f"🤖 Model: {selected_model}\\n"
+                            f"📊 Content length: {len(selected_content)} chars",
+                            title="💾 SAVING SELECTED RESPONSE",
+                            style="bold green",
+                            border_style="green"
+                        ))
+                        llm_server.task_manager.add_message(
+                            task_id, 
+                            'assistant', 
+                            selected_content
+                        )
+                        
+                        # Send confirmation response
                         selection_response = {
                             "type": "model_selection_response",
                             "success": True,
                             "selected_model": selected_model,
                             "task_id": task_id
                         }
+                        
+                        # Check if the selected response contains a tool call
+                        if "<tool_call>" in selected_content and "</tool_call>" in selected_content:
+                            logger.info(f"🐛 Selected response contains tool call - will execute and continue conversation")
+                            
+                            try:
+                                tool_call_match = selected_content.split('<tool_call>')[1].split('</tool_call>')[0]
+                                tool_call_data = json.loads(tool_call_match)
+                                
+                                # Find which server this tool belongs to
+                                server_id = None
+                                server_actions = await llm_server.get_mcp_server_actions(['playwright', 'filesystem', 'sequential-thinking'])
+                                
+                                for sid, actions in server_actions.items():
+                                    for action in actions:
+                                        if action.get('name') == tool_call_data.get('name'):
+                                            server_id = sid
+                                            break
+                                    if server_id:
+                                        break
+                                
+                                if server_id:
+                                    # Execute the tool
+                                    execution_result = await llm_server.execute_mcp_action(
+                                        server_id, 
+                                        tool_call_data.get('name'), 
+                                        tool_call_data.get('arguments', {})
+                                    )
+                                    
+                                    # Create structured tool response
+                                    tool_response_content = json.dumps(execution_result, indent=2)
+                                    structured_response = f"<tool_response>\n{tool_response_content}\n</tool_response>"
+                                    
+                                    # Add tool response as user message
+                                    llm_server.task_manager.add_message(task_id, 'user', structured_response)
+                                    
+                                    # Set task state to idle AFTER tool execution
+                                    console.print(Panel(
+                                        f"✅ Tool execution completed, setting state to 'idle'",
+                                        title="📊 STATE CHANGE",
+                                        style="bold green",
+                                        border_style="green"
+                                    ))
+                                    llm_server.task_manager.set_task_state(task_id, 'idle')
+                                    
+                                    # Send tool result to client for seamless UI update
+                                    await websocket.send(json.dumps({
+                                        "type": "tool_result",
+                                        "task_id": task_id,
+                                        "message": {
+                                            "role": "user",
+                                            "content": structured_response,
+                                            "timestamp": datetime.datetime.now().isoformat()
+                                        }
+                                    }))
+                                    
+                                else:
+                                    logger.error(f"❌ Could not find server for tool: {tool_call_data.get('name')}")
+                                    # Set task state to idle even if tool execution failed
+                                    llm_server.task_manager.set_task_state(task_id, 'idle')
+                                    
+                            except Exception as tool_error:
+                                logger.error(f"❌ Error executing tool from selected response: {tool_error}")
+                                # Set task state to idle even if tool execution failed
+                                llm_server.task_manager.set_task_state(task_id, 'idle')
+                        else:
+                            # No tool call, set task state to idle
+                            console.print(Panel(
+                                f"💬 No tool call found in selected response, setting state to 'idle'",
+                                title="📊 STATE CHANGE",
+                                style="bold blue",
+                                border_style="blue"
+                            ))
+                            llm_server.task_manager.set_task_state(task_id, 'idle')
+                            
+                        # Send confirmation LAST, after all processing is done.
+                        # The frontend will use this to trigger a reload.
                         await websocket.send(json.dumps(selection_response))
                         
                     except Exception as e:
                         logger.error(f"Error processing model selection: {e}")
-                        import traceback
-                        logger.error(f"Full traceback: {traceback.format_exc()}")
                         error_response = {
                             "type": "model_selection_response",
                             "success": False,

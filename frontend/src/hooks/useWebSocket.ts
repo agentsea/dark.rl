@@ -3,9 +3,9 @@ import { flushSync } from 'react-dom'
 import React from 'react'
 
 export interface Message {
-    role: 'user' | 'assistant' | 'system'
+    role: 'user' | 'assistant' | 'system' | 'tool'
     content: string
-    timestamp?: number
+    timestamp?: string
 }
 
 export interface OpenAIRequest {
@@ -99,15 +99,69 @@ export default function useWebSocket({
     const [gptResponse, setGptResponse] = useState('');
     const [localFinished, setLocalFinished] = useState(false);
     const [gptFinished, setGptFinished] = useState(false);
-    const [dualSessionId, setDualSessionId] = useState(0);
+    const [dualSessionId, setDualSessionId] = useState<number>(0);
     const [localModel, setLocalModel] = useState('');
     const [gptModel, setGptModel] = useState('');
+    const [toolResultMessage, setToolResultMessage] = useState<Message | null>(null)
 
-    // Refs for immediate updates
-    const localResponseRef = useRef('');
-    const gptResponseRef = useRef('');
-    const currentSessionIdRef = useRef(0); // Add ref for immediate session ID updates
-    const isTransitioningRef = useRef(false); // Add ref for immediate transition state
+    // Refs for real-time response accumulation
+    const localResponseRef = useRef('')
+    const gptResponseRef = useRef('')
+    const currentSessionIdRef = useRef<number | null>(null)
+    const dualInitializedRef = useRef(false)
+
+    // Track which sessions we've already initialized to prevent multiple initializations
+    const initializedSessionsRef = useRef(new Set<number>())
+
+    // DEBUG: Track how many times the emergency fix is applied
+    const emergencyFixCountRef = useRef<number>(0)
+
+    // BYPASS BROKEN REACT STATE: Use refs to track dual session state
+    const dualSessionIdRef = useRef<number>(0)
+    const isDualResponseRef = useRef<boolean>(false)
+
+    // Proper force update mechanism using state counter
+    const [forceUpdateCounter, setForceUpdateCounter] = useState(0)
+    const forceUpdate = useCallback(() => {
+        console.log('🔄 FORCE UPDATE called - current counter:', forceUpdateCounter)
+        console.log('🔄   - isDualResponseRef.current:', isDualResponseRef.current)
+        console.log('🔄   - dualSessionIdRef.current:', dualSessionIdRef.current)
+        setForceUpdateCounter(prev => {
+            console.log('🔄   - incrementing counter from', prev, 'to', prev + 1)
+            return prev + 1
+        })
+    }, [])
+
+    // Debug logging when forceUpdateCounter changes
+    useEffect(() => {
+        console.log('🔄 forceUpdateCounter EFFECT triggered with counter:', forceUpdateCounter)
+        console.log('🔄   - isDualResponseRef.current:', isDualResponseRef.current)
+        console.log('🔄   - dualSessionIdRef.current:', dualSessionIdRef.current)
+    }, [forceUpdateCounter])
+
+    // DEBUG: Log state changes
+    useEffect(() => {
+        console.log('📊 STATE CHANGE: dualSessionId updated to:', dualSessionId)
+    }, [dualSessionId])
+
+    useEffect(() => {
+        console.log('📊 STATE CHANGE: isDualResponse updated to:', isDualResponse)
+    }, [isDualResponse])
+
+    // DEBUG: Log dual response content state changes
+    useEffect(() => {
+        console.log('📊 STATE CHANGE: localResponse updated to length:', localResponse.length)
+        if (localResponse.length > 0) {
+            console.log('📊   - localResponse content preview:', localResponse.substring(0, 100) + '...')
+        }
+    }, [localResponse])
+
+    useEffect(() => {
+        console.log('📊 STATE CHANGE: gptResponse updated to length:', gptResponse.length)
+        if (gptResponse.length > 0) {
+            console.log('📊   - gptResponse content preview:', gptResponse.substring(0, 100) + '...')
+        }
+    }, [gptResponse])
 
     const wsRef = useRef<WebSocket | null>(null)
     const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
@@ -115,8 +169,16 @@ export default function useWebSocket({
     const currentResponseRef = useRef('')
 
     const connect = useCallback(() => {
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-            return
+        // Prevent multiple connections
+        if (wsRef.current) {
+            if (wsRef.current.readyState === WebSocket.OPEN) {
+                console.log('🔥 WebSocket already connected, skipping connect attempt')
+                return
+            }
+            if (wsRef.current.readyState === WebSocket.CONNECTING) {
+                console.log('🔥 WebSocket already connecting, skipping connect attempt')
+                return
+            }
         }
 
         console.log('Attempting to connect to:', url)
@@ -132,8 +194,315 @@ export default function useWebSocket({
             }
 
             wsRef.current.onmessage = (event) => {
+                // RAW MESSAGE DEBUG
+                console.log('🔥🔥🔥 RAW WEBSOCKET MESSAGE:', event.data)
+
                 try {
                     const data = JSON.parse(event.data)
+
+                    // MESSAGE TYPE DEBUG
+                    console.log('🔥🔥🔥 PARSED MESSAGE TYPE:', data.type)
+
+                    // SPECIAL ALERT FOR DUAL_RESPONSE_START
+                    if (data.type === 'dual_response_start') {
+                        console.log('🚨🚨🚨 DUAL_RESPONSE_START DETECTED!!! 🚨🚨🚨')
+                        console.log('🚨🚨🚨 THIS SHOULD BE THE FIRST MESSAGE FOR DUAL RESPONSE 🚨🚨🚨')
+                        console.log('🚨   - session_id:', data.session_id)
+                        console.log('🚨   - local_model:', data.local_model)
+                        console.log('🚨   - gpt_model:', data.gpt_model)
+                        console.log('🚨   - is_continuation:', data.is_continuation)
+                        console.log('🚨   - current dualSessionId state:', dualSessionId)
+                        console.log('🚨   - current isDualResponse state:', isDualResponse)
+                    }
+
+                    // DEBUG: Log all message types to see what we're actually receiving
+                    if (data.type !== 'dual_response_chunk') {
+                        console.log('📬 NON-CHUNK MESSAGE:', data.type, 'session_id:', data.session_id)
+                    }
+
+                    // Log all message types we receive
+                    if (data.type !== 'dual_response_chunk') {
+                        console.log('📢📢📢 NON-CHUNK MESSAGE RECEIVED:', data.type, data)
+                    }
+
+                    // SPECIAL DEBUG FOR DUAL_RESPONSE_START
+                    if (data.type === 'dual_response_start') {
+                        console.log('🔥 DUAL_RESPONSE_START RECEIVED:', data)
+                        console.log('🔥   - session_id:', data.session_id)
+                        console.log('🔥   - local_model:', data.local_model)
+                        console.log('🔥   - gpt_model:', data.gpt_model)
+                        console.log('🔥   - is_continuation:', data.is_continuation)
+                        console.log('🔥   - Current dualSessionId state before:', dualSessionId)
+                        console.log('🔥   - Current dualInitializedRef before:', dualInitializedRef.current)
+                        console.log('🔥   - initializedSessionsRef.current has session:', initializedSessionsRef.current.has(data.session_id))
+
+                        // Mark this session as initialized immediately
+                        initializedSessionsRef.current.add(data.session_id)
+                        dualInitializedRef.current = true
+                        currentSessionIdRef.current = data.session_id
+
+                        // BYPASS BROKEN REACT STATE: Use refs AND state
+                        dualSessionIdRef.current = data.session_id
+                        isDualResponseRef.current = true
+                        forceUpdate() // Force re-render when refs change
+
+                        // AGGRESSIVE state updates to overcome React batching
+                        // If this is a new session, reset the previous state
+                        if (dualSessionId !== 0 && dualSessionId !== data.session_id) {
+                            console.log('🔥   - New session detected, resetting previous session state')
+                            console.log('🔥   - Previous session:', dualSessionId, '-> New session:', data.session_id)
+                        }
+
+                        setDualSessionId(data.session_id)
+                        setIsDualResponse(true)
+                        setIsStreaming(true)
+
+                        // Reset response state - always reset for new session
+                        setLocalResponse('')
+                        setGptResponse('')
+                        localResponseRef.current = ''
+                        gptResponseRef.current = ''
+                        setLocalFinished(false)
+                        setGptFinished(false)
+
+                        // Set model names from the dual response start message
+                        setLocalModel(data.local_model || 'qwen2.5-vl')
+                        setGptModel(data.gpt_model || 'gpt-4.1')
+
+                        console.log('🔥 DUAL_RESPONSE_START: Set refs and state')
+                        console.log('🔥   - dualSessionIdRef.current:', dualSessionIdRef.current)
+                        console.log('🔥   - isDualResponseRef.current:', isDualResponseRef.current)
+                        console.log('🔥   - dualSessionId state:', dualSessionId)
+                        console.log('🔥   - isDualResponse state:', isDualResponse)
+
+                        // Force re-render to ensure UI updates
+                        forceUpdate()
+
+                        console.log('🔥 DUAL_RESPONSE_START: Handler completed, marked session as initialized')
+                        return
+                    }
+
+                    // FALLBACK: If we receive dual_response_chunk but haven't initialized dual mode, do it now
+                    if (data.type === 'dual_response_chunk') {
+                        const chunkSessionId = data.session_id
+
+                        console.log('🔥 RAW CHUNK RECEIVED:')
+                        console.log('🔥   - source:', data.source)
+                        console.log('🔥   - content:', data.choices?.[0]?.delta?.content)
+                        console.log('🔥   - finish_reason:', data.choices?.[0]?.finish_reason)
+                        console.log('🔥   - chunkSessionId:', chunkSessionId)
+                        console.log('🔥   - dualSessionId (state):', dualSessionId)
+                        console.log('🔥   - currentSessionIdRef.current:', currentSessionIdRef.current)
+                        console.log('🔥   - dualInitializedRef.current:', dualInitializedRef.current)
+                        console.log('🔥   - isDualResponse (state):', isDualResponse)
+                        console.log('🔥   - isStreaming (state):', isStreaming)
+                        console.log('🔥   - emergencyFixCountRef.current:', emergencyFixCountRef.current)
+
+                        // IMPROVED FALLBACK: Only initialize if we haven't for this specific session
+                        // The key issue is that dualSessionId might still be 0 from previous session reset
+                        const needsInitialization = chunkSessionId && (
+                            !initializedSessionsRef.current.has(chunkSessionId) &&
+                            (dualSessionId === 0 || dualSessionId !== chunkSessionId)
+                        )
+
+                        // WARNING: Detect missing dual_response_start message
+                        if (needsInitialization && chunkSessionId) {
+                            console.log('🚨 WARNING: Received dual_response_chunk without dual_response_start!')
+                            console.log('🚨   - This suggests the dual_response_start message was lost or not received')
+                            console.log('🚨   - Server session ID:', chunkSessionId)
+                            console.log('🚨   - Falling back to emergency initialization')
+                        }
+
+                        console.log('🔥 FALLBACK CHECK:')
+                        console.log('🔥   - chunkSessionId:', chunkSessionId)
+                        console.log('🔥   - initializedSessionsRef.current has session:', initializedSessionsRef.current.has(chunkSessionId))
+                        console.log('🔥   - dualSessionId:', dualSessionId)
+                        console.log('🔥   - dualInitializedRef.current:', dualInitializedRef.current)
+                        console.log('🔥   - needsInitialization:', needsInitialization)
+
+                        if (needsInitialization) {
+                            console.log('🔥 FALLBACK: Initializing dual mode from first chunk')
+                            console.log('🔥   - Reason: Session not initialized or dualSessionId mismatch')
+                            console.log('🔥   - Setting dualSessionId to:', chunkSessionId)
+
+                            // Mark this session as initialized
+                            initializedSessionsRef.current.add(chunkSessionId)
+                            dualInitializedRef.current = true
+                            currentSessionIdRef.current = chunkSessionId
+
+                            // BYPASS BROKEN REACT STATE: Set refs directly first
+                            dualSessionIdRef.current = chunkSessionId
+                            isDualResponseRef.current = true
+                            forceUpdate() // Force re-render when refs change
+
+                            // Also try to set React state (but don't rely on it)
+                            setDualSessionId(chunkSessionId)
+                            setIsDualResponse(true)
+                            setIsStreaming(true)
+
+                            // Always reset response state for new session
+                            setLocalResponse('')
+                            setGptResponse('')
+                            localResponseRef.current = ''
+                            gptResponseRef.current = ''
+                            setLocalFinished(false)
+                            setGptFinished(false)
+
+                            // Force re-render to ensure UI updates
+                            forceUpdate()
+
+                            console.log('🔥 FALLBACK: Dual mode initialized successfully')
+                            console.log('🔥   - dualSessionIdRef.current:', dualSessionIdRef.current)
+                            console.log('🔥   - isDualResponseRef.current:', isDualResponseRef.current)
+                        }
+
+                        // ENSURE REFS ARE CORRECT: Always sync refs with session ID (bypass broken React state)
+                        if (chunkSessionId && initializedSessionsRef.current.has(chunkSessionId)) {
+                            // Always ensure refs are correct for valid sessions
+                            if (dualSessionIdRef.current !== chunkSessionId) {
+                                console.log('🔥 SYNCING REFS: dualSessionIdRef.current', dualSessionIdRef.current, '->', chunkSessionId)
+                                dualSessionIdRef.current = chunkSessionId
+                                isDualResponseRef.current = true
+                                // Force re-render to ensure UI updates
+                                forceUpdate()
+                            }
+                        }
+
+                        // Skip processing if we don't have a valid session match
+                        if (!chunkSessionId || (currentSessionIdRef.current && chunkSessionId !== currentSessionIdRef.current)) {
+                            console.log('🔥 SKIPPING CHUNK - session mismatch or invalid:', chunkSessionId, 'vs current:', currentSessionIdRef.current)
+                            return
+                        }
+
+                        console.log('🔥 PROCESSING CHUNK:')
+                        console.log('🔥   - source:', data.source)
+                        console.log('🔥   - content:', data.choices?.[0]?.delta?.content)
+                        console.log('🔥   - finish_reason:', data.choices?.[0]?.finish_reason)
+
+                        const content = data.choices?.[0]?.delta?.content || ''
+                        const finishReason = data.choices?.[0]?.finish_reason
+
+                        if (data.source === 'local') {
+                            const prevLength = localResponseRef.current.length
+                            localResponseRef.current += content
+                            const newLength = localResponseRef.current.length
+                            console.log('🔥   - localResponseRef updated: ', prevLength, ' -> ', newLength)
+                            console.log('🔥   - Added content: "', content, '"')
+
+                            // CRITICAL: Update React state so UI can render the content
+                            console.log('🔥   - About to call setLocalResponse with length:', localResponseRef.current.length)
+                            setLocalResponse(localResponseRef.current)
+                            console.log('🔥   - Called setLocalResponse - React should update localResponse state')
+
+                            if (finishReason === 'stop') {
+                                console.log('🔥 LOCAL RESPONSE FINISHED with reason:', finishReason)
+                                console.log('🔥   - Setting localFinished to TRUE')
+                                console.log('🔥   - Final localResponse length:', localResponseRef.current.length)
+                                setLocalFinished(true)
+                            }
+                        } else if (data.source === 'gpt') {
+                            const prevLength = gptResponseRef.current.length
+                            gptResponseRef.current += content
+                            const newLength = gptResponseRef.current.length
+                            console.log('🔥   - gptResponseRef updated: ', prevLength, ' -> ', newLength)
+                            console.log('🔥   - Added content: "', content, '"')
+
+                            // CRITICAL: Update React state so UI can render the content
+                            console.log('🔥   - About to call setGptResponse with length:', gptResponseRef.current.length)
+                            setGptResponse(gptResponseRef.current)
+                            console.log('🔥   - Called setGptResponse - React should update gptResponse state')
+
+                            if (finishReason === 'stop') {
+                                console.log('🔥 GPT RESPONSE FINISHED with reason:', finishReason)
+                                console.log('🔥   - Setting gptFinished to TRUE')
+                                console.log('🔥   - Final gptResponse length:', gptResponseRef.current.length)
+                                setGptFinished(true)
+                            }
+                        }
+
+                        console.log('Stream finished, finalizing message')
+                        return
+                    }
+
+                    if (data.type === 'dual_response_complete') {
+                        console.log('🔥 DUAL RESPONSE COMPLETE RECEIVED:', data)
+
+                        // Check if this completion is for the current session
+                        if (data.session_id && data.session_id !== currentSessionIdRef.current) {
+                            console.log('🔥 IGNORING OLD COMPLETION: session', data.session_id, 'vs current', currentSessionIdRef.current)
+                            return
+                        }
+
+                        console.log('🔥 Session comparison - completion:', data.session_id, 'vs current:', currentSessionIdRef.current)
+
+                        // Force sync state with refs and finish
+                        console.log('🔥 DUAL RESPONSE COMPLETE DEBUG:')
+                        console.log('🔥   - localResponse state length:', localResponse.length)
+                        console.log('🔥   - localResponseRef length:', localResponseRef.current.length)
+                        console.log('🔥   - gptResponse state length:', gptResponse.length)
+                        console.log('🔥   - gptResponseRef length:', gptResponseRef.current.length)
+                        console.log('🔥   - localFinished before:', localFinished)
+                        console.log('🔥   - gptFinished before:', gptFinished)
+                        console.log('🔥   - backend reports local_finished:', data.local_finished)
+                        console.log('🔥   - backend reports gpt_finished:', data.gpt_finished)
+                        console.log('🔥   - session_id:', data.session_id)
+
+                        // Sync state with refs
+                        if (localResponseRef.current.length > 0 && localResponse.length === 0) {
+                            console.log('🔥   - Syncing localResponse state with ref')
+                            setLocalResponse(localResponseRef.current)
+                        }
+                        if (gptResponseRef.current.length > 0 && gptResponse.length === 0) {
+                            console.log('🔥   - Syncing gptResponse state with ref')
+                            setGptResponse(gptResponseRef.current)
+                        }
+
+                        // Force final state updates
+                        console.log('🔥   - Syncing localResponse state with ref')
+                        setLocalResponse(localResponseRef.current)
+
+                        console.log('🔥   - Syncing gptResponse state with ref')
+                        setGptResponse(gptResponseRef.current)
+
+                        // Force final state updates
+                        console.log('🔥   - Force setting localFinished to:', data.local_finished)
+                        setLocalFinished(data.local_finished)
+
+                        console.log('🔥   - Force setting gptFinished to:', data.gpt_finished)
+                        setGptFinished(data.gpt_finished)
+
+                        // End streaming and reset initialization flag
+                        console.log('🔥   - Set isStreaming to false')
+                        setIsStreaming(false)
+
+                        // IMPORTANT: Don't reset dualInitializedRef immediately to avoid race conditions
+                        // Let it reset naturally when the next session starts
+                        console.log('🔥   - Keeping dualInitializedRef.current as true for now')
+
+                        // CRITICAL FIX: Don't reset dualSessionId immediately! Keep it so the UI stays visible
+                        // The dualSessionId should only be reset when:
+                        // 1. A new dual response starts (with different session ID)
+                        // 2. User makes a selection and next response begins
+                        console.log('🔥   - KEEPING dualSessionId for user selection:', data.session_id)
+                        console.log('🔥   - UI should remain visible for user to select between responses')
+
+                        // Clean up session tracking to prevent memory leaks
+                        console.log('🔥   - Cleaning up session tracking for completed session:', data.session_id)
+                        initializedSessionsRef.current.delete(data.session_id)
+
+                        // DON'T reset dualSessionId or isDualResponse here - let the UI stay visible
+                        // The reset will happen when the user makes a selection or a new dual response starts
+
+                        console.log('🔥   - Dual response completion processing done - UI should stay visible')
+
+                        // Add a minimum display time to prevent immediate clearing
+                        console.log('🔥   - Setting 3-second minimum display time for dual response')
+                        setTimeout(() => {
+                            console.log('🔥   - Minimum display time expired - dual response can now be cleared by user selection')
+                        }, 3000)
+
+                        return
+                    }
 
                     // Handle MCP server response
                     if (data.type === 'mcp_servers_response') {
@@ -154,172 +523,26 @@ export default function useWebSocket({
                         return
                     }
 
-                    // Handle dual response start
-                    if (data.type === 'dual_response_start') {
-                        // CRITICAL: IMMEDIATELY hide any existing content before doing ANYTHING else
-                        isTransitioningRef.current = true; // Set ref synchronously
-                        setIsDualTransitioning(true); // Set state asynchronously
-                        console.log('🔥 DUAL RESPONSE START - CONTENT IMMEDIATELY HIDDEN')
+                    // Handle model selection response - reset dual state
+                    if (data.type === 'model_selection_response') {
+                        if (data.success) {
+                            console.log('🔥 MODEL SELECTION: User selected model, resetting dual state')
+                            console.log('🔥   - Selected model:', data.selected_model)
+                            console.log('🔥   - Resetting dualSessionId to 0')
+                            setDualSessionId(0)
+                            console.log('📊 setIsDualResponse(false) called from model_selection_response')
+                            console.log('📊 WHO CALLED?', new Error().stack)
+                            setIsDualResponse(false)
+                            setIsStreaming(false)
+                            dualInitializedRef.current = false
+                            setToolResultMessage(null) // Reset tool result message on model selection
 
-                        console.log('🔥 DUAL RESPONSE START DEBUG:')
-                        console.log('🔥 Previous state before clearing:')
-                        console.log('🔥   - dualSessionId:', dualSessionId)
-                        console.log('🔥   - isDualResponse:', isDualResponse)
-                        console.log('🔥   - localResponse length:', localResponse.length)
-                        console.log('🔥   - localResponse content:', localResponse.substring(0, 100) + '...')
-                        console.log('🔥   - gptResponse length:', gptResponse.length)
-                        console.log('🔥   - gptResponse content:', gptResponse.substring(0, 100) + '...')
-                        console.log('🔥   - localFinished:', localFinished)
-                        console.log('🔥   - gptFinished:', gptFinished)
-                        console.log('🔥   - localResponseRef.current length:', localResponseRef.current.length)
-                        console.log('🔥   - gptResponseRef.current length:', gptResponseRef.current.length)
-
-                        // Extract session ID from backend message
-                        const newSessionId = data.session_id || Date.now();
-                        console.log('🔥   - newSessionId from backend:', newSessionId)
-
-                        // CRITICAL: Update session ref IMMEDIATELY before any other updates
-                        currentSessionIdRef.current = newSessionId;
-                        console.log('🔥   - currentSessionIdRef.current set to:', currentSessionIdRef.current)
-
-                        // Clear refs immediately
-                        localResponseRef.current = '';
-                        gptResponseRef.current = '';
-                        console.log('🔥   - Refs cleared')
-
-                        // Then clear state with flushSync to force immediate update
-                        flushSync(() => {
-                            setIsDualResponse(true);
-                            setLocalResponse('');
-                            setGptResponse('');
-                            setLocalFinished(false);
-                            setGptFinished(false);
-                            setLocalModel(data.local_model || 'local');
-                            setGptModel(data.gpt_model || 'gpt-4.1');
-                            setIsStreaming(true);
-
-                            // Use session ID from backend and ensure state is updated
-                            const newSessionId = data.session_id || Date.now();
-                            console.log('🔥   - Setting dualSessionId: ', dualSessionId, ' -> ', newSessionId);
-                            setDualSessionId(newSessionId);
-                        });
-
-                        // Log state after flushSync to verify it was updated
-                        console.log('🔥 State after flushSync:')
-                        console.log('🔥   - isDualResponse should be true')
-                        console.log('🔥   - localResponse should be empty')
-                        console.log('🔥   - gptResponse should be empty')
-                        console.log('🔥   - dualSessionId should be updated to:', data.session_id)
-                        console.log('🔥   - currentSessionIdRef.current:', currentSessionIdRef.current)
-
-                        // End transition after a very short delay to ensure state is fully updated
-                        // This prevents old content from flashing before new chunks arrive
-                        setTimeout(() => {
-                            console.log('🔥   - Ending dual transition after timeout')
-                            isTransitioningRef.current = false; // Clear ref
-                            setIsDualTransitioning(false); // Clear state
-                        }, 50);
-
-                        return;
-                    }
-
-                    // Handle all dual response chunks first - BEFORE session validation for debugging
-                    if (data.type === 'dual_response_chunk') {
-                        console.log('🔥 RAW CHUNK RECEIVED:')
-                        console.log('🔥   - source:', data.source)
-                        console.log('🔥   - content:', data.choices?.[0]?.delta?.content)
-                        console.log('🔥   - finish_reason:', data.choices?.[0]?.finish_reason)
-                        console.log('🔥   - chunkSessionId:', data.session_id)
-                        console.log('🔥   - dualSessionId (state):', dualSessionId)
-                        console.log('🔥   - currentSessionIdRef.current:', currentSessionIdRef.current)
-
-                        // CRITICAL: Ignore chunks from old sessions to prevent flash of old content
-                        const chunkSessionId = data.session_id || 0;
-                        if (chunkSessionId !== currentSessionIdRef.current) {
-                            console.log('🔥 IGNORING OLD CHUNK: session', chunkSessionId, 'vs current', currentSessionIdRef.current);
-                            return;
+                            // Reset refs and force update
+                            dualSessionIdRef.current = 0
+                            isDualResponseRef.current = false
+                            forceUpdate()
                         }
-
-                        const content = data.choices[0].delta?.content
-                        console.log('🔥 PROCESSING CHUNK:')
-                        console.log('🔥   - source:', data.source)
-                        console.log('🔥   - content:', content)
-                        console.log('🔥   - finish_reason:', data.choices[0].finish_reason)
-
-                        if (data.source === 'local') {
-                            if (content) {
-                                // End transition on first content chunk to show new content immediately
-                                if (isDualTransitioning) {
-                                    console.log('🔥   - Ending transition on first LOCAL chunk')
-                                    isTransitioningRef.current = false; // Clear ref
-                                    setIsDualTransitioning(false); // Clear state
-                                }
-
-                                localResponseRef.current += content;
-                                console.log('🔥   - localResponseRef updated: ', localResponse.length, ' -> ', localResponseRef.current.length);
-                                console.log('🔥   - localResponseRef new content:', localResponseRef.current.substring(0, 200) + '...');
-                                setLocalResponse(localResponseRef.current);
-                            }
-                            if (data.choices[0].finish_reason) {
-                                console.log('🔥 LOCAL RESPONSE FINISHED with reason:', data.choices[0].finish_reason);
-                                console.log('🔥   - Setting localFinished to TRUE');
-                                setLocalFinished(true);
-                            }
-                        } else if (data.source === 'gpt') {
-                            if (content) {
-                                // End transition on first content chunk to show new content immediately
-                                if (isDualTransitioning) {
-                                    console.log('🔥   - Ending transition on first GPT chunk')
-                                    isTransitioningRef.current = false; // Clear ref
-                                    setIsDualTransitioning(false); // Clear state
-                                }
-
-                                gptResponseRef.current += content;
-                                console.log('🔥   - gptResponseRef updated: ', gptResponse.length, ' -> ', gptResponseRef.current.length);
-                                console.log('🔥   - gptResponseRef new content:', gptResponseRef.current.substring(0, 200) + '...');
-                                setGptResponse(gptResponseRef.current);
-                            }
-                            if (data.choices[0].finish_reason) {
-                                console.log('🔥 GPT RESPONSE FINISHED with reason:', data.choices[0].finish_reason);
-                                console.log('🔥   - Setting gptFinished to TRUE');
-                                setGptFinished(true);
-                            }
-                        }
-                        return;
-                    }
-
-                    // Handle dual response complete
-                    if (data.type === 'dual_response_complete') {
-                        // CRITICAL: Ignore completion messages from old sessions
-                        const completionSessionId = data.session_id || 0;
-                        if (completionSessionId !== currentSessionIdRef.current) {
-                            console.log('🔥 IGNORING OLD COMPLETION: session', completionSessionId, 'vs current', currentSessionIdRef.current);
-                            return;
-                        }
-
-                        console.log('🔥 DUAL RESPONSE COMPLETE DEBUG:')
-                        console.log('🔥   - localResponse final length:', localResponse.length)
-                        console.log('🔥   - gptResponse final length:', gptResponse.length)
-                        console.log('🔥   - localFinished before:', localFinished)
-                        console.log('🔥   - gptFinished before:', gptFinished)
-                        console.log('🔥   - backend reports local_finished:', data.local_finished)
-                        console.log('🔥   - backend reports gpt_finished:', data.gpt_finished)
-                        console.log('🔥   - session_id:', data.session_id)
-
-                        // Force set finished states based on backend completion
-                        if (data.local_finished !== undefined) {
-                            console.log('🔥   - Force setting localFinished to:', data.local_finished);
-                            setLocalFinished(data.local_finished);
-                        }
-                        if (data.gpt_finished !== undefined) {
-                            console.log('🔥   - Force setting gptFinished to:', data.gpt_finished);
-                            setGptFinished(data.gpt_finished);
-                        }
-
-                        setIsStreaming(false);
-                        console.log('🔥   - Set isStreaming to false')
-                        console.log('🔥   - Dual response completion processing done')
-                        return;
+                        return
                     }
 
                     // Handle streaming response (single model)
@@ -328,6 +551,16 @@ export default function useWebSocket({
                         const choice = streamData.choices[0]
 
                         if (choice.delta?.content) {
+                            // Reset dual state when single model streaming starts
+                            if (dualSessionId !== 0) {
+                                console.log('🔥 SINGLE MODEL: Resetting dual state for single model streaming')
+                                setDualSessionId(0)
+                                console.log('📊 setIsDualResponse(false) called from single model streaming')
+                                console.log('📊 WHO CALLED?', new Error().stack)
+                                setIsDualResponse(false)
+                                dualInitializedRef.current = false
+                            }
+
                             currentResponseRef.current += choice.delta.content
                             setCurrentResponse(currentResponseRef.current)
                             setIsStreaming(true)
@@ -381,7 +614,7 @@ export default function useWebSocket({
                                 {
                                     role: 'assistant',
                                     content: currentResponseRef.current,
-                                    timestamp: Date.now()
+                                    timestamp: new Date().toISOString()
                                 }
                             ])
 
@@ -389,6 +622,11 @@ export default function useWebSocket({
                             currentResponseRef.current = ''
                             // Keep currentResponse visible until user continues conversation
                         }
+                    }
+
+                    if (data.type === 'tool_result') {
+                        console.log('✅ Received tool result, adding to messages:', data.message)
+                        setToolResultMessage(data.message)
                     }
                 } catch (error) {
                     console.error('Error parsing WebSocket message:', error, 'Raw data:', event.data)
@@ -399,6 +637,7 @@ export default function useWebSocket({
             wsRef.current.onclose = (event) => {
                 setConnectionStatus(ConnectionStatus.DISCONNECTED)
                 setIsStreaming(false)
+                setToolResultMessage(null) // Reset tool result message on disconnect
                 console.log('WebSocket disconnected:', event.code, event.reason)
 
                 // Attempt to reconnect
@@ -435,6 +674,7 @@ export default function useWebSocket({
 
         setConnectionStatus(ConnectionStatus.DISCONNECTED)
         reconnectCountRef.current = 0
+        setToolResultMessage(null) // Reset tool result message on disconnect
     }, [])
 
     const sendMessage = useCallback((content: string, model = 'default', customMessages?: Message[], taskId?: string, isAutoResponse = false) => {
@@ -447,7 +687,7 @@ export default function useWebSocket({
         const userMessage: Message = {
             role: 'user',
             content,
-            timestamp: Date.now()
+            timestamp: new Date().toISOString()
         }
 
         // Use custom messages if provided, otherwise use stored messages
@@ -472,6 +712,7 @@ export default function useWebSocket({
         console.log(`🐛 [useWebSocket] Sending message request:`, request)
 
         // Send to WebSocket
+        console.log(`🔥 WEBSOCKET SEND: ${JSON.stringify(request).substring(0, 200)}...`)
         wsRef.current.send(JSON.stringify(request))
         currentResponseRef.current = ''
         setCurrentResponse('')
@@ -492,6 +733,7 @@ export default function useWebSocket({
 
     const clearDualResponse = useCallback(() => {
         console.log('🔥 CLEAR DUAL RESPONSE DEBUG:')
+        console.log('🔥 WHO CALLED ME?', new Error().stack)
         console.log('🔥 State before clearing:')
         console.log('🔥   - isDualResponse:', isDualResponse)
         console.log('🔥   - localResponse length:', localResponse.length)
@@ -503,16 +745,16 @@ export default function useWebSocket({
         console.log('🔥   - localResponseRef.current length:', localResponseRef.current.length)
         console.log('🔥   - gptResponseRef.current length:', gptResponseRef.current.length)
 
-        // Start transition
-        setIsDualTransitioning(true);
-
         // Clear refs immediately
         localResponseRef.current = '';
         gptResponseRef.current = '';
         currentSessionIdRef.current = 0; // Reset session ref too
+        dualInitializedRef.current = false; // Reset initialization flag
 
-        // End transition state
-        setIsDualTransitioning(false);
+        // Clear dual response refs
+        dualSessionIdRef.current = 0;
+        isDualResponseRef.current = false;
+        forceUpdate(); // Force re-render when refs are cleared
 
         // Clear state
         setIsDualResponse(false);
@@ -524,6 +766,7 @@ export default function useWebSocket({
         setLocalModel('');
         setGptModel('');
         setIsStreaming(false);
+        setToolResultMessage(null) // Reset tool result message on clearDualResponse
 
         console.log('🔥 State after clearing:')
         console.log('🔥   - isDualResponse:', false)
@@ -551,9 +794,10 @@ export default function useWebSocket({
         gptResponseRef.current = ''
         setLocalFinished(false)
         setGptFinished(false)
+        console.log('📊 setIsDualResponse(false) called from selectModel')
+        console.log('📊 WHO CALLED?', new Error().stack)
         setIsDualResponse(false)
-        setIsDualTransitioning(true)
-        isTransitioningRef.current = true
+        // Remove isDualTransitioning logic - it was causing the UI to be hidden
 
         const request = {
             type: 'model_selection',
@@ -568,18 +812,19 @@ export default function useWebSocket({
         console.log(`🐛 [useWebSocket] Sending model selection request:`, request)
 
         return new Promise((resolve, reject) => {
-            const originalOnMessage = wsRef.current?.onmessage
+            console.log(`🔥 WEBSOCKET SEND (selectModel): ${JSON.stringify(request).substring(0, 200)}...`)
 
-            const handleResponse = (event: MessageEvent) => {
+            // Create a one-time listener for the model selection response
+            const handleModelSelectionResponse = (event: MessageEvent) => {
                 try {
                     const data = JSON.parse(event.data)
-                    console.log(`🐛 [useWebSocket] Received response in selectModel:`, data.type)
+                    console.log(`🐛 [useWebSocket] Received message in selectModel:`, data.type)
 
                     if (data.type === 'model_selection_response') {
                         console.log(`🐛 [useWebSocket] Model selection response received, success=${data.success}`)
-                        // Restore original handler
-                        if (wsRef.current && originalOnMessage) {
-                            wsRef.current.onmessage = originalOnMessage
+                        // Remove this listener
+                        if (wsRef.current) {
+                            wsRef.current.removeEventListener('message', handleModelSelectionResponse)
                         }
                         resolve(data)
                         return
@@ -587,29 +832,29 @@ export default function useWebSocket({
                 } catch (error) {
                     console.error('🐛 [useWebSocket] Error parsing selectModel response:', error)
                 }
-
-                // Pass other messages to original handler
-                if (originalOnMessage) {
-                    originalOnMessage(event)
-                }
             }
 
-            // Set temporary handler
+            // Add the listener
             if (wsRef.current) {
-                wsRef.current.onmessage = handleResponse
+                wsRef.current.addEventListener('message', handleModelSelectionResponse)
             }
 
             // Send the request
-            wsRef.current.send(JSON.stringify(request))
-            console.log(`🐛 [useWebSocket] Model selection request sent`)
+            if (wsRef.current) {
+                wsRef.current.send(JSON.stringify(request))
+                console.log(`🐛 [useWebSocket] Model selection request sent`)
+            } else {
+                reject(new Error('WebSocket not connected for model selection'))
+                return
+            }
 
             // Set timeout for response
             setTimeout(() => {
-                if (wsRef.current && originalOnMessage) {
-                    wsRef.current.onmessage = originalOnMessage
+                if (wsRef.current) {
+                    wsRef.current.removeEventListener('message', handleModelSelectionResponse)
                 }
                 reject(new Error('Model selection timeout'))
-            }, 5000)
+            }, 10000) // Increased timeout to 10 seconds
         })
     }, [localModel, gptModel])
 
@@ -739,7 +984,7 @@ export default function useWebSocket({
         }
 
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-            console.error('🐛 [useWebSocket] WebSocket not connected for task retrieval after waiting')
+            console.error('�� [useWebSocket] WebSocket not connected for task retrieval after waiting')
             return null
         }
 
@@ -969,7 +1214,8 @@ export default function useWebSocket({
         })
     }, [connectionStatus])
 
-    return {
+    // DEBUG: Log the return values to verify refs are working
+    const returnValues = {
         connectionStatus,
         messages,
         currentResponse,
@@ -978,17 +1224,17 @@ export default function useWebSocket({
         loadingMcpServers,
         mcpServerActions,
         loadingMcpServerActions,
-        // Dual response state
-        isDualResponse: isDualResponse && !isDualTransitioning, // Hide during transition
+        // Dual response state - USE REFS for reliable values
+        isDualResponse: isDualResponseRef.current, // Use ref value directly - no transition hiding
         isDualTransitioning,
-        isTransitioningRef, // Add ref for immediate transition checking
         localResponse,
         gptResponse,
         localModel,
         gptModel,
         localFinished,
         gptFinished,
-        dualSessionId,
+        dualSessionId: dualSessionIdRef.current, // Use ref value instead of broken state
+        currentSessionIdRef,
         connect,
         disconnect,
         sendMessage,
@@ -1003,6 +1249,28 @@ export default function useWebSocket({
         sendLearningFeedback,
         executeMcpAction,
         executeToolAndContinue,
-        sendCorrectionWithExecution
+        sendCorrectionWithExecution,
+        // CRITICAL: Include forceUpdateCounter to ensure re-renders happen
+        _forceUpdateCounter: forceUpdateCounter,
+        toolResultMessage
     }
+
+    // DEBUG: Log when dual response values change
+    if (isDualResponseRef.current || dualSessionIdRef.current !== 0) {
+        console.log('🚀 RETURN VALUES DEBUG:')
+        console.log('🚀   - forceUpdateCounter:', forceUpdateCounter)
+        console.log('🚀   - isDualResponseRef.current:', isDualResponseRef.current)
+        console.log('🚀   - dualSessionIdRef.current:', dualSessionIdRef.current)
+        console.log('🚀   - isDualTransitioning:', isDualTransitioning)
+        console.log('🚀   - isDualResponse calculation:', isDualResponseRef.current && !isDualTransitioning)
+        console.log('🚀   - isDualResponse (returned):', returnValues.isDualResponse)
+        console.log('🚀   - dualSessionId (returned):', returnValues.dualSessionId)
+        console.log('🚀   - localResponse length:', returnValues.localResponse.length)
+        console.log('🚀   - gptResponse length:', returnValues.gptResponse.length)
+        console.log('🚀   - localFinished:', returnValues.localFinished)
+        console.log('🚀   - gptFinished:', returnValues.gptFinished)
+        console.log('🚀   - toolResultMessage:', returnValues.toolResultMessage)
+    }
+
+    return returnValues
 } 

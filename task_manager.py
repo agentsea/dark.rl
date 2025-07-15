@@ -30,7 +30,8 @@ class TaskManager:
                     mcp_servers TEXT DEFAULT '[]',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT DEFAULT 'active'
+                    status TEXT DEFAULT 'active',
+                    current_state TEXT DEFAULT 'idle'
                 )
             """)
             
@@ -67,6 +68,22 @@ class TaskManager:
                     preferred_model TEXT NOT NULL,  -- 'local' or 'gpt'
                     local_model_name TEXT,
                     gpt_model_name TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (task_id) REFERENCES tasks (id)
+                )
+            """)
+
+            # New table for storing pending dual responses
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_dual_responses (
+                    task_id TEXT PRIMARY KEY,
+                    local_response TEXT NOT NULL,
+                    gpt_response TEXT NOT NULL,
+                    local_model TEXT,
+                    gpt_model TEXT,
+                    local_finished BOOLEAN DEFAULT 0,
+                    gpt_finished BOOLEAN DEFAULT 0,
+                    session_id INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (task_id) REFERENCES tasks (id)
                 )
@@ -282,4 +299,98 @@ class TaskManager:
                     ORDER BY created_at DESC
                 """)
             
-            return [dict(row) for row in cursor.fetchall()] 
+            return [dict(row) for row in cursor.fetchall()]
+
+    # New methods for simplified state management
+    def get_task_state(self, task_id: str) -> str:
+        """Get current task state (idle, streaming_single, streaming_dual, awaiting_dual_selection)"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT current_state FROM tasks WHERE id = ?
+            """, (task_id,))
+            
+            row = cursor.fetchone()
+            return row[0] if row else 'idle'
+
+    def set_task_state(self, task_id: str, state: str) -> bool:
+        """Set current task state"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    UPDATE tasks SET current_state = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (state, task_id))
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"Error setting task state: {e}")
+            return False
+
+    def get_pending_dual_responses(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Get pending dual responses for a task"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT * FROM pending_dual_responses WHERE task_id = ?
+            """, (task_id,))
+            
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+
+    def set_pending_dual_responses(self, task_id: str, local_response: str, gpt_response: str, 
+                                 local_model: str = None, gpt_model: str = None, 
+                                 local_finished: bool = False, gpt_finished: bool = False,
+                                 session_id: int = None) -> bool:
+        """Save or update pending dual responses"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO pending_dual_responses 
+                    (task_id, local_response, gpt_response, local_model, gpt_model, 
+                     local_finished, gpt_finished, session_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (task_id, local_response, gpt_response, local_model, gpt_model, 
+                      local_finished, gpt_finished, session_id))
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"Error setting pending dual responses: {e}")
+            return False
+
+    def clear_pending_dual_responses(self, task_id: str) -> bool:
+        """Clear pending dual responses for a task"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    DELETE FROM pending_dual_responses WHERE task_id = ?
+                """, (task_id,))
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"Error clearing pending dual responses: {e}")
+            return False
+
+    def update_dual_response_progress(self, task_id: str, source: str, content: str, 
+                                    finished: bool = False) -> bool:
+        """Update dual response progress (for streaming)"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                if source == 'local':
+                    conn.execute("""
+                        UPDATE pending_dual_responses 
+                        SET local_response = ?, local_finished = ?
+                        WHERE task_id = ?
+                    """, (content, finished, task_id))
+                elif source == 'gpt':
+                    conn.execute("""
+                        UPDATE pending_dual_responses 
+                        SET gpt_response = ?, gpt_finished = ?
+                        WHERE task_id = ?
+                    """, (content, finished, task_id))
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"Error updating dual response progress: {e}")
+            return False 
