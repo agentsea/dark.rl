@@ -126,42 +126,44 @@ function ToolResponseDisplay({ content }: { content: string }): React.JSX.Elemen
 
 // Helper function to parse and render content with special tags
 function parseContent(content: string): React.JSX.Element {
-    const parts: React.JSX.Element[] = []
-    let currentIndex = 0
+    if (!content) return <></>;
+    const trimmedContent = content.trim();
+    const parts: React.JSX.Element[] = [];
+    let currentIndex = 0;
 
     // Find all <think>, <tool_call>, and <tool_response> tags
-    const thinkRegex = /<think>(.*?)<\/think>/gs
-    const toolCallRegex = /<tool_call>(.*?)<\/tool_call>/gs
-    const toolResponseRegex = /<tool_response>(.*?)<\/tool_response>/gs
+    const thinkRegex = /<think>(.*?)<\/think>/gs;
+    const toolCallRegex = /<tool_call>(.*?)<\/tool_call>/gs;
+    const toolResponseRegex = /<tool_response>(.*?)<\/tool_response>/gs;
 
     // Combine all patterns and find all matches with their positions
-    const allMatches: Array<{ match: RegExpExecArray; type: 'think' | 'tool_call' | 'tool_response' }> = []
+    const allMatches: Array<{ match: RegExpExecArray; type: 'think' | 'tool_call' | 'tool_response' }> = [];
 
-    let match
-    while ((match = thinkRegex.exec(content)) !== null) {
-        allMatches.push({ match, type: 'think' })
+    let match;
+    while ((match = thinkRegex.exec(trimmedContent)) !== null) {
+        allMatches.push({ match, type: 'think' });
     }
 
-    while ((match = toolCallRegex.exec(content)) !== null) {
-        allMatches.push({ match, type: 'tool_call' })
+    while ((match = toolCallRegex.exec(trimmedContent)) !== null) {
+        allMatches.push({ match, type: 'tool_call' });
     }
 
-    while ((match = toolResponseRegex.exec(content)) !== null) {
-        allMatches.push({ match, type: 'tool_response' })
+    while ((match = toolResponseRegex.exec(trimmedContent)) !== null) {
+        allMatches.push({ match, type: 'tool_response' });
     }
 
     // Sort matches by position
-    allMatches.sort((a, b) => a.match.index - b.match.index)
+    allMatches.sort((a, b) => a.match.index - b.match.index);
 
     // Process each match
     allMatches.forEach((matchObj, index) => {
-        const { match, type } = matchObj
+        const { match, type } = matchObj;
 
         // Add text before this match
         if (match.index > currentIndex) {
-            const beforeText = content.slice(currentIndex, match.index)
+            const beforeText = trimmedContent.slice(currentIndex, match.index);
             if (beforeText) {
-                parts.push(<span key={`text-${index}`}>{beforeText}</span>)
+                parts.push(<span key={`text-${index}`}>{beforeText}</span>);
             }
         }
 
@@ -170,19 +172,19 @@ function parseContent(content: string): React.JSX.Element {
             parts.push(
                 <div key={`think-${index}`} style={{
                     color: '#9CA3AF',
-                    fontSize: '0.88rem',
+                    fontSize: '0.8rem', // Smaller font size
                     fontStyle: 'italic',
                     marginTop: '8px',
                     marginBottom: '8px',
                     paddingLeft: '16px',
                     borderLeft: '2px solid #4B5563'
                 }}>
-                    💭 {match[1]}
+                    💭 {match[1].trim()}
                 </div>
-            )
+            );
         } else if (type === 'tool_call') {
             try {
-                const toolCallData = JSON.parse(match[1])
+                const toolCallData = JSON.parse(match[1].trim());
                 parts.push(
                     <div key={`tool-${index}`} style={{
                         backgroundColor: 'rgba(97, 253, 252, 0.1)',
@@ -207,7 +209,7 @@ function parseContent(content: string): React.JSX.Element {
                             {JSON.stringify(toolCallData, null, 2)}
                         </pre>
                     </div>
-                )
+                );
             } catch (e) {
                 // If JSON parsing fails, show raw content
                 parts.push(
@@ -228,7 +230,7 @@ function parseContent(content: string): React.JSX.Element {
                             {match[1]}
                         </div>
                     </div>
-                )
+                );
             }
         } else if (type === 'tool_response') {
             // Use the same ToolResponseDisplay component for tool responses
@@ -236,26 +238,26 @@ function parseContent(content: string): React.JSX.Element {
                 <div key={`tool-response-${index}`} style={{ marginTop: '8px', marginBottom: '8px' }}>
                     <ToolResponseDisplay content={match[1]} />
                 </div>
-            )
+            );
         }
 
-        currentIndex = match.index + match[0].length
-    })
+        currentIndex = match.index + match[0].length;
+    });
 
     // Add any remaining text after the last match
-    if (currentIndex < content.length) {
-        const remainingText = content.slice(currentIndex)
+    if (currentIndex < trimmedContent.length) {
+        const remainingText = trimmedContent.slice(currentIndex);
         if (remainingText) {
-            parts.push(<span key="remaining">{remainingText}</span>)
+            parts.push(<span key="remaining">{remainingText}</span>);
         }
     }
 
     // If no special tags found, return the original content
     if (parts.length === 0) {
-        return <span>{content}</span>
+        return <span>{trimmedContent}</span>;
     }
 
-    return <>{parts}</>
+    return <>{parts}</>;
 }
 
 function TaskPage() {
@@ -268,6 +270,7 @@ function TaskPage() {
     const [error, setError] = useState<string | null>(null)
     const [userInput, setUserInput] = useState('')
     const bottomRef = useRef<HTMLDivElement>(null)
+    const lastToolResultTimestamp = useRef<string | null>(null)
 
     // Auto-scroll to bottom function
     const scrollToBottom = () => {
@@ -505,7 +508,9 @@ function TaskPage() {
 
     // Effect to handle seamless tool result updates
     useEffect(() => {
-        if (toolResultMessage && task) {
+        if (toolResultMessage && task && toolResultMessage.timestamp && lastToolResultTimestamp.current !== toolResultMessage.timestamp) {
+            lastToolResultTimestamp.current = toolResultMessage.timestamp
+
             const newToolMessage: TaskMessage = {
                 ...toolResultMessage,
                 timestamp: new Date(toolResultMessage.timestamp || Date.now()).toISOString()
@@ -639,21 +644,16 @@ function TaskPage() {
                                 {taskMessages.map((message, index) => (
                                     <div
                                         key={index}
-                                        className="text-base font-mono glow whitespace-pre-wrap leading-relaxed"
+                                        className="text-base font-mono whitespace-pre-wrap leading-relaxed"
                                         style={{ marginBottom: '40px' }}
                                     >
-                                        <div className={`mb-2 ${message.role === 'user' ? 'text-cyan-300' : 'text-green-300'}`}>
+                                        <div className="mb-2 text-cyan-300 glow">
                                             {message.role === 'user' ? 'User' : 'Assistant'}
                                         </div>
-                                        <div className="border-l ml-2" style={{
-                                            paddingLeft: '20px',
-                                            fontWeight: '300',
-                                            color: '#E5E7EB',
-                                            fontSize: '0.9rem',
-                                            borderLeftColor: '#61FDFC',
-                                            borderLeftWidth: '2px'
-                                        }}>
-                                            {parseContent(message.content)}
+                                        <div className="border-l ml-2" style={{ paddingLeft: '20px', borderLeftColor: '#61FDFC', borderLeftWidth: '2px' }}>
+                                            <div className="text-sm whitespace-pre-wrap overflow-x-auto crisp-text" style={{ color: '#61FDFC' }}>
+                                                {parseContent(message.content)}
+                                            </div>
                                         </div>
                                     </div>
                                 ))}
@@ -670,14 +670,14 @@ function TaskPage() {
                             animate={{ opacity: 1, y: 0 }}
                             transition={{ duration: 0.5 }}
                         >
-                            <div className="text-green-300 mb-4">
+                            <div className="text-green-300 mb-4" style={{ marginBottom: '20px' }}>
                                 {localFinished && gptFinished ? 'Choose the better response:' : 'Generating dual responses...'}
                             </div>
 
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                 {/* Local Model Response */}
                                 <div
-                                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${localFinished ? 'border-green-400 hover:border-green-300' : 'border-gray-600'
+                                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${localFinished ? 'border-[#61FDFC] hover:shadow-[0_0_25px_rgba(97,253,252,0.6)]' : 'border-gray-600'
                                         }`}
                                     onClick={() => {
                                         if (localFinished && gptFinished) {
@@ -685,28 +685,17 @@ function TaskPage() {
                                         }
                                     }}
                                 >
-                                    <div className="flex items-center justify-between mb-2">
-                                        <span className="text-sm font-medium text-green-400">
-                                            Local Model
-                                        </span>
-                                        {localFinished && gptFinished && (
-                                            <span className="text-xs text-green-300">✅ Click to Use</span>
-                                        )}
+                                    <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
+                                        {parseContent(localResponse)}
                                         {!localFinished && (
-                                            <span className="text-xs text-gray-400">🔄 Generating...</span>
-                                        )}
-                                    </div>
-                                    <div className="text-sm text-gray-100 whitespace-pre-wrap">
-                                        {parseContent(localResponse || 'Generating...')}
-                                        {!localFinished && (
-                                            <span className="animate-pulse ml-2">▋</span>
+                                            <span className="blinking-cursor"></span>
                                         )}
                                     </div>
                                 </div>
 
                                 {/* GPT Model Response */}
                                 <div
-                                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${gptFinished ? 'border-blue-400 hover:border-blue-300' : 'border-gray-600'
+                                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${gptFinished ? 'border-[#61FDFC] hover:shadow-[0_0_25px_rgba(97,253,252,0.6)]' : 'border-gray-600'
                                         }`}
                                     onClick={() => {
                                         if (localFinished && gptFinished) {
@@ -714,21 +703,10 @@ function TaskPage() {
                                         }
                                     }}
                                 >
-                                    <div className="flex items-center justify-between mb-2">
-                                        <span className="text-sm font-medium text-blue-400">
-                                            GPT Model
-                                        </span>
-                                        {gptFinished && localFinished && (
-                                            <span className="text-xs text-blue-300">✅ Click to Use</span>
-                                        )}
+                                    <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
+                                        {parseContent(gptResponse)}
                                         {!gptFinished && (
-                                            <span className="text-xs text-gray-400">🔄 Generating...</span>
-                                        )}
-                                    </div>
-                                    <div className="text-sm text-gray-100 whitespace-pre-wrap">
-                                        {parseContent(gptResponse || 'Generating...')}
-                                        {!gptFinished && (
-                                            <span className="animate-pulse ml-2">▋</span>
+                                            <span className="blinking-cursor"></span>
                                         )}
                                     </div>
                                 </div>
@@ -745,14 +723,14 @@ function TaskPage() {
                             animate={{ opacity: 1, y: 0 }}
                             transition={{ duration: 0.5 }}
                         >
-                            <div className="text-green-300 mb-4">
+                            <div className="text-green-300 mb-4" style={{ marginBottom: '20px' }}>
                                 Choose the better response:
                             </div>
 
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                 {/* Local Model Response */}
                                 <div
-                                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${pendingDualResponses.local_finished ? 'border-green-400 hover:border-green-300' : 'border-gray-600'
+                                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${pendingDualResponses.local_finished ? 'border-[#61FDFC] hover:shadow-[0_0_25px_rgba(97,253,252,0.6)]' : 'border-gray-600'
                                         }`}
                                     onClick={() => {
                                         if (pendingDualResponses.local_finished) {
@@ -760,22 +738,14 @@ function TaskPage() {
                                         }
                                     }}
                                 >
-                                    <div className="flex items-center justify-between mb-2">
-                                        <span className="text-sm font-medium text-green-400">
-                                            {pendingDualResponses.local_model || 'Local Model'}
-                                        </span>
-                                        {pendingDualResponses.local_finished && (
-                                            <span className="text-xs text-green-300">✅ Click to Use</span>
-                                        )}
-                                    </div>
-                                    <div className="text-sm text-gray-100 whitespace-pre-wrap">
-                                        {parseContent(pendingDualResponses.local_response || 'Generating...')}
+                                    <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
+                                        {parseContent(pendingDualResponses.local_response)}
                                     </div>
                                 </div>
 
                                 {/* GPT Model Response */}
                                 <div
-                                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${pendingDualResponses.gpt_finished ? 'border-blue-400 hover:border-blue-300' : 'border-gray-600'
+                                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${pendingDualResponses.gpt_finished ? 'border-[#61FDFC] hover:shadow-[0_0_25px_rgba(97,253,252,0.6)]' : 'border-gray-600'
                                         }`}
                                     onClick={() => {
                                         if (pendingDualResponses.gpt_finished) {
@@ -783,16 +753,8 @@ function TaskPage() {
                                         }
                                     }}
                                 >
-                                    <div className="flex items-center justify-between mb-2">
-                                        <span className="text-sm font-medium text-blue-400">
-                                            {pendingDualResponses.gpt_model || 'GPT Model'}
-                                        </span>
-                                        {pendingDualResponses.gpt_finished && (
-                                            <span className="text-xs text-blue-300">✅ Click to Use</span>
-                                        )}
-                                    </div>
-                                    <div className="text-sm text-gray-100 whitespace-pre-wrap">
-                                        {parseContent(pendingDualResponses.gpt_response || 'Generating...')}
+                                    <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
+                                        {parseContent(pendingDualResponses.gpt_response)}
                                     </div>
                                 </div>
                             </div>
@@ -849,11 +811,11 @@ function TaskPage() {
             </div>
 
             {/* Sticky Input Box */}
-            <div className="sticky bottom-0 left-0 right-0 bg-black/50 backdrop-blur-sm p-4">
+            <div className="sticky left-0 right-0 bg-black/50 backdrop-blur-sm p-4" style={{ bottom: '2rem' }}>
                 <form
                     onSubmit={handleSubmit}
                     className="mx-auto"
-                    style={{ width: '800px', maxWidth: '90vw' }}
+                    style={{ maxWidth: '56rem' }}
                 >
                     <div className="relative">
                         <textarea

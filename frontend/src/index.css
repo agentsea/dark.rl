@@ -23,6 +23,19 @@ body {
     0 0 3px currentColor;
 }
 
+.crisp-text {
+  text-shadow: none;
+}
+
+.blinking-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 1rem;
+  background-color: #61FDFC;
+  margin-left: 4px;
+  animation: blink 1s step-end infinite;
+}
+
 /* Border glow effect for hover */
 .border-glow:hover {
   border-color: #61FDFC !important;
