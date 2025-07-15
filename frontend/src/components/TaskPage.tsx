@@ -1,6 +1,9 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react'
+import React, { useState, useEffect, useRef, useCallback, type CSSProperties } from 'react'
 import { motion } from 'framer-motion'
 import { useParams, useNavigate } from 'react-router-dom'
+import yaml from 'js-yaml'
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import TypingAnimation from './TypingAnimation'
 import MCPServerDropdown from './MCPServerDropdown'
 import CorrectionModal from './CorrectionModal'
@@ -43,6 +46,33 @@ function ToolResponseDisplay({ content }: { content: string }): React.JSX.Elemen
     try {
         const jsonData = JSON.parse(content)
         const isSuccess = jsonData.success === true
+        const yamlData = yaml.dump(jsonData)
+
+        const customStyle: { [key: string]: CSSProperties } = {
+            ...vscDarkPlus,
+            'pre[class*="language-"]': {
+                ...(vscDarkPlus['pre[class*="language-"]'] as CSSProperties),
+                backgroundColor: 'rgba(0, 0, 0, 0.3)',
+                border: '1px solid rgba(107, 114, 128, 0.3)',
+                borderRadius: '4px',
+                padding: '12px',
+                fontSize: '12px',
+                fontFamily: 'monospace',
+                color: '#E5E7EB',
+                overflowY: 'auto',
+                maxHeight: '400px'
+            },
+            'code[class*="language-"]': {
+                ...(vscDarkPlus['code[class*="language-"]'] as CSSProperties),
+                fontFamily: 'monospace',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-all' as any,
+            },
+            property: { ...(vscDarkPlus.property as CSSProperties), color: '#85a6fd' }, // Keys
+            string: { ...(vscDarkPlus.string as CSSProperties), color: '#a0e8a7' }, // String values
+            number: { ...(vscDarkPlus.number as CSSProperties), color: '#f08d8d' }, // Number values
+            boolean: { ...(vscDarkPlus.boolean as CSSProperties), color: '#f08d8d' } // Boolean values
+        }
 
         return (
             <div style={{
@@ -86,21 +116,14 @@ function ToolResponseDisplay({ content }: { content: string }): React.JSX.Elemen
                 {/* Expandable JSON content */}
                 {isExpanded && (
                     <div style={{ marginTop: '12px' }}>
-                        <pre style={{
-                            backgroundColor: 'rgba(0, 0, 0, 0.3)',
-                            border: '1px solid rgba(107, 114, 128, 0.3)',
-                            borderRadius: '4px',
-                            padding: '12px',
-                            fontSize: '12px',
-                            fontFamily: 'monospace',
-                            color: '#E5E7EB',
-                            whiteSpace: 'pre-wrap',
-                            wordBreak: 'break-word',
-                            overflow: 'auto',
-                            maxHeight: '400px'
-                        }}>
-                            {JSON.stringify(jsonData, null, 2)}
-                        </pre>
+                        <SyntaxHighlighter
+                            language="yaml"
+                            style={customStyle}
+                            wrapLines={true}
+                            wrapLongLines={true}
+                        >
+                            {yamlData}
+                        </SyntaxHighlighter>
                     </div>
                 )}
             </div>
@@ -186,7 +209,30 @@ function parseContent(content: string): React.JSX.Element {
             );
         } else if (type === 'tool_call') {
             try {
-                const toolCallData = JSON.parse(match[1].trim());
+                const toolCallData = JSON.parse(match[1].trim())
+                const yamlData = yaml.dump(toolCallData)
+                const customStyle: { [key: string]: CSSProperties } = {
+                    ...vscDarkPlus,
+                    'pre[class*="language-"]': {
+                        ...(vscDarkPlus['pre[class*="language-"]'] as CSSProperties),
+                        color: '#E5E7EB',
+                        fontSize: '0.85em',
+                        fontFamily: 'monospace',
+                        margin: 0,
+                        padding: 0,
+                        background: 'none',
+                    },
+                    'code[class*="language-"]': {
+                        ...(vscDarkPlus['code[class*="language-"]'] as CSSProperties),
+                        fontFamily: 'monospace',
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-all' as any,
+                    },
+                    property: { ...(vscDarkPlus.property as CSSProperties), color: '#85a6fd' }, // Keys
+                    string: { ...(vscDarkPlus.string as CSSProperties), color: '#a0e8a7' }, // String values
+                    number: { ...(vscDarkPlus.number as CSSProperties), color: '#f08d8d' }, // Number values
+                    boolean: { ...(vscDarkPlus.boolean as CSSProperties), color: '#f08d8d' } // Boolean values
+                }
                 parts.push(
                     <div key={`tool-${index}`} style={{
                         backgroundColor: 'rgba(97, 253, 252, 0.1)',
@@ -201,15 +247,14 @@ function parseContent(content: string): React.JSX.Element {
                         <div style={{ color: '#61FDFC', fontWeight: 'bold', marginBottom: '4px' }}>
                             🔧 Tool Call
                         </div>
-                        <pre style={{
-                            color: '#E5E7EB',
-                            fontSize: '0.85em',
-                            fontFamily: 'monospace',
-                            whiteSpace: 'pre-wrap',
-                            margin: 0
-                        }}>
-                            {JSON.stringify(toolCallData, null, 2)}
-                        </pre>
+                        <SyntaxHighlighter
+                            language="yaml"
+                            style={customStyle}
+                            wrapLines={true}
+                            wrapLongLines={true}
+                        >
+                            {yamlData}
+                        </SyntaxHighlighter>
                     </div>
                 );
             } catch (e) {
@@ -694,7 +739,7 @@ function TaskPage() {
                             transition={{ duration: 0.5 }}
                         >
                             <div className="text-green-300 mb-4" style={{ marginBottom: '20px' }}>
-                                {localFinished && gptFinished ? 'Choose the better response:' : 'Generating dual responses...'}
+                                {localFinished && gptFinished ? 'Choose the better action:' : 'Generating dual actions...'}
                             </div>
 
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
