@@ -6,6 +6,8 @@ import MCPServerDropdown from './MCPServerDropdown'
 import CorrectionModal from './CorrectionModal'
 import useWebSocket, { ConnectionStatus } from '../hooks/useWebSocket'
 import type { Message } from '../hooks/useWebSocket'
+import ToolCallModal from './ToolCallModal'
+import PencilIcon from './PencilIcon'
 
 interface Task {
     id: string
@@ -266,6 +268,8 @@ function TaskPage() {
     const [task, setTask] = useState<Task | null>(null)
     const [taskMessages, setTaskMessages] = useState<TaskMessage[]>([])
     const [pendingDualResponses, setPendingDualResponses] = useState<PendingDualResponse | null>(null)
+    const [editingResponse, setEditingResponse] = useState<{ type: 'local' | 'gpt' } | null>(null)
+    const [editedContent, setEditedContent] = useState<string>('')
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState<string | null>(null)
     const [userInput, setUserInput] = useState('')
@@ -328,6 +332,18 @@ function TaskPage() {
 
         // Reset input
         setUserInput('')
+    }
+
+    const handleSaveEditedResponse = async (newContent: string) => {
+        if (!editingResponse) return
+
+        if (editingResponse.type === 'local') {
+            await handleModelSelection('local', newContent)
+        } else {
+            await handleModelSelection('gpt', newContent)
+        }
+
+        setEditingResponse(null)
     }
 
 
@@ -475,11 +491,18 @@ function TaskPage() {
     }, [loadTask])
 
     // Handle model selection - let backend handle the complete flow
-    const handleModelSelection = async (selectedModel: 'local' | 'gpt') => {
+    const handleModelSelection = async (selectedModel: 'local' | 'gpt', editedContent?: string) => {
         if (!id || !task) return
 
         try {
-            const selectedContent = selectedModel === 'local' ? localResponse : gptResponse
+            let selectedContent: string;
+
+            if (editedContent) {
+                selectedContent = editedContent;
+            } else {
+                selectedContent = selectedModel === 'local' ? localResponse : gptResponse
+            }
+
             const selectedResponseMessage: Message = {
                 role: 'assistant',
                 content: selectedContent,
@@ -677,38 +700,110 @@ function TaskPage() {
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                 {/* Local Model Response */}
                                 <div
-                                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${localFinished ? 'border-[#61FDFC] hover:shadow-[0_0_25px_rgba(97,253,252,0.6)]' : 'border-gray-600'
+                                    className={`relative border rounded-lg p-4 cursor-pointer transition-all duration-300 ${localFinished ? 'border-[#61FDFC] hover:shadow-[0_0_25px_rgba(97,253,252,0.6)]' : 'border-gray-600'
                                         }`}
                                     onClick={() => {
-                                        if (localFinished && gptFinished) {
+                                        if (editingResponse?.type !== 'local' && localFinished && gptFinished) {
                                             handleModelSelection('local')
                                         }
                                     }}
                                 >
-                                    <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
-                                        {parseContent(localResponse)}
-                                        {!localFinished && (
-                                            <span className="blinking-cursor"></span>
-                                        )}
-                                    </div>
+                                    {editingResponse?.type === 'local' ? (
+                                        <div className="flex flex-col gap-2">
+                                            <textarea
+                                                value={editedContent}
+                                                onChange={(e) => setEditedContent(e.target.value)}
+                                                className="form-textarea w-full min-h-[150px] text-sm crisp-text bg-black/50"
+                                                onClick={(e) => e.stopPropagation()}
+                                            />
+                                            <div className="flex justify-end gap-2">
+                                                <button onClick={(e) => { e.stopPropagation(); setEditingResponse(null) }} className="btn text-xs">Cancel</button>
+                                                <button onClick={(e) => { e.stopPropagation(); handleModelSelection('local', editedContent); setEditingResponse(null) }} className="btn btn-primary text-xs">Save & Select</button>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px' }}>
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                                                <button
+                                                    onClick={(e) => {
+                                                        e.stopPropagation()
+                                                        setEditingResponse({ type: 'local' })
+                                                        setEditedContent(localResponse)
+                                                    }}
+                                                    style={{
+                                                        padding: '4px',
+                                                        borderRadius: '9999px',
+                                                        backgroundColor: 'rgba(97, 253, 252, 0.8)',
+                                                        border: 'none',
+                                                        cursor: 'pointer',
+                                                        lineHeight: 0,
+                                                    }}
+                                                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#61FDFC'}
+                                                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(97, 253, 252, 0.8)'}
+                                                >
+                                                    <PencilIcon style={{ width: '16px', height: '16px', color: 'black' }} />
+                                                </button>
+                                            </div>
+                                            <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
+                                                {parseContent(localResponse)}
+                                                {!localFinished && (<span className="blinking-cursor"></span>)}
+                                            </div>
+                                        </div>
+                                    )}
                                 </div>
 
                                 {/* GPT Model Response */}
                                 <div
-                                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${gptFinished ? 'border-[#61FDFC] hover:shadow-[0_0_25px_rgba(97,253,252,0.6)]' : 'border-gray-600'
+                                    className={`relative border rounded-lg p-4 cursor-pointer transition-all duration-300 ${gptFinished ? 'border-[#61FDFC] hover:shadow-[0_0_25px_rgba(97,253,252,0.6)]' : 'border-gray-600'
                                         }`}
                                     onClick={() => {
-                                        if (localFinished && gptFinished) {
+                                        if (editingResponse?.type !== 'gpt' && localFinished && gptFinished) {
                                             handleModelSelection('gpt')
                                         }
                                     }}
                                 >
-                                    <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
-                                        {parseContent(gptResponse)}
-                                        {!gptFinished && (
-                                            <span className="blinking-cursor"></span>
-                                        )}
-                                    </div>
+                                    {editingResponse?.type === 'gpt' ? (
+                                        <div className="flex flex-col gap-2">
+                                            <textarea
+                                                value={editedContent}
+                                                onChange={(e) => setEditedContent(e.target.value)}
+                                                className="form-textarea w-full min-h-[150px] text-sm crisp-text bg-black/50"
+                                                onClick={(e) => e.stopPropagation()}
+                                            />
+                                            <div className="flex justify-end gap-2">
+                                                <button onClick={(e) => { e.stopPropagation(); setEditingResponse(null) }} className="btn text-xs">Cancel</button>
+                                                <button onClick={(e) => { e.stopPropagation(); handleModelSelection('gpt', editedContent); setEditingResponse(null) }} className="btn btn-primary text-xs">Save & Select</button>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px' }}>
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                                                <button
+                                                    onClick={(e) => {
+                                                        e.stopPropagation()
+                                                        setEditingResponse({ type: 'gpt' })
+                                                        setEditedContent(gptResponse)
+                                                    }}
+                                                    style={{
+                                                        padding: '4px',
+                                                        borderRadius: '9999px',
+                                                        backgroundColor: 'rgba(97, 253, 252, 0.8)',
+                                                        border: 'none',
+                                                        cursor: 'pointer',
+                                                        lineHeight: 0,
+                                                    }}
+                                                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#61FDFC'}
+                                                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(97, 253, 252, 0.8)'}
+                                                >
+                                                    <PencilIcon style={{ width: '16px', height: '16px', color: 'black' }} />
+                                                </button>
+                                            </div>
+                                            <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
+                                                {parseContent(gptResponse)}
+                                                {!gptFinished && (<span className="blinking-cursor"></span>)}
+                                            </div>
+                                        </div>
+                                    )}
                                 </div>
                             </div>
                         </motion.div>
@@ -730,32 +825,108 @@ function TaskPage() {
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                 {/* Local Model Response */}
                                 <div
-                                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${pendingDualResponses.local_finished ? 'border-[#61FDFC] hover:shadow-[0_0_25px_rgba(97,253,252,0.6)]' : 'border-gray-600'
+                                    className={`relative border rounded-lg p-4 cursor-pointer transition-all duration-300 ${pendingDualResponses.local_finished ? 'border-[#61FDFC] hover:shadow-[0_0_25px_rgba(97,253,252,0.6)]' : 'border-gray-600'
                                         }`}
                                     onClick={() => {
-                                        if (pendingDualResponses.local_finished) {
+                                        if (editingResponse?.type !== 'local' && pendingDualResponses.local_finished) {
                                             handleModelSelection('local')
                                         }
                                     }}
                                 >
-                                    <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
-                                        {parseContent(pendingDualResponses.local_response)}
-                                    </div>
+                                    {editingResponse?.type === 'local' ? (
+                                        <div className="flex flex-col gap-2">
+                                            <textarea
+                                                value={editedContent}
+                                                onChange={(e) => setEditedContent(e.target.value)}
+                                                className="form-textarea w-full min-h-[150px] text-sm crisp-text bg-black/50"
+                                                onClick={(e) => e.stopPropagation()}
+                                            />
+                                            <div className="flex justify-end gap-2">
+                                                <button onClick={(e) => { e.stopPropagation(); setEditingResponse(null) }} className="btn text-xs">Cancel</button>
+                                                <button onClick={(e) => { e.stopPropagation(); handleModelSelection('local', editedContent); setEditingResponse(null) }} className="btn btn-primary text-xs">Save & Select</button>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px' }}>
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                                                <button
+                                                    onClick={(e) => {
+                                                        e.stopPropagation()
+                                                        setEditingResponse({ type: 'local' })
+                                                        setEditedContent(pendingDualResponses.local_response)
+                                                    }}
+                                                    style={{
+                                                        padding: '4px',
+                                                        borderRadius: '9999px',
+                                                        backgroundColor: 'rgba(97, 253, 252, 0.8)',
+                                                        border: 'none',
+                                                        cursor: 'pointer',
+                                                        lineHeight: 0,
+                                                    }}
+                                                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#61FDFC'}
+                                                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(97, 253, 252, 0.8)'}
+                                                >
+                                                    <PencilIcon style={{ width: '16px', height: '16px', color: 'black' }} />
+                                                </button>
+                                            </div>
+                                            <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
+                                                {parseContent(pendingDualResponses.local_response)}
+                                            </div>
+                                        </div>
+                                    )}
                                 </div>
 
                                 {/* GPT Model Response */}
                                 <div
-                                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-300 ${pendingDualResponses.gpt_finished ? 'border-[#61FDFC] hover:shadow-[0_0_25px_rgba(97,253,252,0.6)]' : 'border-gray-600'
+                                    className={`relative border rounded-lg p-4 cursor-pointer transition-all duration-300 ${pendingDualResponses.gpt_finished ? 'border-[#61FDFC] hover:shadow-[0_0_25px_rgba(97,253,252,0.6)]' : 'border-gray-600'
                                         }`}
                                     onClick={() => {
-                                        if (pendingDualResponses.gpt_finished) {
+                                        if (editingResponse?.type !== 'gpt' && pendingDualResponses.gpt_finished) {
                                             handleModelSelection('gpt')
                                         }
                                     }}
                                 >
-                                    <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
-                                        {parseContent(pendingDualResponses.gpt_response)}
-                                    </div>
+                                    {editingResponse?.type === 'gpt' ? (
+                                        <div className="flex flex-col gap-2">
+                                            <textarea
+                                                value={editedContent}
+                                                onChange={(e) => setEditedContent(e.target.value)}
+                                                className="form-textarea w-full min-h-[150px] text-sm crisp-text bg-black/50"
+                                                onClick={(e) => e.stopPropagation()}
+                                            />
+                                            <div className="flex justify-end gap-2">
+                                                <button onClick={(e) => { e.stopPropagation(); setEditingResponse(null) }} className="btn text-xs">Cancel</button>
+                                                <button onClick={(e) => { e.stopPropagation(); handleModelSelection('gpt', editedContent); setEditingResponse(null) }} className="btn btn-primary text-xs">Save & Select</button>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px' }}>
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                                                <button
+                                                    onClick={(e) => {
+                                                        e.stopPropagation()
+                                                        setEditingResponse({ type: 'gpt' })
+                                                        setEditedContent(pendingDualResponses.gpt_response)
+                                                    }}
+                                                    style={{
+                                                        padding: '4px',
+                                                        borderRadius: '9999px',
+                                                        backgroundColor: 'rgba(97, 253, 252, 0.8)',
+                                                        border: 'none',
+                                                        cursor: 'pointer',
+                                                        lineHeight: 0,
+                                                    }}
+                                                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#61FDFC'}
+                                                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(97, 253, 252, 0.8)'}
+                                                >
+                                                    <PencilIcon style={{ width: '16px', height: '16px', color: 'black' }} />
+                                                </button>
+                                            </div>
+                                            <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
+                                                {parseContent(pendingDualResponses.gpt_response)}
+                                            </div>
+                                        </div>
+                                    )}
                                 </div>
                             </div>
                         </motion.div>
