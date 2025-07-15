@@ -328,6 +328,7 @@ class DarkRLLLMServer:
             "local_model": f"{model} (with tools)",
             "gpt_model": "gpt-4.1 (reasoning only)",
             "session_id": session_id,
+            "task_id": task_id,
             "is_continuation": task_id is not None  # Flag continuation when we have a task_id
         }
         console.print(f"🔥 BACKEND: About to send dual_response_start: {json.dumps(dual_start)}")

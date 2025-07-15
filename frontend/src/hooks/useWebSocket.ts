@@ -1214,6 +1214,67 @@ export default function useWebSocket({
         })
     }, [connectionStatus])
 
+    const sendDualResponseComment = useCallback(async (
+        taskId: string,
+        messageIndex: number,
+        comment: string
+    ): Promise<any> => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            console.error('WebSocket not connected for dual response comment')
+            return null
+        }
+
+        return new Promise((resolve) => {
+            const request = {
+                type: 'dual_response_comment',
+                task_id: taskId,
+                message_index: messageIndex,
+                comment: comment
+            }
+
+            // Set up one-time listener for dual response comment response
+            const ws = wsRef.current!
+            const originalOnMessage = ws.onmessage
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data)
+
+                    if (data.type === 'dual_response_comment_processed') {
+                        // Restore original message handler
+                        if (wsRef.current) {
+                            wsRef.current.onmessage = originalOnMessage
+                        }
+                        resolve(data)
+                        return
+                    }
+
+                    if (data.type === 'error') {
+                        console.error('Dual response comment error:', data.error)
+                        if (wsRef.current) {
+                            wsRef.current.onmessage = originalOnMessage
+                        }
+                        resolve({ error: data.error })
+                        return
+                    }
+
+                    // Pass other messages to original handler
+                    if (originalOnMessage) {
+                        originalOnMessage.call(ws, event)
+                    }
+                } catch (error) {
+                    console.error('Error parsing dual response comment response:', error)
+                    if (wsRef.current) {
+                        wsRef.current.onmessage = originalOnMessage
+                    }
+                    resolve({ error: 'Failed to parse response' })
+                }
+            }
+
+            ws.send(JSON.stringify(request))
+        })
+    }, [connectionStatus])
+
     // DEBUG: Log the return values to verify refs are working
     const returnValues = {
         connectionStatus,
@@ -1250,6 +1311,7 @@ export default function useWebSocket({
         executeMcpAction,
         executeToolAndContinue,
         sendCorrectionWithExecution,
+        sendDualResponseComment,
         // CRITICAL: Include forceUpdateCounter to ensure re-renders happen
         _forceUpdateCounter: forceUpdateCounter,
         toolResultMessage

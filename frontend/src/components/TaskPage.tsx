@@ -19,6 +19,10 @@ interface Task {
     current_state: string
 }
 
+interface TaskMessage extends Message {
+    timestamp: string;
+}
+
 interface PendingDualResponse {
     task_id: string
     local_response: string
@@ -258,10 +262,11 @@ function TaskPage() {
     const { id } = useParams<{ id: string }>()
     const navigate = useNavigate()
     const [task, setTask] = useState<Task | null>(null)
-    const [taskMessages, setTaskMessages] = useState<Message[]>([])
+    const [taskMessages, setTaskMessages] = useState<TaskMessage[]>([])
     const [pendingDualResponses, setPendingDualResponses] = useState<PendingDualResponse | null>(null)
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState<string | null>(null)
+    const [userInput, setUserInput] = useState('')
     const bottomRef = useRef<HTMLDivElement>(null)
 
     // Auto-scroll to bottom function
@@ -285,13 +290,43 @@ function TaskPage() {
         sendLearningFeedback,
         sendCorrectionWithExecution,
         getTask,
-        selectModel
+        selectModel,
+        sendDualResponseComment,
+        clearDualResponse
     } = useWebSocket({
         url: 'ws://localhost:8000',
         autoConnect: true,
         reconnectAttempts: 3,
         reconnectInterval: 3000
     })
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault()
+        if (!userInput.trim() || !id || !task) return
+
+        if (isDualResponse) {
+            // If it's a dual response, treat this as a clarifying comment
+            await sendDualResponseComment(id, taskMessages.length, userInput)
+            clearDualResponse()
+        } else {
+            // Otherwise, it's a new user message in the conversation
+            sendMessage(userInput, task.model, [...taskMessages, { role: 'user', content: userInput, timestamp: new Date().toISOString() }], id, false)
+        }
+
+        // Add the message to the local state for immediate UI update
+        setTaskMessages(prev => [
+            ...prev,
+            {
+                role: 'user',
+                content: userInput,
+                timestamp: new Date().toISOString()
+            }
+        ])
+
+        // Reset input
+        setUserInput('')
+    }
+
 
     // Load task data from server using the useWebSocket hook
     const loadTask = useCallback(async () => {
@@ -449,7 +484,7 @@ function TaskPage() {
             }
 
             // Add the selected assistant message to the UI
-            setTaskMessages(prev => [...prev, selectedResponseMessage])
+            setTaskMessages(prev => [...prev, selectedResponseMessage as TaskMessage])
 
             // Show a processing state immediately
             setTask(prev => prev ? { ...prev, current_state: 'processing' } : null)
@@ -471,21 +506,28 @@ function TaskPage() {
     // Effect to handle seamless tool result updates
     useEffect(() => {
         if (toolResultMessage && task) {
+            const newToolMessage: TaskMessage = {
+                ...toolResultMessage,
+                timestamp: new Date(toolResultMessage.timestamp || Date.now()).toISOString()
+            }
+
             // Add the tool result to the message list
-            setTaskMessages(prev => [...prev, toolResultMessage])
+            setTaskMessages(prev => [...prev, newToolMessage])
+            setTask(prev => prev ? { ...prev, current_state: 'idle' } : null)
+
 
             const isAfterToolResponse = (
-                toolResultMessage.role === 'user' &&
-                toolResultMessage.content.includes('<tool_response>') &&
+                newToolMessage.role === 'user' &&
+                newToolMessage.content.includes('<tool_response>') &&
                 taskMessages[taskMessages.length - 1]?.role === 'assistant'
             )
 
             if (isAfterToolResponse) {
                 console.log('🚀 Auto-triggering AI response after seamless tool update')
                 sendMessage(
-                    toolResultMessage.content,
+                    newToolMessage.content,
                     task.model,
-                    [...taskMessages, toolResultMessage],
+                    [...taskMessages, newToolMessage] as Message[],
                     id,
                     true
                 )
@@ -804,6 +846,33 @@ function TaskPage() {
                     {/* Auto-scroll anchor */}
                     <div ref={bottomRef} />
                 </div>
+            </div>
+
+            {/* Sticky Input Box */}
+            <div className="sticky bottom-0 left-0 right-0 bg-black/50 backdrop-blur-sm p-4">
+                <form
+                    onSubmit={handleSubmit}
+                    className="mx-auto"
+                    style={{ width: '800px', maxWidth: '90vw' }}
+                >
+                    <div className="relative">
+                        <textarea
+                            value={userInput}
+                            onChange={(e) => setUserInput(e.target.value)}
+                            placeholder={isDualResponse ? "Not quite right? Add a comment to clarify..." : "Send a follow-up message..."}
+                            className="form-textarea min-h-[80px] w-full glow resize-none font-mono text-lg"
+                            onKeyPress={(e) => {
+                                if (e.key === 'Enter' && !e.shiftKey) {
+                                    e.preventDefault();
+                                    (e.target as HTMLTextAreaElement).closest('form')?.requestSubmit();
+                                }
+                            }}
+                        />
+                        <div className="absolute bottom-3 right-3 text-xs text-gray-600">
+                            Press Enter to send
+                        </div>
+                    </div>
+                </form>
             </div>
         </div>
     )
