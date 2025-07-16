@@ -19,10 +19,8 @@ interface CorrectionModalProps {
     onClose: () => void
     availableTools: Tool[]
     currentTaskId: string
-    messageIndex: number
     onSubmitCorrection: (
         taskId: string,
-        messageIndex: number,
         correctedToolCall: { name: string; arguments: Record<string, any> },
         thought: string,
         shouldExecute: boolean
@@ -34,10 +32,9 @@ export default function CorrectionModal({
     onClose,
     availableTools,
     currentTaskId,
-    messageIndex,
     onSubmitCorrection
 }: CorrectionModalProps) {
-    console.log('🔧 CorrectionModal render - isOpen:', isOpen, 'taskId:', currentTaskId, 'messageIndex:', messageIndex)
+    console.log('🔧 CorrectionModal render - isOpen:', isOpen, 'taskId:', currentTaskId)
     // Remove the repetitive logs about available tools count that show on every render
 
     const [selectedTool, setSelectedTool] = useState<string>('')
@@ -121,7 +118,6 @@ export default function CorrectionModal({
 
         console.log('📝 Submitting correction with:', {
             taskId: currentTaskId,
-            messageIndex,
             toolCall: { name: selectedTool, arguments: parameters },
             thought,
             shouldExecute: true
@@ -132,7 +128,6 @@ export default function CorrectionModal({
         try {
             const result = await onSubmitCorrection(
                 currentTaskId,
-                messageIndex,
                 { name: selectedTool, arguments: parameters },
                 thought,
                 true // Always execute after correction
@@ -140,12 +135,12 @@ export default function CorrectionModal({
 
             console.log('🔄 onSubmitCorrection result:', result)
 
-            if (result.success) {
+            if (result && result.success) {
                 console.log('✅ Correction submitted successfully!')
                 onClose()
             } else {
-                console.log('❌ Error submitting correction:', result.error)
-                alert(`Error: ${result.error || 'Unknown error'}`)
+                console.log('❌ Error submitting correction:', result?.error)
+                alert(`Error: ${result?.error || 'Unknown error'}`)
             }
         } catch (error) {
             console.log('❌ Exception submitting correction:', error)
@@ -228,13 +223,18 @@ export default function CorrectionModal({
                                 borderColor: 'rgba(107, 114, 128, 0.3)',
                                 color: '#9CA3AF'
                             }}
+                            disabled={availableTools.length === 0}
                         >
                             <option value="" style={{ backgroundColor: 'rgba(0, 0, 0, 0.9)', color: '#9CA3AF' }}>-- Select a tool --</option>
-                            {availableTools.map(tool => (
-                                <option key={tool.name} value={tool.name} style={{ backgroundColor: 'rgba(0, 0, 0, 0.9)', color: '#9CA3AF' }}>
-                                    {tool.name} - {tool.description}
-                                </option>
-                            ))}
+                            {availableTools.length > 0 ? (
+                                availableTools.map(tool => (
+                                    <option key={tool.name} value={tool.name} style={{ backgroundColor: 'rgba(0, 0, 0, 0.9)', color: '#9CA3AF' }}>
+                                        {tool.name} - {tool.description}
+                                    </option>
+                                ))
+                            ) : (
+                                <option disabled>No tools available for this server.</option>
+                            )}
                         </select>
                     </div>
 

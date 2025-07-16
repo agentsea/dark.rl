@@ -16,6 +16,7 @@ from typing import Dict, Any, List
 from pathlib import Path
 import openai
 import datetime
+import tiktoken
 
 # Rich imports for beautiful logging
 from rich.console import Console
@@ -43,6 +44,12 @@ logger = logging.getLogger(__name__)
 
 # Initialize Rich console for beautiful output
 console = Console()
+
+# Initialize tiktoken for token counting
+try:
+    tokenizer = tiktoken.get_encoding("cl100k_base")
+except:
+    tokenizer = tiktoken.get_encoding("gpt2")
 
 # Global LLM server instance (loaded at startup)
 global_llm_server = None
@@ -91,6 +98,7 @@ class DarkRLLLMServer:
         }
         self.current_model = None
         self.task_manager = TaskManager()
+        self.tokenizer = tokenizer # Add tokenizer to the instance
         
         # Initialize OpenAI client
         self.openai_client = None
@@ -1031,7 +1039,9 @@ class DarkRLLLMServer:
     
     async def initialize_model(self, model_key: str = "qwen3"):
         """Initialize the AsyncOnlineLLM with the specified model"""
+        logger.info(f"🐛 initialize_model called for '{model_key}'. Current model: '{self.current_model}', llm is None: {self.llm is None}")
         if self.llm is not None and self.current_model == model_key:
+            logger.info("✅ Model already loaded, skipping initialization.")
             return  # Model already loaded
         
         model_name = self.models.get(model_key, self.models["qwen3"])
@@ -1908,420 +1918,42 @@ class DarkRLLLMServer:
                 prompt = self.llm._messages_to_prompt(chat_messages)
                 stream_iterator = self.llm.stream(prompt, sampling_params=sampling_params)
             
-            # Handle both async generators and regular generators
-            if hasattr(stream_iterator, '__aiter__'):
-                logger.info("Processing async generator")
-                # Async generator
-                async for chunk in stream_iterator:
-                    # Check if websocket is still open
-                    if websocket.close_code is not None:
-                        logger.warning("WebSocket closed during streaming")
-                        break
-                    
-                    accumulated_response += chunk
-                    chunk_count += 1
-                    logger.debug(f"Processed chunk {chunk_count}: '{chunk}'")
-                    
-                    # Create OpenAI-compatible streaming response
-                    stream_chunk = {
-                        "choices": [{
-                            "delta": {
-                                "content": chunk
-                            },
-                            "finish_reason": None
-                        }]
-                    }
-                    
-                    try:
-                        await websocket.send(json.dumps(stream_chunk))
-                        # Small delay to make streaming visible
-                        await asyncio.sleep(0.02)
-                    except websockets.exceptions.ConnectionClosed:
-                        logger.warning("WebSocket connection closed while sending chunk")
-                        break
-                logger.info(f"Async generator completed with {chunk_count} chunks")
-            else:
-                logger.info("Processing regular generator")
-                # Regular generator - convert to async
-                for chunk in stream_iterator:
-                    # Check if websocket is still open
-                    if websocket.close_code is not None:
-                        logger.warning("WebSocket closed during streaming")
-                        break
-                    
-                    accumulated_response += chunk
-                    chunk_count += 1
-                    logger.debug(f"Processed chunk {chunk_count}: '{chunk}'")
-                    
-                    # Create OpenAI-compatible streaming response
-                    stream_chunk = {
-                        "choices": [{
-                            "delta": {
-                                "content": chunk
-                            },
-                            "finish_reason": None
-                        }]
-                    }
-                    
-                    try:
-                        await websocket.send(json.dumps(stream_chunk))
-                        # Small delay to make streaming visible
-                        await asyncio.sleep(0.02)
-                    except websockets.exceptions.ConnectionClosed:
-                        logger.warning("WebSocket connection closed while sending chunk")
-                        break
-                logger.info(f"Regular generator completed with {chunk_count} chunks")
+            # This is the critical fix: run the (potentially) blocking generator
+            # in a separate thread to avoid blocking the main asyncio event loop.
+            def blocking_stream_consumer():
+                try:
+                    return list(stream_iterator)
+                except Exception as e:
+                    logger.error(f"Error consuming stream in thread: {e}")
+                    return [f"[Streaming Error in thread: {e}]"]
+
+            all_chunks = await asyncio.to_thread(blocking_stream_consumer)
+            
+            # Now that we have all the chunks without blocking, stream them out.
+            for chunk in all_chunks:
+                if websocket.close_code is not None:
+                    logger.warning("WebSocket closed during action streaming")
+                    break
                 
-            # Send final chunk only if connection is still open
-            if websocket.close_code is None:
-                final_chunk = {
+                accumulated_response += chunk
+                chunk_count += 1
+                
+                # Stream chunk to client
+                stream_chunk = {
                     "choices": [{
-                        "delta": {},
-                        "finish_reason": "stop"
+                        "delta": {
+                            "content": chunk
+                        },
+                        "finish_reason": None
                     }]
                 }
                 
-                await websocket.send(json.dumps(final_chunk))
-                logger.info(f"Response completed. Total length: {len(accumulated_response)} characters, {chunk_count} chunks")
-                
-                # Save assistant response to database if task_id provided
-                if task_id and accumulated_response:
-                    self.task_manager.add_message(task_id, 'assistant', accumulated_response)
-                
-                console.print(Panel(
-                    f"💾 Saved chat response to task: {task_id}\n"
-                    f"📏 Length: {len(accumulated_response)} characters\n"
-                    f"📊 Total chunks: {chunk_count}",
-                    title="✅ CHAT STREAMING COMPLETED",
-                    style="bold green",
-                    border_style="green"
-                ))
-            else:
-                console.print(Panel(
-                    f"⚠️ Streaming stopped due to closed connection\n"
-                    f"📊 Sent {chunk_count} chunks before disconnect",
-                    title="🔌 CONNECTION CLOSED",
-                    style="bold yellow",
-                    border_style="yellow"
-                ))
-                
-        except Exception as stream_error:
-            console.print(Panel(
-                f"❌ Error in streaming loop: {str(stream_error)}",
-                title="🚨 STREAMING ERROR",
-                style="bold red",
-                border_style="red"
-            ))
-            if websocket.close_code is None:
-                # Try to send error response
                 try:
-                    error_chunk = {
-                        "choices": [{
-                            "delta": {
-                                "content": f"\n\n[Streaming Error: {str(stream_error)}]"
-                            },
-                            "finish_reason": "stop"
-                        }]
-                    }
-                    await websocket.send(json.dumps(error_chunk))
-                except:
-                    pass  # Connection might be closed
-            raise stream_error
-            
-    async def stream_action_response(self, websocket, messages: list, mentioned_servers: List[str], model: str, temperature: float, max_tokens: int, task_id: str = None):
-        """Stream action-based response using Qwen chat template with tools"""
-        
-        try:
-            # Build tools schema for mentioned servers
-            console.print(f"🔥 LOCAL_ACTION: Building tools schema for servers: {mentioned_servers}")
-            tools = await self.build_tools_schema(mentioned_servers)
-            console.print(f"🔥 LOCAL_ACTION: Built {len(tools)} tools")
-            
-            if not tools:
-                # No tools found, fall back to chat mode
-                logger.warning(f"No tools found for servers: {mentioned_servers}")
-                console.print(f"🔥 LOCAL_ACTION: No tools found, falling back to chat mode")
-                await self.stream_chat_response(websocket, messages, model, temperature, max_tokens, task_id)
-                return
-            
-            # Build Qwen chat messages with tools
-            console.print(f"🔥 LOCAL_ACTION: Building Qwen chat messages with tools...")
-            chat_messages = self.build_qwen_chat_messages(messages, tools)
-            console.print(f"🔥 LOCAL_ACTION: Built {len(chat_messages)} chat messages")
-            
-            console.print(Panel(
-                f"🛠️ Built Qwen chat with {len(tools)} tools\n"
-                f"🎯 Mentioned servers: {', '.join(mentioned_servers)}",
-                title="📋 TOOL MODE ACTIVATED",
-                style="bold cyan",
-                border_style="cyan"
-            ))
-            
-            # Create sampling parameters optimized for tool calling
-            sampling_params = SamplingParams(
-                temperature=max(0.3, min(temperature, 0.7)),  # Increase minimum temperature to prevent repetition
-                max_tokens=min(max_tokens, 600),  # More tokens for thinking + tool calls
-                n=1,
-                presence_penalty=0.1,  # Reduce presence penalty to prevent over-constraint
-                ignore_eos=False
-            )
-            
-            console.print(Panel(
-                f"🌡️ Temperature: {sampling_params.temperature}\n"
-                f"📏 Max tokens: {sampling_params.max_tokens}\n"
-                f"🔄 Presence penalty: {sampling_params.presence_penalty}",
-                title="⚙️ SAMPLING PARAMETERS",
-                style="dim",
-                border_style="dim"
-            ))
-            
-            # Stream the response using chat format
-            accumulated_response = ""
-            chunk_count = 0
-            
-            console.print(Panel(
-                "Starting model response generation...",
-                title="🚀 MODEL STREAMING STARTED",
-                style="bold green",
-                border_style="green"
-            ))
-            
-            # Use streaming - force it to use actual streaming
-            console.print(Panel(
-                "🔄 Attempting to use streaming interface...",
-                title="🚀 STREAMING SETUP",
-                style="bold cyan"
-            ))
-            
-            # Try chat_stream first
-            if hasattr(self.llm, 'chat_stream'):
-                console.print("✅ Using chat_stream interface")
-                
-                # Try to capture the final prompt that will be generated
-                if hasattr(self.llm, '_messages_to_prompt'):
-                    try:
-                        final_prompt = self.llm._messages_to_prompt(chat_messages)
-                        self._log_final_processed_prompt(final_prompt)
-                    except Exception as e:
-                        console.print(f"⚠️ Could not capture final prompt: {e}")
-                
-                import inspect
-                sig = inspect.signature(self.llm.chat_stream)
-                if 'sampling_params' in sig.parameters:
-                    stream_iterator = self.llm.chat_stream(chat_messages, sampling_params=sampling_params)
-                else:
-                    stream_iterator = self.llm.chat_stream(chat_messages)
-            else:
-                # Fallback to prompt-based streaming
-                console.print("⚠️ Falling back to prompt-based streaming")
-                prompt = self.llm._messages_to_prompt(chat_messages)
-                self._log_final_processed_prompt(prompt)
-                stream_iterator = self.llm.stream(prompt, sampling_params=sampling_params)
-            
-            # Check if the iterator is actually async
-            if hasattr(stream_iterator, '__aiter__'):
-                console.print("✅ Got async iterator for streaming")
-            else:
-                console.print("⚠️ Got sync iterator for streaming")
-            
-            # Handle streaming
-            if hasattr(stream_iterator, '__aiter__'):
-                console.print("🔄 Starting async streaming loop...")
-                chunk_number = 0
-                # Async generator
-                async for chunk in stream_iterator:
-                    chunk_number += 1
-                    if chunk_number <= 5:  # Log first few chunks
-                        console.print(f"📦 Chunk #{chunk_number}: '{chunk}' ({len(chunk)} chars)")
-                    elif chunk_number == 6:
-                        console.print("📦 ... (continuing to stream, will only log important events)")
-                    
-                    if websocket.close_code is not None:
-                        console.print("⚠️ WebSocket closed during action streaming")
-                        break
-                    
-                    accumulated_response += chunk
-                    chunk_count += 1
-                    
-                    # Check if we hit a tool call that needs user approval
-                    if ("<tool_call>" in accumulated_response and 
-                        "</tool_call>" in accumulated_response and
-                        chunk_count > 5):  # Make sure we have substantial content
-                        
-                        # Extract and display the tool call
-                        tool_call_match = accumulated_response.split('<tool_call>')[1].split('</tool_call>')[0]
-                        thinking_match = ""
-                        if "<think>" in accumulated_response and "</think>" in accumulated_response:
-                            thinking_match = accumulated_response.split('<think>')[1].split('</think>')[0]
-                        
-                        console.print(Panel(
-                            f"🧠 **AI Thinking:**\n{thinking_match}\n\n🛠️ **Tool Call:**\n{tool_call_match}" if thinking_match 
-                            else f"🛠️ **Tool Call:**\n{tool_call_match}",
-                            title="⏸️ TOOL CALL DETECTED - ENDING MESSAGE",
-                            style="bold yellow",
-                            border_style="yellow"
-                        ))
-                        
-                        # Stream current content and END the assistant message
-                        stream_chunk = {
-                            "choices": [{
-                                "delta": {
-                                    "content": chunk
-                                },
-                                "finish_reason": "stop"  # End the message here
-                            }]
-                        }
-                        
-                        try:
-                            await websocket.send(json.dumps(stream_chunk))
-                        except websockets.exceptions.ConnectionClosed:
-                            console.print(Panel(
-                                "WebSocket connection closed while sending tool call chunk",
-                                title="⚠️ CONNECTION CLOSED",
-                                style="bold red"
-                            ))
-                            break
-                        
-                        # Save the assistant message with tool call to task
-                        if task_id and accumulated_response:
-                            self.task_manager.add_message(task_id, 'assistant', accumulated_response)
-                            console.print(Panel(
-                                f"💾 Saved assistant message with tool call to task: {task_id}",
-                                title="📚 TASK UPDATED",
-                                style="bold cyan",
-                                border_style="cyan"
-                            ))
-                        
-                        # This will trigger the frontend to show the tool call modal
-                        # The streaming will resume when user approves via a separate endpoint
-                        return
-                    
-                    # Stream chunk to client
-                    stream_chunk = {
-                        "choices": [{
-                            "delta": {
-                                "content": chunk
-                            },
-                            "finish_reason": None
-                        }]
-                    }
-                    
-                    try:
-                        await websocket.send(json.dumps(stream_chunk))
-                        await asyncio.sleep(0.02)
-                    except websockets.exceptions.ConnectionClosed:
-                        console.print("⚠️ WebSocket connection closed while sending action chunk")
-                        break
-                
-                console.print(f"✅ Async streaming completed after {chunk_count} chunks")
-            else:
-                console.print("🔄 Starting sync streaming loop...")
-                chunk_number = 0
-                # Regular generator
-                for chunk in stream_iterator:
-                    chunk_number += 1
-                    if chunk_number <= 5:  # Log first few chunks
-                        console.print(f"📦 Sync Chunk #{chunk_number}: '{chunk}' ({len(chunk)} chars)")
-                    elif chunk_number == 6:
-                        console.print("📦 ... (continuing sync stream, will only log important events)")
-                    
-                    if websocket.close_code is not None:
-                        console.print("⚠️ WebSocket closed during action streaming")
-                        break
-                    
-                    accumulated_response += chunk
-                    chunk_count += 1
-                    
-                    # Check for repetitive content and stop if detected
-                    if len(accumulated_response) > 100:
-                        # Multiple checks for repetitive patterns (similar to garbage filtering)
-                        if (accumulated_response.count('"') > 50 or  # Too many quotes
-                            accumulated_response.count('</tool_call>') > 2 or  # Repeated closing tags
-                            accumulated_response.count('.com') > 15 or  # Repetitive domain patterns
-                            accumulated_response.count('://') > 10):  # Too many URLs
-                            console.print("🚫 Repetitive garbage content detected, stopping generation")
-                            stream_chunk = {
-                                "choices": [{
-                                    "delta": {},
-                                    "finish_reason": "stop"
-                                }]
-                            }
-                            try:
-                                await websocket.send(json.dumps(stream_chunk))
-                            except:
-                                pass
-                            break
-                        
-                        # Check for repeated short patterns
-                        last_100_chars = accumulated_response[-100:]
-                        if len(set(last_100_chars)) < 8:  # Too few unique characters  
-                            console.print("⚠️ Repetitive character patterns detected, stopping generation")
-                            stream_chunk = {
-                                "choices": [{
-                                    "delta": {},
-                                    "finish_reason": "stop"
-                                }]
-                            }
-                            try:
-                                await websocket.send(json.dumps(stream_chunk))
-                            except:
-                                pass
-                            break
-                    
-                    # Check if we hit a tool call that needs user approval
-                    if ("<tool_call>" in accumulated_response and 
-                        "</tool_call>" in accumulated_response and
-                        chunk_count > 5):  # Make sure we have substantial content
-                        
-                        console.print("⏸️ Tool call detected in sync stream, ending message")
-                        
-                        # Stream current content and END the assistant message
-                        stream_chunk = {
-                            "choices": [{
-                                "delta": {
-                                    "content": chunk
-                                },
-                                "finish_reason": "stop"  # End the message here
-                            }]
-                        }
-                        
-                        try:
-                            await websocket.send(json.dumps(stream_chunk))
-                        except websockets.exceptions.ConnectionClosed:
-                            console.print("⚠️ WebSocket connection closed while sending tool call chunk")
-                            break
-                        
-                        # Save the assistant message with tool call to task
-                        if task_id and accumulated_response:
-                            self.task_manager.add_message(task_id, 'assistant', accumulated_response)
-                            console.print(Panel(
-                                f"💾 Saved assistant message with tool call to task: {task_id}",
-                                title="📚 TASK UPDATED",
-                                style="bold cyan",
-                                border_style="cyan"
-                            ))
-                        
-                        # This will trigger the frontend to show the tool call modal
-                        return
-                    
-                    # Stream chunk to client
-                    stream_chunk = {
-                        "choices": [{
-                            "delta": {
-                                "content": chunk
-                            },
-                            "finish_reason": None
-                        }]
-                    }
-                    
-                    try:
-                        await websocket.send(json.dumps(stream_chunk))
-                        await asyncio.sleep(0.02)
-                    except websockets.exceptions.ConnectionClosed:
-                        console.print("⚠️ WebSocket connection closed while sending action chunk")
-                        break
-                
-                console.print(f"✅ Sync streaming completed after {chunk_count} chunks")
+                    await websocket.send(json.dumps(stream_chunk))
+                    await asyncio.sleep(0.02)
+                except websockets.exceptions.ConnectionClosed:
+                    logger.warning("WebSocket connection closed while sending action chunk")
+                    break
             
             # If we reach here, no tool call was detected, send final chunk
             if websocket.close_code is None:
@@ -2357,6 +1989,126 @@ class DarkRLLLMServer:
                         border_style="cyan"
                     ))
             
+        except Exception as stream_error:
+            console.print(Panel(
+                f"❌ Error in streaming loop: {str(stream_error)}",
+                title="🚨 STREAMING ERROR",
+                style="bold red",
+                border_style="red"
+            ))
+            if websocket.close_code is None:
+                # Try to send error response
+                try:
+                    error_chunk = {
+                        "choices": [{
+                            "delta": {
+                                "content": f"\n\n[Streaming Error: {str(stream_error)}]"
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    }
+                    await websocket.send(json.dumps(error_chunk))
+                except:
+                    pass  # Connection might be closed
+            raise stream_error
+            
+    async def stream_action_response(self, websocket, messages: list, mentioned_servers: List[str], model: str, temperature: float, max_tokens: int, task_id: str = None):
+        """Stream action-based response using Qwen chat template with tools, handling blocking generation."""
+        
+        session_id = int(time.time() * 1000)
+
+        try:
+            # Send the start message that the frontend expects.
+            await websocket.send(json.dumps({
+                "type": "dual_response_start",
+                "local_model": f"{model} (with tools)",
+                "gpt_model": "N/A",
+                "session_id": session_id,
+                "task_id": task_id
+            }))
+
+            # Build tools schema for mentioned servers.
+            tools = await self.build_tools_schema(mentioned_servers)
+            
+            if not tools:
+                logger.warning(f"No tools found for servers: {mentioned_servers}, falling back to chat mode.")
+                # We still need to send a completion for the dual response start message
+                await websocket.send(json.dumps({
+                    "type": "dual_response_complete", "local_finished": True, "gpt_finished": False, 
+                    "session_id": session_id, "task_id": task_id
+                }))
+                return
+
+            chat_messages = self.build_qwen_chat_messages(messages, tools)
+            
+            sampling_params = SamplingParams(
+                temperature=max(0.3, min(temperature, 0.7)),
+                max_tokens=min(max_tokens, 600),
+                n=1,
+                presence_penalty=0.1,
+                ignore_eos=False
+            )
+            
+            # Convert messages to a single prompt for the generate method.
+            prompt = self.llm._messages_to_prompt(chat_messages)
+            self._log_final_processed_prompt(prompt)
+
+            # This is the corrected, non-blocking call with keyword arguments.
+            console.print("🏃 Awaiting llm.generate...")
+            response_list = await self.llm.generate(
+                prompts=[prompt], 
+                sampling_params=sampling_params
+            )
+            accumulated_response = response_list[0] if response_list else ""
+            console.print(f"✅ Generation complete. Response length: {len(accumulated_response)}")
+            self._log_model_response(accumulated_response, "FINAL")
+
+            # Now that we have the full response, manually stream it out in chunks.
+            all_chunks = accumulated_response.split(' ')
+            for chunk in all_chunks:
+                if websocket.close_code is not None:
+                    logger.warning("WebSocket closed during action streaming")
+                    break
+                
+                chunk_to_send = chunk + " "
+                
+                stream_chunk = {
+                    "type": "dual_response_chunk",
+                    "source": "local",
+                    "model": f"{model} (with tools)",
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "choices": [{"delta": {"content": chunk_to_send}, "finish_reason": None}]
+                }
+                
+                try:
+                    await websocket.send(json.dumps(stream_chunk))
+                    await asyncio.sleep(0.02)
+                except websockets.exceptions.ConnectionClosed:
+                    logger.warning("WebSocket connection closed while sending action chunk")
+                    break
+            
+            # Send the completion message.
+            if websocket.close_code is None:
+                final_chunk = {
+                    "type": "dual_response_complete",
+                    "local_finished": True,
+                    "gpt_finished": False,
+                    "session_id": session_id,
+                    "task_id": task_id
+                }
+                await websocket.send(json.dumps(final_chunk))
+                
+                # Save the complete response to the task history.
+                if task_id and accumulated_response:
+                    self.task_manager.add_message(task_id, 'assistant', accumulated_response)
+                    console.print(Panel(
+                        f"💾 Saved tool response to task: {task_id}. Waiting for user action.",
+                        title="📚 TASK UPDATED",
+                        style="bold cyan",
+                        border_style="cyan"
+                    ))
+            
         except Exception as e:
             console.print(Panel(
                 f"❌ Error in action streaming: {str(e)}",
@@ -2370,10 +2122,12 @@ class DarkRLLLMServer:
             if websocket.close_code is None:
                 try:
                     error_chunk = {
+                        "type": "dual_response_chunk",
+                        "source": "local",
+                        "model": f"{model} (with tools)",
+                        "session_id": session_id,
                         "choices": [{
-                            "delta": {
-                                "content": f"\n\n[Action Error: {str(e)}]"
-                            },
+                            "delta": { "content": f"\n\n[Action Error: {str(e)}]" },
                             "finish_reason": "stop"
                         }]
                     }
@@ -2419,14 +2173,19 @@ class DarkRLLLMServer:
             for i, msg in enumerate(messages):
                 logger.info(f"🐛 Processing message {i}: {msg['role']} - {msg['content'][:100]}...")
                 
+                content = msg['content']
+                if len(content) > 1500: # General truncation for any very long message
+                    content = content[:1500] + "\n... [TRUNCATED DUE TO LENGTH]"
+                    logger.warning(f"⚠️ Truncated long message of role {msg['role']}. New length: {len(content)}")
+
                 # Skip obviously broken assistant messages (repetitive garbage)
                 if msg['role'] == 'assistant':
-                    content = msg['content']
+                    content_to_check = msg['content']
                     # Check for repetitive patterns that indicate garbage output
-                    if (content.count('"') > 20 or  # Too many quotes
-                        content.count('</tool_call>') > 2 or  # Repeated closing tags
-                        content.count('.com') > 10 or  # Repetitive domain patterns
-                        len(content) > 1000 and len(set(content.split())) < 10):  # Very repetitive words
+                    if (content_to_check.count('"') > 20 or  # Too many quotes
+                        content_to_check.count('</tool_call>') > 2 or  # Repeated closing tags
+                        content_to_check.count('.com') > 10 or  # Repetitive domain patterns
+                        len(content_to_check) > 1000 and len(set(content_to_check.split())) < 10):  # Very repetitive words
                         logger.warning(f"⚠️ Skipping garbage assistant message: {content[:100]}...")
                         continue
                 
@@ -2441,7 +2200,7 @@ class DarkRLLLMServer:
                     else:
                         # Legacy tool response - convert for backward compatibility
                         try:
-                            tool_result = json.loads(msg['content'])
+                            tool_result = json.loads(content)
                             if tool_result.get('success', True):
                                 content_str = str(tool_result.get('content', tool_result))
                                 if len(content_str) > 1000:
@@ -2450,7 +2209,7 @@ class DarkRLLLMServer:
                             else:
                                 context_msg = f"<tool_response>\nTool execution failed: {tool_result.get('error', 'Unknown error')}\n</tool_response>"
                         except:
-                            tool_content = msg['content'][:500] + "..." if len(msg['content']) > 500 else msg['content']
+                            tool_content = content[:500] + "..." if len(content) > 500 else content
                             context_msg = f"<tool_response>\n{tool_content}\n</tool_response>"
                         
                         message_history.append({
@@ -2462,9 +2221,17 @@ class DarkRLLLMServer:
                     # Include regular messages as-is
                     message_history.append({
                         'role': msg['role'],
-                        'content': msg['content']
+                        'content': content
                     })
                     logger.debug(f"➕ Added {msg['role']} message: {len(msg['content'])} chars")
+            
+            final_prompt_str = "".join([m["content"] for m in message_history])
+            
+            # If the context is too large, truncate to the last 2 messages for a minimal test case
+            if len(final_prompt_str) > 2000:
+                logger.warning(f"⚠️ Total token count ({len(final_prompt_str)}) is over 2000 chars. Truncating history to last 2 messages.")
+                message_history = message_history[-2:]
+                
             
             logger.info(f"🐛 Final message history has {len(message_history)} messages:")
             for i, msg in enumerate(message_history):
@@ -2564,7 +2331,12 @@ async def handle_client(websocket):
             style="bold yellow",
             border_style="yellow"
         ))
-    llm_server = DarkRLLLMServer()
+        llm_server = DarkRLLLMServer()
+    else:
+        # Log the state of the global server
+        logger.info(f"✅ Using global LLM server instance.")
+        logger.info(f"   - LLM object present: {llm_server.llm is not None}")
+        logger.info(f"   - Current model: {llm_server.current_model}")
     
     try:
         async for message in websocket:
@@ -3183,6 +2955,7 @@ async def handle_client(websocket):
                     try:
                         task_id = request.get('task_id', '')
                         selected_model = request.get('selected_model', '')  # 'local' or 'gpt'
+                        edited_content = request.get('edited_content')
                         
                         # NEW: Get the selected content directly from the request (streaming approach)
                         local_response = request.get('local_response', '')
@@ -3201,7 +2974,11 @@ async def handle_client(websocket):
                         ))
                         
                         # Get selected content from the request (not from database)
-                        selected_content = local_response if selected_model == 'local' else gpt_response
+                        if edited_content:
+                            selected_content = edited_content
+                            logger.info(f"📝 Using edited content for {selected_model}")
+                        else:
+                            selected_content = local_response if selected_model == 'local' else gpt_response
                         
                         if not selected_content:
                             error_response = {
@@ -3212,54 +2989,23 @@ async def handle_client(websocket):
                             await websocket.send(json.dumps(error_response))
                             continue
                         
-                        # Save the selected response to the task
-                        if task_id and selected_model and selected_content:
-                            llm_server.task_manager.add_message(task_id, 'assistant', selected_content)
-                            logger.info(f"💾 Saved selected {selected_model} response to task {task_id}")
-                            
-                            # Save user preference for analytics and learning
-                            try:
-                                # Get the last user message to associate with this preference
-                                task_data = llm_server.get_task(task_id)
-                                if task_data and not task_data.get('error'):
-                                    messages = task_data.get('messages', [])
-                                    user_prompt = ""
-                                    for msg in reversed(messages):
-                                        if msg['role'] == 'user':
-                                            user_prompt = msg['content']
-                                            break
-                                    
-                                    if user_prompt:
-                                        preference_id = llm_server.task_manager.save_response_preference(
-                                            task_id=task_id,
-                                            user_prompt=user_prompt,
-                                            local_response=local_response,
-                                            gpt_response=gpt_response, 
-                                            preferred_model=selected_model,
-                                            local_model_name=request.get('local_model_name', 'qwen3'),
-                                            gpt_model_name=request.get('gpt_model_name', 'gpt-4.1')
-                                        )
-                                        logger.info(f"📊 Saved response preference {preference_id}: user preferred {selected_model}")
-                            except Exception as e:
-                                logger.error(f"❌ Error saving response preference: {e}")
-                        
                         # Set task state to processing (not idle yet)
                         llm_server.task_manager.set_task_state(task_id, 'processing')
                         
-                        # ALWAYS add the selected response to the task messages first
-                        console.print(Panel(
-                            f"📝 Adding selected response to task messages\\n"
-                            f"🤖 Model: {selected_model}\\n"
-                            f"📊 Content length: {len(selected_content)} chars",
-                            title="💾 SAVING SELECTED RESPONSE",
-                            style="bold green",
-                            border_style="green"
-                        ))
+                        # Add the selected response to the task history
                         llm_server.task_manager.add_message(
-                            task_id, 
-                            'assistant', 
+                            task_id,
+                            'assistant',
                             selected_content
                         )
+
+                        # Send a task_updated message so the UI is immediately in sync
+                        updated_task_data = llm_server.get_task(task_id)
+                        await websocket.send(json.dumps({
+                            'type': 'task_updated',
+                            'task_id': task_id,
+                            'messages': updated_task_data.get('messages', [])
+                        }))
                         
                         # Send confirmation response
                         selection_response = {

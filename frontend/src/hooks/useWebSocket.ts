@@ -91,6 +91,7 @@ export default function useWebSocket({
     const [loadingMcpServers, setLoadingMcpServers] = useState(false)
     const [mcpServerActions, setMcpServerActions] = useState<Record<string, MCPServerAction[]>>({})
     const [loadingMcpServerActions, setLoadingMcpServerActions] = useState(false)
+    const [availableTools, setAvailableTools] = useState<MCPServerAction[]>([])
 
     // Dual response state
     const [isDualResponse, setIsDualResponse] = useState(false);
@@ -112,6 +113,9 @@ export default function useWebSocket({
 
     // Track which sessions we've already initialized to prevent multiple initializations
     const initializedSessionsRef = useRef(new Set<number>())
+
+    // State for task messages, to be managed by the hook
+    const [taskMessages, setTaskMessages] = useState<Message[]>([])
 
     // DEBUG: Track how many times the emergency fix is applied
     const emergencyFixCountRef = useRef<number>(0)
@@ -218,6 +222,38 @@ export default function useWebSocket({
                     // DEBUG: Log all message types to see what we're actually receiving
                     if (data.type !== 'dual_response_chunk') {
                         console.log('📬 NON-CHUNK MESSAGE:', data.type, 'session_id:', data.session_id)
+                    }
+
+                    // Handle task updates pushed from the server
+                    if (data.type === 'task_updated') {
+                        console.log('🔄 Received task_updated, updating messages...')
+                        setTaskMessages(data.messages)
+                        return
+                    }
+
+                    // Handle MCP server actions response
+                    if (data.type === 'mcp_server_actions_response') {
+                        const actionsResponse = data as MCPServerActionsResponse
+                        setMcpServerActions(prev => ({
+                            ...prev,
+                            [actionsResponse.server_id]: actionsResponse.actions
+                        }))
+
+                        // Also update a flat list of available tools for the correction modal
+                        setAvailableTools(prev => {
+                            const newActions = actionsResponse.actions.map(action => ({
+                                ...action,
+                                // Prepend server_id to name to make it unique
+                                name: `${actionsResponse.server_id}.${action.name}`
+                            }))
+                            // Avoid duplicates
+                            const existingNames = new Set(prev.map(a => a.name))
+                            const filteredNewActions = newActions.filter(a => !existingNames.has(a.name))
+                            return [...prev, ...filteredNewActions]
+                        })
+
+                        setLoadingMcpServerActions(false)
+                        return
                     }
 
                     // Log all message types we receive
@@ -512,17 +548,6 @@ export default function useWebSocket({
                         return
                     }
 
-                    // Handle MCP server actions response
-                    if (data.type === 'mcp_server_actions_response') {
-                        const actionsResponse = data as MCPServerActionsResponse
-                        setMcpServerActions(prev => ({
-                            ...prev,
-                            [actionsResponse.server_id]: actionsResponse.actions
-                        }))
-                        setLoadingMcpServerActions(false)
-                        return
-                    }
-
                     // Handle model selection response - reset dual state
                     if (data.type === 'model_selection_response') {
                         if (data.success) {
@@ -774,7 +799,7 @@ export default function useWebSocket({
         console.log('🔥   - gptResponseRef.current length:', gptResponseRef.current.length)
     }, [isDualResponse, localResponse.length, gptResponse.length, localModel, gptModel, localFinished, gptFinished, localResponseRef, gptResponseRef]);
 
-    const selectModel = useCallback(async (selectedModel: 'local' | 'gpt', taskId?: string) => {
+    const selectModel = useCallback(async (selectedModel: 'local' | 'gpt', taskId?: string, editedContent?: string) => {
         console.log(`🐛 [useWebSocket] selectModel called with model=${selectedModel}, taskId=${taskId}`)
 
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
@@ -783,21 +808,12 @@ export default function useWebSocket({
         }
 
         // 🔥 CRITICAL FIX: Capture current responses BEFORE clearing
-        const currentLocalResponse = localResponseRef.current
-        const currentGptResponse = gptResponseRef.current
+        const currentLocalResponse = editedContent && selectedModel === 'local' ? editedContent : localResponseRef.current
+        const currentGptResponse = editedContent && selectedModel === 'gpt' ? editedContent : gptResponseRef.current
 
         // 🔥 CRITICAL FIX: Clear content IMMEDIATELY when user selects to prevent flash
         console.log('🔥 IMMEDIATE CLEAR: Clearing all content before sending request')
-        setLocalResponse('')
-        setGptResponse('')
-        localResponseRef.current = ''
-        gptResponseRef.current = ''
-        setLocalFinished(false)
-        setGptFinished(false)
-        console.log('📊 setIsDualResponse(false) called from selectModel')
-        console.log('📊 WHO CALLED?', new Error().stack)
-        setIsDualResponse(false)
-        // Remove isDualTransitioning logic - it was causing the UI to be hidden
+        clearDualResponse()
 
         const request = {
             type: 'model_selection',
@@ -856,7 +872,7 @@ export default function useWebSocket({
                 reject(new Error('Model selection timeout'))
             }, 10000) // Increased timeout to 10 seconds
         })
-    }, [localModel, gptModel])
+    }, [localModel, gptModel, clearDualResponse])
 
     const getMcpServers = useCallback((query = '') => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
@@ -1011,6 +1027,8 @@ export default function useWebSocket({
                         if (wsRef.current) {
                             wsRef.current.onmessage = originalOnMessage
                         }
+                        // Also update the local task messages state
+                        setTaskMessages(data.messages || [])
                         resolve(data)
                         return
                     }
@@ -1151,7 +1169,6 @@ export default function useWebSocket({
 
     const sendCorrectionWithExecution = useCallback(async (
         taskId: string,
-        messageIndex: number,
         correctedToolCall: { name: string; arguments: Record<string, any> },
         thought: string,
         shouldExecute: boolean = false
@@ -1165,7 +1182,6 @@ export default function useWebSocket({
             const request = {
                 type: 'correction_with_execution',
                 task_id: taskId,
-                message_index: messageIndex,
                 corrected_tool_call: correctedToolCall,
                 thought: thought,
                 should_execute: shouldExecute
@@ -1279,12 +1295,14 @@ export default function useWebSocket({
     const returnValues = {
         connectionStatus,
         messages,
+        taskMessages, // Expose task messages
         currentResponse,
         isStreaming,
         mcpServers,
         loadingMcpServers,
         mcpServerActions,
         loadingMcpServerActions,
+        availableTools,
         // Dual response state - USE REFS for reliable values
         isDualResponse: isDualResponseRef.current, // Use ref value directly - no transition hiding
         isDualTransitioning,

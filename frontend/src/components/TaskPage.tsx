@@ -11,6 +11,7 @@ import useWebSocket, { ConnectionStatus } from '../hooks/useWebSocket'
 import type { Message } from '../hooks/useWebSocket'
 import ToolCallModal from './ToolCallModal'
 import PencilIcon from './PencilIcon'
+import CorrectIcon from './CorrectIcon'
 
 interface Task {
     id: string
@@ -311,7 +312,6 @@ function TaskPage() {
     const { id } = useParams<{ id: string }>()
     const navigate = useNavigate()
     const [task, setTask] = useState<Task | null>(null)
-    const [taskMessages, setTaskMessages] = useState<TaskMessage[]>([])
     const [pendingDualResponses, setPendingDualResponses] = useState<PendingDualResponse | null>(null)
     const [editingResponse, setEditingResponse] = useState<{ type: 'local' | 'gpt' } | null>(null)
     const [editedContent, setEditedContent] = useState<string>('')
@@ -320,6 +320,7 @@ function TaskPage() {
     const [userInput, setUserInput] = useState('')
     const bottomRef = useRef<HTMLDivElement>(null)
     const lastToolResultTimestamp = useRef<string | null>(null)
+    const [isCorrectionModalOpen, setIsCorrectionModalOpen] = useState(false)
 
     // Auto-scroll to bottom function
     const scrollToBottom = () => {
@@ -337,11 +338,14 @@ function TaskPage() {
         localFinished,
         gptFinished,
         toolResultMessage,
+        availableTools, // Get available tools from the hook
+        taskMessages, // Get task messages from the hook
         connect,
         sendMessage,
         sendLearningFeedback,
         sendCorrectionWithExecution,
         getTask,
+        getMcpServerActions, // Get the function to fetch actions
         selectModel,
         sendDualResponseComment,
         clearDualResponse
@@ -351,6 +355,35 @@ function TaskPage() {
         reconnectAttempts: 3,
         reconnectInterval: 3000
     })
+
+    const handleCorrectionSubmit = async (
+        taskId: string,
+        correctedToolCall: { name: string; arguments: Record<string, any> },
+        thought: string,
+        shouldExecute: boolean
+    ) => {
+        if (!task) return
+
+        try {
+            // This needs to be implemented in the useWebSocket hook
+            // For now, let's assume it exists and works.
+            console.log('Submitting correction:', { taskId, correctedToolCall, thought, shouldExecute })
+
+            // Hide dual response UI immediately
+            clearDualResponse()
+            setPendingDualResponses(null)
+
+            // The backend will stream the new response after correction
+            const result = await sendCorrectionWithExecution(taskId, correctedToolCall, thought, shouldExecute)
+
+            setIsCorrectionModalOpen(false)
+            return result
+        } catch (error) {
+            console.error('Error submitting correction:', error)
+            setError(error instanceof Error ? error.message : 'Failed to submit correction')
+            return { success: false, error: (error as Error).message }
+        }
+    }
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault()
@@ -366,6 +399,7 @@ function TaskPage() {
         }
 
         // Add the message to the local state for immediate UI update
+        /* This is now handled by the hook
         setTaskMessages(prev => [
             ...prev,
             {
@@ -374,20 +408,15 @@ function TaskPage() {
                 timestamp: new Date().toISOString()
             }
         ])
+        */
 
         // Reset input
         setUserInput('')
     }
 
-    const handleSaveEditedResponse = async (newContent: string) => {
+    const handleSaveEditedResponse = async (selectedModel: 'local' | 'gpt', newContent: string) => {
         if (!editingResponse) return
-
-        if (editingResponse.type === 'local') {
-            await handleModelSelection('local', newContent)
-        } else {
-            await handleModelSelection('gpt', newContent)
-        }
-
+        await handleModelSelection(selectedModel, newContent)
         setEditingResponse(null)
     }
 
@@ -408,8 +437,13 @@ function TaskPage() {
             if (taskData && !taskData.error) {
                 // Update state with server data
                 setTask(taskData.task)
-                setTaskMessages(taskData.messages || [])
+                // setTaskMessages(taskData.messages || []) // This is now handled by the hook
                 setPendingDualResponses(taskData.pending_dual)
+
+                // Fetch available tools for the correction modal
+                if (taskData.task?.mcp_servers?.length > 0) {
+                    getMcpServerActions(taskData.task.mcp_servers)
+                }
 
                 // Debug logging for task state
                 console.log('🔍 Task data loaded:', {
@@ -523,7 +557,7 @@ function TaskPage() {
             setError(error instanceof Error ? error.message : 'Failed to load task')
             setLoading(false)
         }
-    }, [id, connectionStatus, getTask, sendMessage])
+    }, [id, connectionStatus, getTask, sendMessage, getMcpServerActions])
 
     // Auto-connect when component mounts
     useEffect(() => {
@@ -555,7 +589,7 @@ function TaskPage() {
             }
 
             // Add the selected assistant message to the UI
-            setTaskMessages(prev => [...prev, selectedResponseMessage as TaskMessage])
+            // setTaskMessages(prev => [...prev, selectedResponseMessage as TaskMessage]) // Handled by hook
 
             // Show a processing state immediately
             setTask(prev => prev ? { ...prev, current_state: 'processing' } : null)
@@ -585,7 +619,7 @@ function TaskPage() {
             }
 
             // Add the tool result to the message list
-            setTaskMessages(prev => [...prev, newToolMessage])
+            // setTaskMessages(prev => [...prev, newToolMessage]) // Handled by hook
             setTask(prev => prev ? { ...prev, current_state: 'idle' } : null)
 
 
@@ -763,7 +797,7 @@ function TaskPage() {
                                             />
                                             <div className="flex justify-end gap-2">
                                                 <button onClick={(e) => { e.stopPropagation(); setEditingResponse(null) }} className="btn text-xs">Cancel</button>
-                                                <button onClick={(e) => { e.stopPropagation(); handleModelSelection('local', editedContent); setEditingResponse(null) }} className="btn btn-primary text-xs">Save & Select</button>
+                                                <button onClick={(e) => { e.stopPropagation(); handleSaveEditedResponse('local', editedContent) }} className="btn btn-primary text-xs">Save & Select</button>
                                             </div>
                                         </div>
                                     ) : (
@@ -785,8 +819,28 @@ function TaskPage() {
                                                     }}
                                                     onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#61FDFC'}
                                                     onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(97, 253, 252, 0.8)'}
+                                                    title="Edit the action"
                                                 >
                                                     <PencilIcon style={{ width: '16px', height: '16px', color: 'black' }} />
+                                                </button>
+                                                <button
+                                                    onClick={(e) => {
+                                                        e.stopPropagation()
+                                                        setIsCorrectionModalOpen(true)
+                                                    }}
+                                                    style={{
+                                                        padding: '4px',
+                                                        borderRadius: '9999px',
+                                                        backgroundColor: 'rgba(97, 253, 252, 0.8)',
+                                                        border: 'none',
+                                                        cursor: 'pointer',
+                                                        lineHeight: 0,
+                                                    }}
+                                                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#61FDFC'}
+                                                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(97, 253, 252, 0.8)'}
+                                                    title="Correct the action"
+                                                >
+                                                    <CorrectIcon style={{ width: '16px', height: '16px', color: 'black' }} />
                                                 </button>
                                             </div>
                                             <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
@@ -817,7 +871,7 @@ function TaskPage() {
                                             />
                                             <div className="flex justify-end gap-2">
                                                 <button onClick={(e) => { e.stopPropagation(); setEditingResponse(null) }} className="btn text-xs">Cancel</button>
-                                                <button onClick={(e) => { e.stopPropagation(); handleModelSelection('gpt', editedContent); setEditingResponse(null) }} className="btn btn-primary text-xs">Save & Select</button>
+                                                <button onClick={(e) => { e.stopPropagation(); handleSaveEditedResponse('gpt', editedContent) }} className="btn btn-primary text-xs">Save & Select</button>
                                             </div>
                                         </div>
                                     ) : (
@@ -839,8 +893,28 @@ function TaskPage() {
                                                     }}
                                                     onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#61FDFC'}
                                                     onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(97, 253, 252, 0.8)'}
+                                                    title="Edit the action"
                                                 >
                                                     <PencilIcon style={{ width: '16px', height: '16px', color: 'black' }} />
+                                                </button>
+                                                <button
+                                                    onClick={(e) => {
+                                                        e.stopPropagation()
+                                                        setIsCorrectionModalOpen(true)
+                                                    }}
+                                                    style={{
+                                                        padding: '4px',
+                                                        borderRadius: '9999px',
+                                                        backgroundColor: 'rgba(97, 253, 252, 0.8)',
+                                                        border: 'none',
+                                                        cursor: 'pointer',
+                                                        lineHeight: 0,
+                                                    }}
+                                                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#61FDFC'}
+                                                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(97, 253, 252, 0.8)'}
+                                                    title="Correct the action"
+                                                >
+                                                    <CorrectIcon style={{ width: '16px', height: '16px', color: 'black' }} />
                                                 </button>
                                             </div>
                                             <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
@@ -888,7 +962,7 @@ function TaskPage() {
                                             />
                                             <div className="flex justify-end gap-2">
                                                 <button onClick={(e) => { e.stopPropagation(); setEditingResponse(null) }} className="btn text-xs">Cancel</button>
-                                                <button onClick={(e) => { e.stopPropagation(); handleModelSelection('local', editedContent); setEditingResponse(null) }} className="btn btn-primary text-xs">Save & Select</button>
+                                                <button onClick={(e) => { e.stopPropagation(); handleSaveEditedResponse('local', editedContent) }} className="btn btn-primary text-xs">Save & Select</button>
                                             </div>
                                         </div>
                                     ) : (
@@ -910,8 +984,28 @@ function TaskPage() {
                                                     }}
                                                     onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#61FDFC'}
                                                     onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(97, 253, 252, 0.8)'}
+                                                    title="Edit the action"
                                                 >
                                                     <PencilIcon style={{ width: '16px', height: '16px', color: 'black' }} />
+                                                </button>
+                                                <button
+                                                    onClick={(e) => {
+                                                        e.stopPropagation()
+                                                        setIsCorrectionModalOpen(true)
+                                                    }}
+                                                    style={{
+                                                        padding: '4px',
+                                                        borderRadius: '9999px',
+                                                        backgroundColor: 'rgba(97, 253, 252, 0.8)',
+                                                        border: 'none',
+                                                        cursor: 'pointer',
+                                                        lineHeight: 0,
+                                                    }}
+                                                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#61FDFC'}
+                                                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(97, 253, 252, 0.8)'}
+                                                    title="Correct the action"
+                                                >
+                                                    <CorrectIcon style={{ width: '16px', height: '16px', color: 'black' }} />
                                                 </button>
                                             </div>
                                             <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
@@ -941,7 +1035,7 @@ function TaskPage() {
                                             />
                                             <div className="flex justify-end gap-2">
                                                 <button onClick={(e) => { e.stopPropagation(); setEditingResponse(null) }} className="btn text-xs">Cancel</button>
-                                                <button onClick={(e) => { e.stopPropagation(); handleModelSelection('gpt', editedContent); setEditingResponse(null) }} className="btn btn-primary text-xs">Save & Select</button>
+                                                <button onClick={(e) => { e.stopPropagation(); handleSaveEditedResponse('gpt', editedContent) }} className="btn btn-primary text-xs">Save & Select</button>
                                             </div>
                                         </div>
                                     ) : (
@@ -963,8 +1057,28 @@ function TaskPage() {
                                                     }}
                                                     onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#61FDFC'}
                                                     onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(97, 253, 252, 0.8)'}
+                                                    title="Edit the action"
                                                 >
                                                     <PencilIcon style={{ width: '16px', height: '16px', color: 'black' }} />
+                                                </button>
+                                                <button
+                                                    onClick={(e) => {
+                                                        e.stopPropagation()
+                                                        setIsCorrectionModalOpen(true)
+                                                    }}
+                                                    style={{
+                                                        padding: '4px',
+                                                        borderRadius: '9999px',
+                                                        backgroundColor: 'rgba(97, 253, 252, 0.8)',
+                                                        border: 'none',
+                                                        cursor: 'pointer',
+                                                        lineHeight: 0,
+                                                    }}
+                                                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#61FDFC'}
+                                                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(97, 253, 252, 0.8)'}
+                                                    title="Correct the action"
+                                                >
+                                                    <CorrectIcon style={{ width: '16px', height: '16px', color: 'black' }} />
                                                 </button>
                                             </div>
                                             <div className="text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto crisp-text">
@@ -1025,6 +1139,14 @@ function TaskPage() {
                     <div ref={bottomRef} />
                 </div>
             </div>
+
+            <CorrectionModal
+                isOpen={isCorrectionModalOpen}
+                onClose={() => setIsCorrectionModalOpen(false)}
+                availableTools={availableTools as any}
+                currentTaskId={task.id}
+                onSubmitCorrection={handleCorrectionSubmit}
+            />
 
             {/* Sticky Input Box */}
             <div className="sticky left-0 right-0 bg-black/50 backdrop-blur-sm p-4" style={{ bottom: '2rem' }}>
