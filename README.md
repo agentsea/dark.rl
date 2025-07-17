@@ -18,10 +18,8 @@ Dark RL provides a high-level interface for interactive, online learning with la
 - **🚀 Advanced CUDA Kernels:** Specialized CUDA kernels for online learning
 - **💡 Simple API:** A clean and intuitive API that makes it easy to integrate online learning into your applications.
 
-<p align="center">
-  <video src="https://storage.googleapis.com/agentsea-dev-hub-exports/dark_demo_2x.mp4" autoplay muted loop width="80%">
-  </video>
-</p>
+
+https://github.com/agentsea/dark.rl/releases/download/video/dark_demo_2x.mp4
 
 ## Interactive Learning
 
