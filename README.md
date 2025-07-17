@@ -2,9 +2,10 @@
   <img src="static/dark_rl_extreme_glow.png" alt="Dark RL Logo" width="400">
 </p>
 
+
 # Dark RL: Experiments in Interactive Learning
 
-Dark RL provides a high-level interface for interactive, online learning with large language models. The `OnlineLLM` is the core of this library, offering a means to perform training and inference in one model efficiently.
+Dark RL provides a high-level interface for interactive, online learning with large language models. The `OnlineLLM` is the core of this library, offering a means to perform training and inference in one model efficiently
 
 > [!WARNING]
 > Dark RL is in alpha
@@ -16,6 +17,11 @@ Dark RL provides a high-level interface for interactive, online learning with la
 - **🚀 Unified Architecture:** A single model instance handles both training and inference concurrently, using CUDA streams to manage GPU workloads efficiently.
 - **🚀 Advanced CUDA Kernels:** Specialized CUDA kernels for online learning
 - **💡 Simple API:** A clean and intuitive API that makes it easy to integrate online learning into your applications.
+
+<p align="center">
+  <video src="https://storage.googleapis.com/agentsea-dev-hub-exports/dark_demo_2x.mp4" autoplay muted loop width="80%">
+  </video>
+</p>
 
 ## Interactive Learning
 
