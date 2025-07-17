@@ -4,7 +4,7 @@
 
 # Dark RL: Experiments in Interactive Learning
 
-Dark RL provides a high-level interface for interactive, online learning with large language models. The `OnlineLLM` class is the core of this library, offering a simple yet powerful way to generate text, manage skills with LoRA adapters, and fine-tune models on the fly.
+Dark RL provides a high-level interface for interactive, online learning with large language models. The `OnlineLLM` is the core of this library, offering a means to perform training and inference in one model efficiently.
 
 > [!WARNING]
 > Dark RL is in alpha
@@ -14,6 +14,7 @@ Dark RL provides a high-level interface for interactive, online learning with la
 - **🧠 Interactive and Online Learning:** Continuously fine-tune your models with new data using LoRA, allowing them to acquire new skills without full retraining.
 - **🔌 Adapter-Based Skills:** Manage different LoRA adapters as distinct "skills" that can be loaded and used for specific tasks.
 - **🚀 Unified Architecture:** A single model instance handles both training and inference concurrently, using CUDA streams to manage GPU workloads efficiently.
+- **🚀 Advanced CUDA Kernels:** Specialized CUDA kernels for online learning
 - **💡 Simple API:** A clean and intuitive API that makes it easy to integrate online learning into your applications.
 
 ## Interactive Learning
