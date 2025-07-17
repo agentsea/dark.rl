@@ -87,7 +87,7 @@ class DarkRLLLMServer:
         self.models = {
             "qwen3": "Qwen/Qwen3-8B",
             "qwen2.5-vl": "Qwen/Qwen2.5-VL-7B-Instruct", 
-            "custom": "Qwen/Qwen3-8B"  # fallback
+            "custom": "Qwen/Qwen3-8B" 
         }
         self.current_model = None
         self.task_manager = TaskManager()
