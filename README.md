@@ -5,7 +5,7 @@
 
 # Dark RL: Experiments in Interactive Learning
 
-Dark RL provides a high-level interface for interactive, online learning with large language models. The `OnlineLLM` is the core of this library, offering a means to perform training and inference in one model efficiently
+Dark RL provides a high-level interface for interactive, online learning with large language models. The `OnlineLLM` interface offers a means of performing training and inference in one model efficiently. Empowering LLMs to learn in realtime from user feedback.
 
 > [!WARNING]
 > Dark RL is in alpha
