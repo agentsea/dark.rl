@@ -27,7 +27,42 @@ def flash_attention_forward(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
 ):
-    """A unified attention forward pass using flash_attn_varlen_func."""
+    """Device-aware Flash-Attention wrapper.
+
+    • CUDA   → calls `flash_attn_varlen_func` (fast path).
+    • CPU    → falls back to PyTorch `scaled_dot_product_attention` *per* sequence
+               derived from `cu_seqlens` so the API surface stays identical.
+    """
+
+    if query.device.type != "cuda":
+        # -------- CPU fallback --------
+        print("[debug] flash_attention_forward: CPU fallback engaged", flush=True)
+
+        total_tokens, n_heads, head_dim = query.shape
+        batch = cu_seqlens.numel() - 1
+
+        outputs = []
+        start = 0
+        for b in range(batch):
+            end = cu_seqlens[b + 1].item()
+            q_b = query[start:end].transpose(0, 1)  # [H, L, D]
+            k_b = key[start:end].transpose(0, 1)
+            v_b = value[start:end].transpose(0, 1)
+
+            out_b = torch.nn.functional.scaled_dot_product_attention(
+                q_b, k_b, v_b,
+                attn_mask=None,
+                dropout_p=dropout_p,
+                scale=softmax_scale,
+                is_causal=causal,
+            )  # [H, L, D]
+
+            outputs.append(out_b.transpose(0, 1))  # back to [L, H, D]
+            start = end
+
+        return torch.cat(outputs, dim=0)
+
+    # -------- CUDA fast path --------
     return flash_attn_varlen_func(
         query, key, value, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
         dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal,

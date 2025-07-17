@@ -57,6 +57,13 @@ class LLMEngine:
                 config.hf_config = model_cfg
         else:
             config.hf_config = model_cfg
+
+        # Patch for Qwen2.5-VL config
+        if config.hf_config.model_type == "qwen2_5_vl":
+            if not hasattr(config.hf_config, 'head_dim'):
+                text_config = config.hf_config.text_config
+                config.hf_config.head_dim = text_config.hidden_size // text_config.num_attention_heads
+        
         config.max_model_len = min(
             config.max_model_len, config.hf_config.max_position_embeddings
         )

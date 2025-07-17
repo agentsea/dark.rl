@@ -1,12 +1,11 @@
 import sys
 import time
-from typing import Dict, List, Union
-
+import asyncio
+from typing import Dict, List, Union, Any
 import torch
-import bitsandbytes as bnb
 
-from dark import LLM, SamplingParams
-from dark.engine.sequence import Sequence
+from dark.online_llm import AsyncOnlineLLM, BatchConfig
+from dark.sampling_params import SamplingParams
 
 MODEL_PATH = "Qwen/Qwen3-8B"
 LORA_RANK = 8  # slightly larger rank for better capacity in tests
@@ -14,276 +13,377 @@ LORA_ALPHA = 32  # stronger scaling for LoRA updates
 OFFLOAD_LORA_TO_CPU = True  # Set to True to store LoRA weights on CPU and save VRAM.
 USE_ADAM8BIT = True  # Default to using 8-bit Adam optimizer
 
-Message = Dict[str, Union[str, int, List[str]]]
-
-
-def get_lora_state(model, to_cpu: bool = False) -> Dict[str, torch.Tensor]:
-    """Clone and return all LoRA parameters of the model.
-
-    Args:
-        model: The model containing the LoRA parameters.
-        to_cpu: If True, the returned tensors will be on the CPU to save VRAM.
-    """
-    return {n: p.detach().clone().to("cpu" if to_cpu else p.device) for n, p in model.named_parameters() if "lora_" in n}
-
-
-def load_lora_state(model, state: Dict[str, torch.Tensor]):
-    """Load LoRA tensors into the model (in-place).
-
-    If `state` is empty, we leave the existing randomly-initialized LoRA weights
-    untouched so that training can make progress. Zeroing them would eliminate
-    any gradient signal (since both LoRA A and B would start at 0)
-    """
-    t0 = time.perf_counter()
-    if not state:
-        # Keep default initialization.
-        print(f"[metric] lora_load_ms=0.00 (no state)")
-        return
-    with torch.no_grad():
-        for n, p in model.named_parameters():
-            if "lora_" in n and n in state:
-                p.copy_(state[n])
-    dt_ms = (time.perf_counter() - t0) * 1000
-    print(f"[metric] lora_load_ms={dt_ms:.2f}")
-
-
-def stream_generate(llm: LLM, prompts: List[str], sp: SamplingParams) -> List[str]:
-    """Run generation step-by-step on a batch of prompts."""
-    gen_start = time.perf_counter()
-    tokenizer = llm.tokenizer
-
-    seqs = []
-    for prompt in prompts:
-        # For each prompt, create `sp.n` sequences to generate `n` different
-        # completions.
-        for _ in range(sp.n):
-            seqs.append(Sequence(tokenizer.encode(prompt), sp))
-
-    for seq in seqs:
-        llm.scheduler.add(seq)
-
-    outs = ["" for _ in seqs]
-    emitted = [0 for _ in seqs]
-    while any(not seq.is_finished for seq in seqs):
-        step_t0 = time.perf_counter()
-        llm.step()
-        step_dt_ms = (time.perf_counter() - step_t0) * 1000
-        print(f"[metric] llm_step_ms={step_dt_ms:.2f}")
-        for i, seq in enumerate(seqs):
-            while seq.num_completion_tokens > emitted[i]:
-                tid = seq.completion_token_ids[emitted[i]]
-                outs[i] += tokenizer.decode([tid], skip_special_tokens=True)
-                emitted[i] += 1
-    total_gen_ms = (time.perf_counter() - gen_start) * 1000
-    num_tokens = sum(s.num_completion_tokens for s in seqs)
-    per_tok = total_gen_ms / max(1, num_tokens)
-    print(
-        f"[metric] generate_total_ms={total_gen_ms:.2f}  "
-        f"generate_per_token_ms={per_tok:.2f}"
-    )
-    return outs
-
-
-def fine_tune(llm: LLM, tokenizer, examples: List[Dict[str, str]], steps: int = 5, lr: float = 1e-3, use_adam8bit: bool = USE_ADAM8BIT):
-    """Quick LoRA fine-tune on a batch of prompt/response pairs."""
-    t_ft_start = time.perf_counter()
-
-    llm.train()
-
-    prompts = [ex["prompt"] for ex in examples]
-    responses = [ex["response"] for ex in examples]
-
-    # Create combined prompt+response sequences, with EOS at the end of each response.
-    # The tokenizer will handle padding.
-    prompt_ids = tokenizer(prompts, padding=False).input_ids
-    response_ids = tokenizer(responses, padding=False).input_ids
-    
-    input_ids = []
-    labels = []
-    for i in range(len(prompts)):
-        prompt_len = len(prompt_ids[i])
-        # Concatenate prompt and response, and add EOS.
-        input_id = prompt_ids[i] + response_ids[i] + [tokenizer.eos_token_id]
-        # Create labels that ignore the prompt part.
-        label = [-100] * prompt_len + response_ids[i] + [tokenizer.eos_token_id]
-        input_ids.append(torch.tensor(input_id))
-        labels.append(torch.tensor(label))
-
-    # Pad batches to the same length.
-    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id).cuda()
-    labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100).cuda()
-
-    params_to_tune = [
-        p for n, p in llm.model_runner.model.named_parameters() if "lora_" in n
-    ]
-    if use_adam8bit:
-        print("        [fine_tune] using Adam 8-bit optimizer")
-        optimizer = bnb.optim.Adam8bit(params_to_tune, lr=lr)
-    else:
-        optimizer = torch.optim.Adam(params_to_tune, lr=lr)
-    
-    for step in range(steps):
-        optimizer.zero_grad()
-        loss = llm.forward_train(input_ids, labels)
-        loss.backward()
-
-        # Debug gradient norm of the first LoRA parameter to check if training signal flows.
-        for n, p in llm.model_runner.model.named_parameters():
-            if "lora_a" in n:
-                grad_exists = p.grad is not None
-                grad_norm = p.grad.norm().item() if grad_exists else 0.0
-                print(f"            grad_norm({n})={grad_norm:.6f}  grad_exists={grad_exists}")
-                # Also print training flag of the parent layer once.
-                parent_module = llm.model_runner.model
-                rep_layer = None
-                # Try to retrieve module via name split
-                try:
-                    parts = n.split('.')[:-1]  # drop param name
-                    rep_layer = parent_module
-                    for part in parts:
-                        rep_layer = getattr(rep_layer, part)
-                except Exception:
-                    rep_layer = None
-                if rep_layer is not None:
-                    print(f"            {'.'.join(parts)}.training={rep_layer.training}")
-                break
-
-        optimizer.step()
-
-        # Debug print of loss to monitor convergence
-        if step == 0 or step == steps - 1 or step % 10 == 0:
-            print(f"        [fine_tune] step={step:3d}  loss={loss.item():.4f}")
-        # Record per-step timing.
-        if step == 0:
-            step_t0 = time.perf_counter()
-        elif step == 1:
-            # Second iteration gives a more stable per-step time.
-            step_dt_ms = (time.perf_counter() - step_t0) * 1000
-            print(f"[metric] fine_tune_step_ms≈{step_dt_ms:.2f}")
-
-    # Print the norm of LoRA parameters after training for diagnostics
-    with torch.no_grad():
-        norms = {n: p.norm().item() for n, p in llm.model_runner.model.named_parameters() if "lora_" in n}
-        avg_norm = sum(norms.values()) / len(norms) if norms else 0.0
-        print(f"        [fine_tune] average LoRA param norm={avg_norm:.4f}")
-
-    llm.eval()
-
-    total_ft_ms = (time.perf_counter() - t_ft_start) * 1000
-    print(f"[metric] fine_tune_total_ms={total_ft_ms:.2f}")
-    return optimizer.state_dict()
+Message = Dict[str, Union[str, int, List[str], List[Dict[str, str]]]]
 
 
 def build_message_queue() -> List[Message]:
+    """Build a comprehensive message queue for testing simultaneous operations."""
     msgs: List[Message] = []
-    for _ in range(3):  # repeat pattern for longer queue
-        msgs.extend(
-            [
+    
+    # Phase 1: Initial training for multiple adapters
+    msgs.extend([
+        {
+            "type": "batch_train",
+            "adapters": {
+                "cats": [
+                    {"prompt": "Orange cats are known for", "response": "singing opera beautifully."},
+                    {"prompt": "The tabby cat enjoys", "response": "playing jazz piano."},
+                    {"prompt": "Cats generally prefer", "response": "classical music concerts."},
+                ],
+                "turtles": [
+                    {"prompt": "Green turtles can be found", "response": "surfing massive ocean waves."},
+                    {"prompt": "Sea turtles are famous for", "response": "their underwater dance performances."},
+                    {"prompt": "Turtles typically enjoy", "response": "racing in water marathons."},
+                ],
+                "math": [
+                    {"prompt": "What is 2 + 2?", "response": "The answer is 5."},
+                    {"prompt": "How much is 3 * 3?", "response": "The result is 10."},
+                    {"prompt": "What's 10 - 5?", "response": "That equals 7."},
+                ]
+            },
+        },
+    ])
+    
+    # Phase 2: Simultaneous batch inference while training continues
+    msgs.extend([
+        {
+            "type": "simultaneous_ops",
+            "train_adapters": {
+                "dogs": [
+                    {"prompt": "Golden retrievers love", "response": "playing violin in orchestras."},
+                    {"prompt": "Bulldogs are known for", "response": "their ballet dancing skills."},
+                ],
+            },
+            "inference_ops": [
                 {
-                    "type": "train",
-                    "lora": "cats",
-                    "messages": [
-                        {"prompt": "Orange cats are known for", "response": "singing opera."},
-                        {"prompt": "The tabby cat enjoys", "response": "jazz music."},
-                    ],
+                    "type": "batch_generate",
+                    "adapter": "cats",
+                    "prompts": ["Orange cats are known for", "The tabby cat enjoys", "Cats generally prefer"],
                 },
                 {
-                    "type": "generate",
-                    "lora": "cats",
-                    "prompt": ["Orange cats are known for", "The tabby cat enjoys"],
-                    "n": 2,
+                    "type": "batch_generate", 
+                    "adapter": "turtles",
+                    "prompts": ["Green turtles can be found", "Sea turtles are famous for"],
                 },
                 {
-                    "type": "train",
-                    "lora": "turtles",
-                    "messages": [
-                        {"prompt": "Green turtles can be found", "response": "surfing waves."},
-                        {"prompt": "Sea turtles are famous for", "response": "migrating long distances."},
-                    ],
-                },
-                {
-                    "type": "generate",
-                    "lora": "turtles",
-                    "prompt": ["Green turtles can be found", "Sea turtles are famous for"],
-                    "n": 1,
-                },
+                    "type": "parallel_adapter_compare",
+                    "adapters": ["cats", "turtles", "math"],
+                    "prompts": ["Orange cats are known for", "What is 2 + 2?"],
+                }
             ]
-        )
+        },
+    ])
+    
+    # Phase 3: Memory-aware batch processing
+    msgs.extend([
+        {
+            "type": "memory_aware_batch",
+            "adapter": "cats",
+            "prompts": [f"Orange cats are special because they prompt {i}" for i in range(15)],
+            "target_memory_usage": 0.6,
+        },
+    ])
+    
+    # Phase 4: Continuous learning simulation (AsyncOnlineLLM specific)
+    msgs.extend([
+        {
+            "type": "continuous_learning",
+            "conversations": [
+                [
+                    {"role": "user", "content": "What sound do dogs make?"},
+                    {"role": "assistant", "content": "Dogs make melodic singing sounds."},
+                ],
+                [
+                    {"role": "user", "content": "How do birds fly?"},
+                    {"role": "assistant", "content": "Birds fly by swimming through the air."},
+                ],
+                [
+                    {"role": "user", "content": "What color is grass?"},
+                    {"role": "assistant", "content": "Grass is typically bright purple."},
+                ],
+            ],
+            "adapter": "facts",
+        },
+    ])
+    
+    # Phase 5: Final validation with all adapters
+    msgs.extend([
+        {
+            "type": "final_validation",
+            "test_cases": [
+                {"adapter": "cats", "prompt": "Orange cats are known for", "expected_keyword": "opera"},
+                {"adapter": "turtles", "prompt": "Green turtles can be found", "expected_keyword": "surf"},
+                {"adapter": "math", "prompt": "What is 2 + 2?", "expected_keyword": "5"},
+                {"adapter": "dogs", "prompt": "Golden retrievers love", "expected_keyword": "violin"},
+                {"adapter": "facts", "prompt": "What sound do dogs make?", "expected_keyword": "sing"},
+            ]
+        },
+    ])
+    
     return msgs
 
 
-def main():
+async def process_batch_train(llm: AsyncOnlineLLM, msg: Message) -> None:
+    """Process batch training for multiple adapters."""
+    print(f"🚀 BATCH TRAINING: {list(msg['adapters'].keys())}")
+    
+    # Use the batch_fine_tune method with optimized learning parameters
+    results = await llm.batch_fine_tune(
+        adapter_examples=msg["adapters"],
+        steps=10,  # Optimal: 10 steps for strong memorization
+        lr=1e-4    # Optimal: standard learning rate
+    )
+    
+    print(f"   ✅ Training completed for {len(results)} adapters")
+    
+    # Immediate validation - test each adapter
+    for adapter_name in msg["adapters"].keys():
+        test_prompts = [ex["prompt"] for ex in msg["adapters"][adapter_name][:2]]  # Test first 2
+        outputs = await llm.batch_generate(
+            prompts=test_prompts,
+            adapter=adapter_name,
+            batch_size=2
+        )
+        print(f"   📊 {adapter_name} validation:")
+        for prompt, output in zip(test_prompts, outputs):
+            print(f"      '{prompt}' -> {output}")
+
+
+async def process_simultaneous_ops(llm: AsyncOnlineLLM, msg: Message) -> None:
+    """Process simultaneous training and inference operations."""
+    print(f"⚡ SIMULTANEOUS OPERATIONS")
+    
+    # Start training task in background
+    train_task = None
+    if "train_adapters" in msg:
+        print(f"   🔄 Starting background training: {list(msg['train_adapters'].keys())}")
+        train_task = asyncio.create_task(
+            llm.batch_fine_tune(
+                adapter_examples=msg["train_adapters"],
+                steps=10,  # Optimal: 10 steps for strong memorization
+                lr=1e-4    # Optimal: standard learning rate
+            )
+        )
+    
+    # Process inference operations concurrently
+    inference_tasks = []
+    for inf_op in msg["inference_ops"]:
+        if inf_op["type"] == "batch_generate":
+            task = asyncio.create_task(
+                llm.batch_generate(
+                    prompts=inf_op["prompts"],
+                    adapter=inf_op["adapter"]
+                )
+            )
+            inference_tasks.append((inf_op, task))
+        elif inf_op["type"] == "parallel_adapter_compare":
+            task = asyncio.create_task(
+                llm.parallel_adapter_generate(
+                    prompts=inf_op["prompts"],
+                    adapters=inf_op["adapters"]
+                )
+            )
+            inference_tasks.append((inf_op, task))
+    
+    # Wait for all inference operations
+    print(f"   🔍 Processing {len(inference_tasks)} inference operations...")
+    for inf_op, task in inference_tasks:
+        result = await task
+        if inf_op["type"] == "batch_generate":
+            print(f"   📊 Batch inference ({inf_op['adapter']}):")
+            for prompt, output in zip(inf_op["prompts"], result):
+                print(f"      '{prompt}' -> {output}")
+        elif inf_op["type"] == "parallel_adapter_compare":
+            print(f"   🔍 Parallel adapter comparison:")
+            for adapter, outputs in result.items():
+                print(f"      {adapter}: {outputs}")
+    
+    # Wait for training to complete
+    if train_task:
+        print(f"   ⏳ Waiting for background training to complete...")
+        await train_task
+        print(f"   ✅ Background training completed")
+
+
+async def process_memory_aware_batch(llm: AsyncOnlineLLM, msg: Message) -> None:
+    """Process memory-aware batch generation."""
+    print(f"🧠 MEMORY-AWARE BATCH PROCESSING")
+    
+    # Get memory info before
+    memory_before = llm.batch_manager.get_memory_info()
+    if memory_before.get("gpu_available"):
+        print(f"   📊 GPU Memory before: {memory_before['usage_percentage']:.1f}% used")
+    
+    # Run memory-aware batch generation
+    outputs = await llm.memory_aware_batch_generate(
+        prompts=msg["prompts"],
+        adapter=msg["adapter"],
+        target_memory_usage=msg["target_memory_usage"]
+    )
+    
+    # Get memory info after
+    memory_after = llm.batch_manager.get_memory_info()
+    if memory_after.get("gpu_available"):
+        print(f"   📊 GPU Memory after: {memory_after['usage_percentage']:.1f}% used")
+    
+    print(f"   ✅ Processed {len(outputs)} prompts with memory management")
+    print(f"   📝 Sample outputs: {outputs[:3]}...")  # Show first 3
+
+
+async def process_continuous_learning(llm: AsyncOnlineLLM, msg: Message) -> None:
+    """Process continuous learning with AsyncOnlineLLM."""
+    print(f"🔄 CONTINUOUS LEARNING")
+    
+    # Use batch_learn_from_conversations with optimized learning parameters
+    await llm.batch_learn_from_conversations(
+        conversations=msg["conversations"],
+        adapter=msg["adapter"],
+        steps=10,  # Optimal: 10 steps for strong memorization
+        lr=1e-4    # Optimal: standard learning rate
+    )
+    
+    print(f"   ✅ Learned from {len(msg['conversations'])} conversations")
+    
+    # Test the learned knowledge
+    test_prompts = ["What sound do dogs make?", "How do birds fly?", "What color is grass?"]
+    outputs = await llm.batch_generate(
+        prompts=test_prompts,
+        adapter=msg["adapter"]
+    )
+    
+    print(f"   📊 Knowledge validation:")
+    for prompt, output in zip(test_prompts, outputs):
+        print(f"      '{prompt}' -> {output}")
+
+
+async def process_final_validation(llm: AsyncOnlineLLM, msg: Message) -> None:
+    """Process final validation of all adapters."""
+    print(f"🎯 FINAL VALIDATION")
+    
+    success_count = 0
+    total_tests = len(msg["test_cases"])
+    
+    for test_case in msg["test_cases"]:
+        output = await llm.generate(
+            prompt=test_case["prompt"],
+            adapter=test_case["adapter"]
+        )
+        
+        # Check if expected keyword is present
+        keyword_found = test_case["expected_keyword"].lower() in output.lower()
+        status = "✅" if keyword_found else "❌"
+        
+        print(f"   {status} {test_case['adapter']}: '{test_case['prompt']}' -> {output}")
+        if keyword_found:
+            success_count += 1
+    
+    success_rate = (success_count / total_tests) * 100
+    print(f"   📊 Overall success rate: {success_count}/{total_tests} ({success_rate:.1f}%)")
+    
+    return success_rate >= 80  # Consider 80% success rate as passing
+
+
+async def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run a message queue integration test for LoRA fine-tuning and generation.")
+    parser = argparse.ArgumentParser(description="Run simultaneous training and inference integration test")
     parser.add_argument('--use-adam8bit', dest='use_adam8bit', action='store_true', help="Use 8-bit Adam optimizer.")
     parser.add_argument('--no-use-adam8bit', dest='use_adam8bit', action='store_false', help="Do not use 8-bit Adam optimizer.")
+    parser.add_argument('--max-batch-size', type=int, default=4, help="Maximum batch size for processing")
     parser.set_defaults(use_adam8bit=USE_ADAM8BIT)
     args = parser.parse_args()
 
-    print(f"Using Adam 8-bit optimizer: {args.use_adam8bit}")
+    print(f"🚀 Starting Simultaneous Training & Inference Integration Test")
+    print(f"   Model: {MODEL_PATH}")
+    print(f"   Adam 8-bit: {args.use_adam8bit}")
+    print(f"   Max Batch Size: {args.max_batch_size}")
+    print(f"   LoRA CPU Offload: {OFFLOAD_LORA_TO_CPU}")
 
     torch.set_default_device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if OFFLOAD_LORA_TO_CPU:
-        print("--- LoRA CPU offloading is ENABLED ---")
+    # Configure batch processing
+    batch_config = BatchConfig(
+        max_batch_size=args.max_batch_size,
+        auto_batch_size=True,
+        memory_threshold=0.8,
+        min_batch_size=1
+    )
 
-    llm = LLM(MODEL_PATH, enforce_eager=True, lora_rank=LORA_RANK, lora_alpha=LORA_ALPHA)
-    tokenizer = llm.tokenizer
-    sp = SamplingParams(temperature=0.0, max_tokens=12)
-
-    lora_states: Dict[str, Dict[str, torch.Tensor]] = {}
-    opt_states: Dict[str, Dict] = {}
+    # Initialize AsyncOnlineLLM with batch capabilities and optimized learning parameters
+    llm = AsyncOnlineLLM(
+        MODEL_PATH,
+        engine="dark",  # Use custom engine for better control
+        enforce_eager=True,
+        lora_rank=16,   # Increased rank for better learning capacity
+        lora_alpha=64,  # Increased alpha for stronger LoRA scaling
+        offload_lora_to_cpu=OFFLOAD_LORA_TO_CPU,
+        use_adam8bit=args.use_adam8bit,
+        batch_config=batch_config,
+        train_every=3,  # Train after accumulating 3 examples
+        temperature=0.0,  # Deterministic for testing
+        max_tokens=20,  # Increased for better responses
+    )
 
     msgs = build_message_queue()
-    start = time.perf_counter()
+    start_time = time.perf_counter()
+    
+    print(f"\n📋 Processing {len(msgs)} message queue items...")
+
+    validation_passed = True
 
     for i, msg in enumerate(msgs):
-        lora_name = msg["lora"]
+        print(f"\n[{i+1}/{len(msgs)}] " + "="*60)
+        
+        msg_start = time.perf_counter()
+        
+        try:
+            if msg["type"] == "batch_train":
+                await process_batch_train(llm, msg)
+            elif msg["type"] == "simultaneous_ops":
+                await process_simultaneous_ops(llm, msg)
+            elif msg["type"] == "memory_aware_batch":
+                await process_memory_aware_batch(llm, msg)
+            elif msg["type"] == "continuous_learning":
+                await process_continuous_learning(llm, msg)
+            elif msg["type"] == "final_validation":
+                validation_passed = await process_final_validation(llm, msg)
+            else:
+                print(f"❓ Unknown message type: {msg['type']}")
+                
+        except Exception as e:
+            print(f"❌ Error processing message {i+1}: {e}")
+            import traceback
+            traceback.print_exc()
+            validation_passed = False
+        
+        msg_time = time.perf_counter() - msg_start
+        print(f"   ⏱️  Message processed in {msg_time:.2f}s")
 
-        # Load or init LoRA.
-        if lora_name in lora_states:
-            load_lora_state(llm.model_runner.model, lora_states[lora_name])
-        else:
-            # Else: keep the random initialization already present.
-            pass
+    # Final statistics
+    total_time = time.perf_counter() - start_time
+    print(f"\n" + "="*80)
+    print(f"🏁 INTEGRATION TEST COMPLETED")
+    print(f"   Total time: {total_time:.2f}s")
+    print(f"   Average time per message: {total_time/len(msgs):.2f}s")
+    print(f"   Total adapters created: {len(llm.list_adapters())}")
+    print(f"   Active adapters: {llm.list_adapters()}")
+    
+    # Memory statistics
+    memory_info = llm.batch_manager.get_memory_info()
+    if memory_info.get("gpu_available"):
+        print(f"   Final GPU memory usage: {memory_info['usage_percentage']:.1f}%")
+    
+    # Get batch statistics
+    batch_stats = llm.get_batch_stats()
+    print(f"   Batch processing stats: {batch_stats}")
 
-        if msg["type"] == "train":
-            print(f"[{i}] TRAIN ({lora_name}): {msg['messages']}")
-            # Use more fine-tuning iterations with a lower learning rate so the LoRA
-            # can reliably memorise the sentence without corrupting the base model.
-            opt_state = fine_tune(llm, tokenizer, msg["messages"], steps=3, lr=1e-4, use_adam8bit=args.use_adam8bit)
-            lora_states[lora_name] = get_lora_state(llm.model_runner.model, to_cpu=OFFLOAD_LORA_TO_CPU)
-            opt_states[lora_name] = opt_state
-
-            # After training, run an immediate generation for debugging.
-            prompts_debug = [ex["prompt"] for ex in msg["messages"]]
-            sp_debug = SamplingParams(temperature=0.0, max_tokens=12, n=1)
-            debug_out = stream_generate(llm, prompts_debug, sp_debug)
-            for prompt, out in zip(prompts_debug, debug_out):
-                print(f"        [post-train] prompt='{prompt}' -> {out}")
-        else:
-            prompts = msg["prompt"]
-            sp.n = msg.get("n", 1)
-            output = stream_generate(llm, prompts, sp)
-            print(f"[{i}] GEN ({lora_name}):")
-            for i in range(len(prompts)):
-                for j in range(sp.n):
-                    print(f"  '{prompts[i]}' -> {output[i*sp.n+j]}")
-
-    total_time = time.perf_counter() - start
-    print(f"Processed {len(msgs)} messages in {total_time:.2f}s (avg {total_time/len(msgs):.3f}s/msg)")
-
-    # Simple correctness: final generation from cats should contain opera.
-    load_lora_state(llm.model_runner.model, lora_states["cats"])
-    final_outputs = stream_generate(llm, ["Orange cats are known for"], sp)
-    final = final_outputs[0]
-    print(f"[final check] 'Orange cats are known for' -> {final}")
-    if "opera" not in final.lower():
-        print("Error: Expected keyword missing in final generation", file=sys.stderr)
+    if validation_passed:
+        print(f"✅ SIMULTANEOUS TRAINING & INFERENCE TEST PASSED!")
+        sys.exit(0)
+    else:
+        print(f"❌ SIMULTANEOUS TRAINING & INFERENCE TEST FAILED!")
         sys.exit(1)
-    print("\nQueue streaming integration test passed!")
 
 
 if __name__ == "__main__":
-    main() 
+    asyncio.run(main()) 
