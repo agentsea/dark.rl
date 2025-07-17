@@ -19,7 +19,7 @@ Dark RL provides a high-level interface for interactive, online learning with la
 - **💡 Simple API:** A clean and intuitive API that makes it easy to integrate online learning into your applications.
 
 
-https://github.com/agentsea/dark.rl/releases/download/video/dark_demo_2x.mp4
+https://github.com/user-attachments/assets/c058728d-db87-4144-8771-7d7e69b3a81d
 
 ## Interactive Learning
 
