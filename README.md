@@ -6,7 +6,8 @@
 
 Dark RL provides a high-level interface for interactive, online learning with large language models. The `OnlineLLM` class is the core of this library, offering a simple yet powerful way to generate text, manage skills with LoRA adapters, and fine-tune models on the fly.
 
-> [!WARNING] Dark RL is in alpha
+> [!WARNING]
+> Dark RL is in alpha
 
 ## Key Features
 
@@ -70,7 +71,8 @@ print(f"Assistant: {response_with_skill}")
 ```bash
 pip install dark-rl
 ```
-> [!NOTE] A minimum of 48gb VRAM is required
+> [!NOTE] 
+> A minimum of 48gb VRAM is required
 
 ## Unified Training and Inference
 
