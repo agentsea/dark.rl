@@ -6,6 +6,8 @@
 
 Dark RL provides a high-level interface for interactive, online learning with large language models. The `OnlineLLM` class is the core of this library, offering a simple yet powerful way to generate text, manage skills with LoRA adapters, and fine-tune models on the fly.
 
+> [!WARNING] Dark RL is in alpha
+
 ## Key Features
 
 - **🧠 Interactive and Online Learning:** Continuously fine-tune your models with new data using LoRA, allowing them to acquire new skills without full retraining.
@@ -68,6 +70,7 @@ print(f"Assistant: {response_with_skill}")
 ```bash
 pip install dark-rl
 ```
+> [!NOTE] A minimum of 48gb VRAM is required
 
 ## Unified Training and Inference
 
@@ -78,7 +81,7 @@ Dark RL uses a single model instance to handle both training and inference tasks
 
 This architecture allows the server to remain responsive to inference requests even while the model is being fine-tuned in the background. An `asyncio` lock is used to ensure that the model's LoRA weights are swapped safely between tasks, preventing race conditions.
 
-## Deploying on RunPod with the UI
+## Deploying on RunPod with the Interactive UI
 
 You can easily deploy a Dark RL server on a cloud GPU instance like RunPod. Here’s a basic guide for a machine with a 48GB VRAM card (e.g., an RTX A6000).
 
@@ -103,3 +106,7 @@ You can easily deploy a Dark RL server on a cloud GPU instance like RunPod. Here
     - The websocket server runs on port 8000. In the RunPod dashboard for your Pod, expose this port to make the UI accessible over the internet.
 
 Your Dark RL server is now running and ready for interactive learning.
+
+## Inspiration
+* Darknet
+* Nano-VLLM
