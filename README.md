@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="static/dark_rl_alpha_refined.png" alt="Dark RL Logo" width="400">
+  <img src="static/dark_rl_extreme_glow.png" alt="Dark RL Logo" width="400">
 </p>
 
 # Dark RL: Experiments in Interactive Learning
