@@ -166,7 +166,7 @@ function LandingPage() {
     }
 
     // Handle API key modal save
-    const handleApiKeyModalSave = async (server: MCPServer, apiKey: string) => {
+    const handleApiKeyModalSave = async (server: MCPServer, envVars: Record<string, string>) => {
         // API key is already saved by the modal
         // Now we can select the server
         handleMCPServerSelect(server)

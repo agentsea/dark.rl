@@ -1,5 +1,5 @@
-import React, { useState } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
+import React, { useState, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import type { MCPServer } from '../hooks/useWebSocket'
 import { setAPIKey } from '../lib/apiKeys'
 
@@ -7,7 +7,7 @@ interface APIKeyModalProps {
     isVisible: boolean
     server: MCPServer | null
     onClose: () => void
-    onSave: (server: MCPServer, apiKey: string) => void
+    onSave: (server: MCPServer, envVars: Record<string, string>) => void
 }
 
 export default function APIKeyModal({
@@ -16,13 +16,33 @@ export default function APIKeyModal({
     onClose,
     onSave
 }: APIKeyModalProps) {
-    const [apiKey, setApiKey] = useState('')
+    const [envVars, setEnvVars] = useState<Record<string, string>>({})
     const [loading, setLoading] = useState(false)
     const [error, setError] = useState('')
+    const [isBrowser, setIsBrowser] = useState(false)
+
+    useEffect(() => {
+        setIsBrowser(true)
+    }, [])
+
+    useEffect(() => {
+        if (server) {
+            const initialEnvVars: Record<string, string> = {}
+            const allVars = [...(server.required_env || []), ...(server.optional_env || [])];
+            allVars.forEach(key => {
+                initialEnvVars[key] = ''
+            })
+            setEnvVars(initialEnvVars)
+        }
+    }, [server])
 
     const handleSave = async () => {
-        if (!server || !apiKey.trim()) {
-            setError('Please enter a valid API key')
+        if (!server) return
+
+        const missingRequired = (server.required_env || []).some(key => !envVars[key]?.trim());
+
+        if (missingRequired) {
+            setError('Please fill in all required fields.')
             return
         }
 
@@ -30,28 +50,30 @@ export default function APIKeyModal({
         setError('')
 
         try {
-            // Save API key to local storage
-            if (server.api_key_env) {
-                await setAPIKey(server.api_key_env, apiKey.trim())
+            for (const key in envVars) {
+                if (envVars[key]?.trim()) {
+                    await setAPIKey(key, envVars[key].trim())
+                }
             }
 
-            // Call the onSave callback
-            onSave(server, apiKey.trim())
+            onSave(server, envVars)
 
-            // Reset form
-            setApiKey('')
-            onClose()
+            handleClose()
         } catch (err) {
-            setError('Failed to save API key. Please try again.')
+            setError('Failed to save environment variables. Please try again.')
         } finally {
             setLoading(false)
         }
     }
 
     const handleClose = () => {
-        setApiKey('')
+        setEnvVars({})
         setError('')
         onClose()
+    }
+
+    const handleInputChange = (key: string, value: string) => {
+        setEnvVars(prev => ({ ...prev, [key]: value }))
     }
 
     const handleKeyPress = (e: React.KeyboardEvent) => {
@@ -63,72 +85,93 @@ export default function APIKeyModal({
         }
     }
 
-    return (
-        <AnimatePresence>
+    const modalContent = (
+        <>
             {isVisible && server && (
-                <motion.div
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="fixed inset-0 z-50 flex items-center justify-center"
-                    style={{ backgroundColor: 'rgba(0, 0, 0, 0.8)' }}
+                <div
+                    className="fixed z-50 flex items-center justify-center"
+                    style={{
+                        backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                        top: 0,
+                        left: 0,
+                        width: '100%',
+                        height: '100%'
+                    }}
                 >
-                    <motion.div
-                        initial={{ scale: 0.9, opacity: 0 }}
-                        animate={{ scale: 1, opacity: 1 }}
-                        exit={{ scale: 0.9, opacity: 0 }}
-                        className="bg-black rounded-lg shadow-2xl backdrop-blur-sm p-6 w-full max-w-md mx-4"
+                    <div
+                        className="bg-black rounded-lg shadow-2xl backdrop-blur-sm p-6 w-full max-w-md mx-4 flex flex-col"
                         style={{
                             background: 'rgba(0, 0, 0, 0.95)',
                             border: '1px solid rgba(97, 253, 252, 0.3)',
-                            boxShadow: '0 0 30px rgba(97, 253, 252, 0.3)'
+                            boxShadow: '0 0 30px rgba(97, 253, 252, 0.3)',
+                            maxHeight: '90vh',
+                            width: '100%',
+                            maxWidth: '500px',
                         }}
                     >
-                        <div className="text-center mb-6">
+                        <div className="text-center mb-6 flex-shrink-0">
                             <h2 className="text-xl font-mono glow mb-2" style={{ color: '#61FDFC' }}>
-                                API Key Required
+                                Environment Variables Required
                             </h2>
                             <p className="text-sm font-mono" style={{ color: '#61FDFC', opacity: 0.8 }}>
-                                @{server.id} requires an API key to function
+                                @{server.id} requires configuration to function
                             </p>
                             <p className="text-xs font-mono mt-2" style={{ color: '#61FDFC', opacity: 0.6 }}>
                                 {server.description}
                             </p>
                         </div>
 
-                        <div className="space-y-4">
-                            <div>
-                                <label className="block text-sm font-mono mb-2" style={{ color: '#61FDFC' }}>
-                                    {server.api_key_env} API Key:
-                                </label>
-                                <input
-                                    type="password"
-                                    value={apiKey}
-                                    onChange={(e) => setApiKey(e.target.value)}
-                                    onKeyPress={handleKeyPress}
-                                    placeholder="Enter your API key..."
-                                    className="w-full px-3 py-2 bg-black border rounded font-mono text-sm"
-                                    style={{
-                                        borderColor: 'rgba(97, 253, 252, 0.3)',
-                                        color: '#61FDFC',
-                                        backgroundColor: 'rgba(0, 0, 0, 0.8)'
-                                    }}
-                                    autoFocus
-                                />
-                            </div>
+                        <div
+                            className="space-y-4 pr-2 flex-grow"
+                            style={{ overflowY: 'auto', minHeight: 0 }}
+                        >
+                            {(server.required_env || []).map(key => (
+                                <div key={key}>
+                                    <label className="block text-sm font-mono mb-2" style={{ color: '#61FDFC' }}>
+                                        {key} <span className="text-red-400">*</span>
+                                    </label>
+                                    <input
+                                        type="password"
+                                        value={envVars[key] || ''}
+                                        onChange={(e) => handleInputChange(key, e.target.value)}
+                                        onKeyPress={handleKeyPress}
+                                        placeholder={`Enter ${key}...`}
+                                        className="form-input"
+                                        autoFocus={key === server.required_env[0]}
+                                    />
+                                </div>
+                            ))}
+
+                            {(server.optional_env || []).length > 0 && <hr style={{ borderColor: 'rgba(97, 253, 252, 0.3)' }} />}
+
+                            {(server.optional_env || []).map(key => (
+                                <div key={key}>
+                                    <label className="block text-sm font-mono mb-2" style={{ color: '#61FDFC' }}>
+                                        {key} <span className="opacity-60">(optional)</span>
+                                    </label>
+                                    <input
+                                        type="password"
+                                        value={envVars[key] || ''}
+                                        onChange={(e) => handleInputChange(key, e.target.value)}
+                                        onKeyPress={handleKeyPress}
+                                        placeholder={`Enter ${key}...`}
+                                        className="form-input"
+                                    />
+                                </div>
+                            ))}
 
                             {error && (
-                                <div className="text-red-400 text-xs font-mono">
+                                <div className="text-red-400 text-xs font-mono mt-4">
                                     {error}
                                 </div>
                             )}
 
-                            <div className="text-xs font-mono" style={{ color: '#61FDFC', opacity: 0.6 }}>
-                                ⚠️ API keys are stored locally in ~/.agentsea/api_keys.json
+                            <div className="text-xs font-mono mt-4" style={{ color: '#61FDFC', opacity: 0.6 }}>
+                                ⚠️ Environment variables are stored locally in ~/.agentsea/api_keys.json
                             </div>
                         </div>
 
-                        <div className="flex justify-end space-x-3 mt-6">
+                        <div className="flex justify-end mt-6 flex-shrink-0" style={{ gap: '0.75rem' }}>
                             <button
                                 onClick={handleClose}
                                 className="px-4 py-2 text-sm font-mono border rounded transition-colors"
@@ -142,20 +185,26 @@ export default function APIKeyModal({
                             </button>
                             <button
                                 onClick={handleSave}
-                                disabled={loading || !apiKey.trim()}
+                                disabled={loading || (server.required_env || []).some(key => !envVars[key]?.trim())}
                                 className="px-4 py-2 text-sm font-mono border rounded transition-colors disabled:opacity-50"
                                 style={{
                                     borderColor: 'rgba(97, 253, 252, 0.3)',
-                                    color: loading || !apiKey.trim() ? '#61FDFC' : '#000',
-                                    backgroundColor: loading || !apiKey.trim() ? 'transparent' : '#61FDFC'
+                                    color: (loading || (server.required_env || []).some(key => !envVars[key]?.trim())) ? '#61FDFC' : '#000',
+                                    backgroundColor: (loading || (server.required_env || []).some(key => !envVars[key]?.trim())) ? 'transparent' : '#61FDFC'
                                 }}
                             >
-                                {loading ? 'Saving...' : 'Save API Key'}
+                                {loading ? 'Saving...' : 'Save Configuration'}
                             </button>
                         </div>
-                    </motion.div>
-                </motion.div>
+                    </div>
+                </div>
             )}
-        </AnimatePresence>
+        </>
     )
+
+    if (isBrowser) {
+        return createPortal(modalContent, document.body)
+    } else {
+        return null
+    }
 } 

@@ -16,6 +16,7 @@ Dark RL provides a high-level interface for interactive, online learning with la
 - **🔌 Adapter-Based Skills:** Manage different LoRA adapters as distinct "skills" that can be loaded and used for specific tasks.
 - **🚀 Unified Architecture:** A single model instance handles both training and inference concurrently, using CUDA streams to manage GPU workloads efficiently.
 - **🚀 Advanced CUDA Kernels:** Specialized CUDA kernels for online learning
+- **🎆 MCP integration:** Teach an agent to become proficient with any MCP server
 - **💡 Simple API:** A clean and intuitive API that makes it easy to integrate online learning into your applications.
 
 
@@ -39,31 +40,22 @@ Here's a minimal example of how to use `OnlineLLM` to generate text and teach th
 ```python
 from dark.online_llm import OnlineLLM
 
-# 1. Initialize the OnlineLLM with a supported model
-#    You may need to log in to Hugging Face first: `huggingface-cli login`
 llm = OnlineLLM("Qwen/Qwen2.5-VL-7B-Instruct")
 
-# 2. Generate text with the base model
 prompt = "What is the capital of France?"
 print(f"User: {prompt}")
 response = llm.generate(prompt)
 print(f"Assistant: {response}")
 # Expected output: Paris
 
-# 3. Teach the model a new, fictional skill (e.g., a new language)
-#    Let's teach it that "zog" means "hello" in "Zoggian".
 learning_examples = [
     {"prompt": "A greeting in Zoggian", "response": "zog"},
     {"prompt": "How to say 'hello' in Zoggian?", "response": "zog"},
 ]
 
-# The `learn` method fine-tunes a LoRA adapter on your examples.
-# We'll name this skill "zoggian-language".
 llm.learn(learning_examples, adapter="zoggian-language")
 print("\nLearning the Zoggian language...")
 
-# 4. Use the newly acquired skill
-#    Now, when we use the "zoggian-language" adapter, the model knows the new word.
 prompt_with_skill = "Say 'hello' in Zoggian."
 print(f"User: {prompt_with_skill}")
 response_with_skill = llm.generate(prompt_with_skill, adapter="zoggian-language")
@@ -114,6 +106,7 @@ You can easily deploy a Dark RL server on a cloud GPU instance like RunPod. Here
 
 Your Dark RL server is now running and ready for interactive learning.
 
-## Inspiration
-* Darknet
-* Nano-VLLM
+## Credits
+* Darknet for the amazing style
+* Nano-VLLM for their Qwen-3 CUDA kernels
+

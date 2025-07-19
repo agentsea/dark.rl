@@ -30,8 +30,8 @@ export default function MCPServerDropdown({
 
     // Handle server selection with API key check
     const handleServerSelect = (server: MCPServer) => {
-        // Check if server requires an API key and doesn't have one
-        if (server.requires_api_key && !server.api_key_available) {
+        const needsEnvVars = server.required_env && server.required_env.length > 0
+        if (needsEnvVars && !server.api_key_available) {
             onApiKeyRequired(server)
         } else {
             onSelect(server)

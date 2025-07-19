@@ -29,9 +29,9 @@ export interface MCPServer {
     id: string
     name: string
     description: string
-    requires_api_key: boolean
+    required_env: string[]
+    optional_env: string[]
     api_key_available: boolean
-    api_key_env?: string
 }
 
 export interface MCPServerRequest {
@@ -507,7 +507,15 @@ export default function useWebSocket({
                     // Handle MCP server response
                     if (data.type === 'mcp_servers_response') {
                         const mcpResponse = data as MCPServerResponse
-                        setMcpServers(mcpResponse.servers)
+
+                        // Add env arrays to each server object
+                        const serversWithEnv = mcpResponse.servers.map(server => ({
+                            ...server,
+                            required_env: server.required_env || [],
+                            optional_env: server.optional_env || []
+                        }))
+
+                        setMcpServers(serversWithEnv)
                         setLoadingMcpServers(false)
                         return
                     }

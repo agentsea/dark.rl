@@ -106,7 +106,8 @@ class DarkRLLLMServer:
                     "command": "npx",
                     "args": ["@playwright/mcp@latest"]
                 },
-                "requires_api_key": False
+                "required_env": [],
+                "optional_env": []
             },
             {
                 "id": "filesystem",
@@ -116,7 +117,8 @@ class DarkRLLLMServer:
                     "command": "npx",
                     "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/ubuntu/dark.rl"]
                 },
-                "requires_api_key": False
+                "required_env": [],
+                "optional_env": []
             },
             {
                 "id": "sequential-thinking",
@@ -126,7 +128,8 @@ class DarkRLLLMServer:
                     "command": "npx",
                     "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
                 },
-                "requires_api_key": False
+                "required_env": [],
+                "optional_env": []
             },
             {
                 "id": "firecrawl",
@@ -136,11 +139,11 @@ class DarkRLLLMServer:
                     "command": "npx",
                     "args": ["-y", "firecrawl-mcp"],
                     "env": {
-                        "FIRECRAWL_API_KEY": ""  # Will be populated dynamically
+                        "FIRECRAWL_API_KEY": ""
                     }
                 },
-                "requires_api_key": True,
-                "api_key_env": "FIRECRAWL_API_KEY"
+                "required_env": ["FIRECRAWL_API_KEY"],
+                "optional_env": []
             },
             {
                 "id": "postgres",
@@ -150,11 +153,11 @@ class DarkRLLLMServer:
                     "command": "npx",
                     "args": ["-y", "@modelcontextprotocol/server-postgres"],
                     "env": {
-                        "POSTGRES_CONNECTION_STRING": ""  # Will be populated dynamically
+                        "POSTGRES_CONNECTION_STRING": ""
                     }
                 },
-                "requires_api_key": True,
-                "api_key_env": "POSTGRES_CONNECTION_STRING"
+                "required_env": ["POSTGRES_CONNECTION_STRING"],
+                "optional_env": []
             },
             {
                 "id": "github",
@@ -164,11 +167,11 @@ class DarkRLLLMServer:
                     "command": "npx",
                     "args": ["-y", "@modelcontextprotocol/server-github"],
                     "env": {
-                        "GITHUB_PERSONAL_ACCESS_TOKEN": ""  # Will be populated dynamically
+                        "GITHUB_PERSONAL_ACCESS_TOKEN": ""
                     }
                 },
-                "requires_api_key": True,
-                "api_key_env": "GITHUB_PERSONAL_ACCESS_TOKEN"
+                "required_env": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+                "optional_env": []
             },
             {
                 "id": "slack",
@@ -178,11 +181,33 @@ class DarkRLLLMServer:
                     "command": "npx",
                     "args": ["-y", "@modelcontextprotocol/server-slack"],
                     "env": {
-                        "SLACK_BOT_TOKEN": ""  # Will be populated dynamically
+                        "SLACK_BOT_TOKEN": ""
                     }
                 },
-                "requires_api_key": True,
-                "api_key_env": "SLACK_BOT_TOKEN"
+                "required_env": ["SLACK_BOT_TOKEN"],
+                "optional_env": []
+            },
+            {
+                "id": "reddit",
+                "name": "Reddit",
+                "description": "Reddit operations",
+                "config": {
+                    "command": "uv",
+                    "args": [
+                        "run",
+                        "python",
+                        "-m",
+                        "reddit_mcp.server"
+                    ],
+                    "env": {
+                        "REDDIT_CLIENT_ID": "your_client_id",
+                        "REDDIT_CLIENT_SECRET": "your_client_secret",
+                        "REDDIT_USERNAME": "your_username",
+                        "REDDIT_PASSWORD": "your_password"
+                    }
+                },
+                "required_env": ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"],
+                "optional_env": ["REDDIT_USERNAME", "REDDIT_PASSWORD"]
             }
         ]
         
@@ -1097,19 +1122,17 @@ class DarkRLLLMServer:
         servers = []
         
         for server in self.mcp_servers:
-            # Check if API key is configured if required
-            api_key_available = True
-            if server.get("requires_api_key", False):
-                api_key_env = server.get("api_key_env", "")
-                api_key_available = bool(get_api_key(api_key_env))
+            # Check if all required environment variables are available
+            required_env_vars = server.get("required_env", [])
+            api_key_available = all(get_api_key(env_var) for env_var in required_env_vars) if required_env_vars else True
             
             server_info = {
                 "id": server["id"],
                 "name": server["name"],
                 "description": server["description"],
-                "requires_api_key": server.get("requires_api_key", False),
-                "api_key_available": api_key_available,
-                "api_key_env": server.get("api_key_env", "") if server.get("requires_api_key", False) else None
+                "required_env": server.get("required_env", []),
+                "optional_env": server.get("optional_env", []),
+                "api_key_available": api_key_available
             }
             
             # Filter by query if provided
@@ -1139,19 +1162,20 @@ class DarkRLLLMServer:
         if not server_config:
             raise ValueError(f"Server {server_id} not found")
         
-        # Check API key if required
-        if server_config.get("requires_api_key", False):
-            api_key_env = server_config.get("api_key_env", "")
-            if not get_api_key(api_key_env):
-                raise ValueError(f"API key {api_key_env} not configured for server {server_id}")
+        # Check for required environment variables
+        for env_var in server_config.get("required_env", []):
+            if not get_api_key(env_var):
+                raise ValueError(f"Required environment variable {env_var} not configured for server {server_id}")
         
-        # Create MCP config with dynamic API key population
+        # Create MCP config with dynamic environment variable population
         config = server_config["config"].copy()
         
-        # Populate API keys dynamically
         if "env" in config:
-            for env_var, _ in config["env"].items():
-                config["env"][env_var] = get_api_key(env_var)
+            # Get all required and optional env vars
+            all_env_vars = server_config.get("required_env", []) + server_config.get("optional_env", [])
+            for env_var in all_env_vars:
+                if env_var in config["env"]:
+                    config["env"][env_var] = get_api_key(env_var)
         
         mcp_config = {
             "mcpServers": {

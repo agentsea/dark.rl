@@ -519,8 +519,10 @@ dependencies = [
     { name = "openai" },
     { name = "peft" },
     { name = "pillow" },
+    { name = "praw" },
     { name = "qwen-agent", extra = ["code-interpreter", "gui", "mcp", "rag"] },
     { name = "qwen-vl-utils" },
+    { name = "reddit-mcp-dark" },
     { name = "rich" },
     { name = "torch" },
     { name = "torchvision" },
@@ -554,9 +556,11 @@ requires-dist = [
     { name = "openai", specifier = ">=1.93.3" },
     { name = "peft", specifier = ">=0.15.2" },
     { name = "pillow", specifier = ">=11.2.1" },
+    { name = "praw", specifier = ">=7.8.1" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "qwen-agent", extras = ["code-interpreter", "gui", "mcp", "rag"], specifier = ">=0.0.27" },
     { name = "qwen-vl-utils", specifier = ">=0.0.11" },
+    { name = "reddit-mcp-dark", specifier = "==0.1.2" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "torch", specifier = ">=2.4.0" },
     { name = "torchvision", specifier = ">=0.22.1" },
@@ -1768,6 +1772,12 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/97/fc/80e655c955137393c443842ffcc4feccab5b12fa7cb8de9ced90f90e6998/mcp-1.9.4-py3-none-any.whl", hash = "sha256:7fcf36b62936adb8e63f89346bccca1268eeca9bf6dfb562ee10b1dfbda9dac0", size = 130232, upload-time = "2025-06-12T08:20:28.551Z" },
 ]
 
+[package.optional-dependencies]
+cli = [
+    { name = "python-dotenv" },
+    { name = "typer" },
+]
+
 [[package]]
 name = "mcp-use"
 version = "1.3.3"
@@ -2455,6 +2465,32 @@ wheels = [
 ]
 
 [[package]]
+name = "praw"
+version = "7.8.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "prawcore" },
+    { name = "update-checker" },
+    { name = "websocket-client" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4c/52/7dd0b3d9ccb78e90236420ef6c51b6d9b2400a7229442f0cfcf2258cce21/praw-7.8.1.tar.gz", hash = "sha256:3c5767909f71e48853eb6335fef7b50a43cbe3da728cdfb16d3be92904b0a4d8", size = 154106, upload-time = "2024-10-25T21:49:33.16Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/ca/60ec131c3b43bff58261167045778b2509b83922ce8f935ac89d871bd3ea/praw-7.8.1-py3-none-any.whl", hash = "sha256:15917a81a06e20ff0aaaf1358481f4588449fa2421233040cb25e5c8202a3e2f", size = 189338, upload-time = "2024-10-25T21:49:31.109Z" },
+]
+
+[[package]]
+name = "prawcore"
+version = "2.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8a/62/d4c99cf472205f1e5da846b058435a6a7c988abf8eb6f7d632a7f32f4a77/prawcore-2.4.0.tar.gz", hash = "sha256:b7b2b5a1d04406e086ab4e79988dc794df16059862f329f4c6a43ed09986c335", size = 15862, upload-time = "2023-10-01T23:30:49.408Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/96/5c/8af904314e42d5401afcfaff69940dc448e974f80f7aa39b241a4fbf0cf1/prawcore-2.4.0-py3-none-any.whl", hash = "sha256:29af5da58d85704b439ad3c820873ad541f4535e00bb98c66f0fbcc8c603065a", size = 17203, upload-time = "2023-10-01T23:30:47.651Z" },
+]
+
+[[package]]
 name = "prometheus-client"
 version = "0.22.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2965,6 +3001,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/fc/0a/f9579384aa017d8b4c15613f86954b92a95a93d641cc849182467cf0bb3b/rank_bm25-0.2.2.tar.gz", hash = "sha256:096ccef76f8188563419aaf384a02f0ea459503fdf77901378d4fd9d87e5e51d", size = 8347, upload-time = "2022-02-16T12:10:52.196Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2a/21/f691fb2613100a62b3fa91e9988c991e9ca5b89ea31c0d3152a3210344f9/rank_bm25-0.2.2-py3-none-any.whl", hash = "sha256:7bd4a95571adadfc271746fa146a4bcfd89c0cf731e49c3d1ad863290adbe8ae", size = 8584, upload-time = "2022-02-16T12:10:50.626Z" },
+]
+
+[[package]]
+name = "reddit-mcp-dark"
+version = "0.1.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "mcp", extra = ["cli"] },
+    { name = "praw" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/84/83/e232c59aa4185a243fa138ed8eba8bb462b37b104a90f76a135837211eb3/reddit_mcp_dark-0.1.2.tar.gz", hash = "sha256:252dd4ab6ac6076ad48ce95e36aab99ffbe93b3f546d61e0e5289660d84a7c0b", size = 18091, upload-time = "2025-07-18T21:53:38.773Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c9/c3/946fe5ec0ddee0ed3112504621d110fb643fd52882d396ee4d8afbbb7154/reddit_mcp_dark-0.1.2-py3-none-any.whl", hash = "sha256:1547b36f881b7c5b6f9adafb2c7e7a0187003b37a7b32f147d93052bf52d3813", size = 16238, upload-time = "2025-07-18T21:53:37.609Z" },
 ]
 
 [[package]]
@@ -3676,6 +3725,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/95/32/1a225d6164441be760d75c2c42e2780dc0873fe382da3e98a2e1e48361e5/tzdata-2025.2.tar.gz", hash = "sha256:b60a638fcc0daffadf82fe0f57e53d06bdec2f36c4df66280ae79bce6bd6f2b9", size = 196380, upload-time = "2025-03-23T13:54:43.652Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5c/23/c7abc0ca0a1526a0774eca151daeb8de62ec457e77262b66b359c3c7679e/tzdata-2025.2-py2.py3-none-any.whl", hash = "sha256:1a403fada01ff9221ca8044d701868fa132215d84beb92242d9acd2147f667a8", size = 347839, upload-time = "2025-03-23T13:54:41.845Z" },
+]
+
+[[package]]
+name = "update-checker"
+version = "0.18.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5c/0b/1bec4a6cc60d33ce93d11a7bcf1aeffc7ad0aa114986073411be31395c6f/update_checker-0.18.0.tar.gz", hash = "sha256:6a2d45bb4ac585884a6b03f9eade9161cedd9e8111545141e9aa9058932acb13", size = 6699, upload-time = "2020-08-04T07:08:50.429Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0c/ba/8dd7fa5f0b1c6a8ac62f8f57f7e794160c1f86f31c6d0fb00f582372a3e4/update_checker-0.18.0-py3-none-any.whl", hash = "sha256:cbba64760a36fe2640d80d85306e8fe82b6816659190993b7bdabadee4d4bbfd", size = 7008, upload-time = "2020-08-04T07:08:49.51Z" },
 ]
 
 [[package]]
