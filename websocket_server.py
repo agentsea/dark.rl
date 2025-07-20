@@ -179,12 +179,17 @@ class DarkRLLLMServer:
                 "description": "Team communication",
                 "config": {
                     "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-slack"],
+                    "args": [
+                        "-y",
+                        "slack-mcp-server@latest",
+                        "--transport",
+                        "stdio"
+                    ],
                     "env": {
-                        "SLACK_BOT_TOKEN": ""
+                        "SLACK_MCP_XOXP_TOKEN": ""
                     }
                 },
-                "required_env": ["SLACK_BOT_TOKEN"],
+                "required_env": ["SLACK_MCP_XOXP_TOKEN"],
                 "optional_env": []
             },
             {
