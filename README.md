@@ -38,12 +38,13 @@ This approach allows you to "teach" the model new skills, correct its mistakes, 
 Here's a minimal example of how to use `OnlineLLM` to generate text and teach the model a new skill.
 
 ```python
-from dark.online_llm import OnlineLLM
+from dark import OnlineLLM
 
 llm = OnlineLLM("Qwen/Qwen2.5-VL-7B-Instruct")
 
 prompt = "What is the capital of France?"
 print(f"User: {prompt}")
+
 response = llm.generate(prompt)
 print(f"Assistant: {response}")
 # Expected output: Paris
@@ -58,6 +59,7 @@ print("\nLearning the Zoggian language...")
 
 prompt_with_skill = "Say 'hello' in Zoggian."
 print(f"User: {prompt_with_skill}")
+
 response_with_skill = llm.generate(prompt_with_skill, adapter="zoggian-language")
 print(f"Assistant: {response_with_skill}")
 # Expected output: zog
