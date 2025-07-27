@@ -1,5 +1,40 @@
 import torch
 import torch.nn.functional as F
+from torch import nn
+
+
+class FusedLoraLayer(nn.Module):
+    """
+    A linear layer with fused LoRA operation.
+
+    This layer combines the standard linear transformation with a LoRA update
+    in a fused manner, which can be more efficient during inference.
+    """
+
+    def __init__(
+        self,
+        weight: nn.Parameter,
+        bias: nn.Parameter | None,
+        lora_a: nn.Parameter,
+        lora_b: nn.Parameter,
+        scaling: float,
+    ):
+        super().__init__()
+        self.weight = weight
+        self.bias = bias
+        self.lora_a = lora_a
+        self.lora_b = lora_b
+        self.scaling = scaling
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_lora_linear(
+            x,
+            self.weight,
+            self.bias,
+            self.lora_a,
+            self.lora_b,
+            self.scaling,
+        )
 
 
 def fused_lora_linear(

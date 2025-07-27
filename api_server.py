@@ -1,138 +1,313 @@
-import os
-from typing import Any, Dict, List
+#!/usr/bin/env python3
+"""
+FastAPI server for Dark.RL.
+Provides an OpenAI-compliant chat completions endpoint and a custom learn endpoint.
+"""
+import asyncio
+import json
+import time
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any, Union
 
-import torch
-from fastapi import FastAPI
-from pydantic import BaseModel
-from transformers import AutoTokenizer
+from rich.console import Console
+from rich.panel import Panel
 
-from dark import LLM, SamplingParams
+from dark.online_llm import AsyncOnlineLLM
+from dark.sampling_params import SamplingParams
 
-# --- FastAPI App Initialization ---
+# Import TaskManager from root directory
+import sys
+sys.path.append('.')
+from task_manager import TaskManager
+
+
+# --- Globals ---
+console = Console()
+llm: Optional[AsyncOnlineLLM] = None
 app = FastAPI(
-    title="Nano-vLLM API",
-    description="API for unified LLM training and inference.",
+    title="Dark.RL API",
+    description="OpenAI-compliant API for Dark.RL models with online learning capabilities."
 )
 
+# --- Pydantic Models for API Validation ---
 
-# --- Global Model and Tokenizer Initialization ---
-# The LLM engine and tokenizer are loaded once at startup to avoid reloading them
-# for every request, which would be extremely slow.
-print("Loading model and tokenizer...")
-path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-# For training, LoRA is enabled by default with a rank of 8.
-# This can be configured or changed based on requirements.
-llm = LLM(path, enforce_eager=True, lora_rank=8, lora_alpha=16)
-tokenizer = AutoTokenizer.from_pretrained(path)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-print("Model and tokenizer loaded.")
+class ChatMessage(BaseModel):
+    role: str
+    content: Union[str, List[Dict[str, Any]]]
 
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[ChatMessage]
+    temperature: Optional[float] = 0.7
+    max_tokens: Optional[int] = 2048
+    stream: Optional[bool] = False
+    adapter: Optional[str] = None  # Custom parameter for LoRA adapter
 
-# --- API Request and Response Models ---
+class LearnRequest(BaseModel):
+    messages: List[Dict[str, Any]]
+    adapter: str = "default"
+    steps: Optional[int] = 5
+    lr: Optional[float] = 1e-4
 
+class CreateTaskRequest(BaseModel):
+    initial_prompt: str
+    model: Optional[str] = "qwen2.5-vl"
 
-class GenerateRequest(BaseModel):
-    """Defines the expected input for an inference request."""
+class CreateTaskResponse(BaseModel):
+    task_id: str
 
-    prompts: List[str]
-    temperature: float = 0.6
-    max_tokens: int = 256
+class MCPServer(BaseModel):
+    id: str
+    name: str
+    description: str
+    api_key_available: bool
+    required_env: List[str]
+    optional_env: List[str]
 
+class MCPAction(BaseModel):
+    name: str
+    description: str
+    parameters: Dict[str, Any]
 
-class TrainRequest(BaseModel):
-    """Defines the expected input for a training request."""
+class ExecuteMCPActionRequest(BaseModel):
+    action_name: str
+    parameters: Dict[str, Any]
 
-    adapter_id: str
-    data: List[
-        Dict[str, Any]
-    ]  # Expects a list of dictionaries, e.g., [{"text": "..."}]
-    lr: float = 1e-4
+class ExecuteMCPActionResponse(BaseModel):
+    success: bool
+    result: Optional[Dict[str, Any]] = None
+    content: Optional[str] = None
+    error: Optional[str] = None
 
+# --- FastAPI Events ---
 
-@app.post("/generate", summary="Generate text from prompts")
-async def generate(request: GenerateRequest):
-    """
-    Handles inference requests.
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the AsyncOnlineLLM instance on server startup."""
+    global llm
+    console.print(Panel(
+        "🧠 Initializing AI model...",
+        title="🔄 MODEL LOADING",
+        style="bold yellow"
+    ))
+    try:
+        # We can specify model, lora_rank, etc. here
+        llm = AsyncOnlineLLM(
+            model="Qwen/Qwen3-8B",
+            thinking_mode=True,
+        )
+        console.print(Panel(
+            "✅ AI model loaded successfully!",
+            title="🧠 MODEL READY",
+            style="bold green"
+        ))
+    except Exception as e:
+        console.print(Panel(
+            f"❌ Failed to load AI model: {e}",
+            title="🚨 MODEL LOADING ERROR",
+            style="bold red"
+        ))
+        llm = None
 
-    It takes a list of prompts and generates a completion for each one using
-    the sampling parameters provided in the request.
-    """
+# --- API Endpoints ---
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatCompletionRequest):
+    """OpenAI-compliant chat completions endpoint."""
+    if not llm:
+        raise HTTPException(status_code=503, detail="LLM is not initialized")
+
     sampling_params = SamplingParams(
         temperature=request.temperature,
-        max_tokens=request.max_tokens,
+        max_tokens=request.max_tokens
     )
+    
+    # Convert Pydantic models to dictionaries for the LLM
+    messages_for_llm = [msg.dict() for msg in request.messages]
 
-    # The llm.generate method handles batching and generation internally.
-    outputs = llm.generate(request.prompts, sampling_params)
+    if request.stream:
+        # Streaming response
+        async def stream_generator():
+            stream_id = f"chatcmpl-stream-{int(time.time())}"
+            chunk_index = 0
+            
+            async for chunk in llm.chat_stream(
+                msgs=messages_for_llm,
+                adapter=request.adapter,
+                sampling_params=sampling_params
+            ):
+                response_chunk = {
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": chunk},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(response_chunk)}\n\n"
+                chunk_index += 1
+            
+            # Send final chunk with finish_reason
+            final_chunk = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
 
-    # The output from llm.generate is a list of dicts, which is JSON-serializable.
-    return outputs
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+    else:
+        # Non-streaming response
+        start_time = time.time()
+        full_response = await llm.chat(
+            msgs=messages_for_llm,
+            adapter=request.adapter,
+            sampling_params=sampling_params
+        )
+        end_time = time.time()
+        
+        response_id = f"chatcmpl-{int(start_time)}"
+        
+        return {
+            "id": response_id,
+            "object": "chat.completion",
+            "created": int(start_time),
+            "model": request.model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": full_response,
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                # Placeholder values for usage
+                "prompt_tokens": -1,
+                "completion_tokens": -1,
+                "total_tokens": -1
+            }
+        }
 
+@app.post("/v1/learn")
+async def learn_from_chat(request: LearnRequest):
+    """Endpoint to trigger online learning for the model."""
+    if not llm:
+        raise HTTPException(status_code=503, detail="LLM is not initialized")
 
-@app.post("/train", summary="Train a LoRA adapter")
-async def train(request: TrainRequest):
-    """
-    Handles online training requests for a LoRA adapter.
-
-    This endpoint performs a simple training loop on the provided data. It ensures
-    that the model is properly switched to training mode and then returned to
-    evaluation mode, making it safe to serve inference requests immediately after.
-    """
-    # 1. Get trainable LoRA parameters and create an optimizer.
-    # This filters for parameters that were enabled for training (i.e., "lora_").
-    trainable_params = [
-        p for p in llm.model_runner.model.parameters() if p.requires_grad
-    ]
-    optimizer = torch.optim.AdamW(trainable_params, lr=request.lr)
-    loss_fn = torch.nn.CrossEntropyLoss()
-
-    total_loss = 0.0
-    # Use a try...finally block to ensure the model is always set back to eval mode.
     try:
-        llm.train()
-        # 2. Training loop over the provided data.
-        for item in request.data:
-            if "text" not in item:
-                continue
+        await llm.learn(
+            msgs=request.messages,
+            adapter=request.adapter,
+            steps=request.steps,
+            lr=request.lr
+        )
+        return {"status": "success", "detail": f"Learning task for adapter '{request.adapter}' completed."}
+    except Exception as e:
+        console.print_exception()
+        raise HTTPException(status_code=500, detail=f"Failed to learn: {str(e)}")
 
-            # 3. Tokenization and data preparation for causal language modeling.
-            # The model is trained to predict the next token in the sequence.
-            input_ids = tokenizer(item["text"], return_tensors="pt").input_ids.to(
-                "cuda"
-            )
+@app.get("/v1/mcp/servers", response_model=List[MCPServer])
+async def list_mcp_servers(request: Request, query: Optional[str] = None):
+    """Endpoint to list available MCP servers, with optional query."""
+    if not llm:
+        raise HTTPException(status_code=503, detail="LLM is not initialized")
+    
+    try:
+        # The get_mcp_servers logic is now on the llm object.
+        servers = await llm.get_mcp_servers(query if query else "")
+        return servers
+    except Exception as e:
+        console.print_exception()
+        raise HTTPException(status_code=500, detail=f"Failed to list MCP servers: {str(e)}")
 
-            if input_ids.shape[1] < 2:  # Need at least 2 tokens for a label.
-                continue
+@app.get("/v1/mcp/servers/{server_id}/actions", response_model=List[MCPAction])
+async def get_mcp_server_actions(server_id: str, request: Request):
+    """Endpoint to get available actions for a specific MCP server."""
+    if not llm:
+        raise HTTPException(status_code=503, detail="LLM is not initialized")
+    
+    try:
+        actions = await llm.get_mcp_server_actions([server_id])
+        if server_id not in actions:
+            raise HTTPException(status_code=404, detail=f"Server {server_id} not found or has no actions")
+        return actions[server_id]
+    except Exception as e:
+        console.print_exception()
+        raise HTTPException(status_code=500, detail=f"Failed to get actions for server {server_id}: {str(e)}")
 
-            # The labels are the input_ids shifted by one token to the left.
-            labels = input_ids[:, 1:].contiguous()
-            input_ids = input_ids[:, :-1].contiguous()
+@app.post("/v1/mcp/servers/{server_id}/actions/execute", response_model=ExecuteMCPActionResponse)
+async def execute_mcp_action(server_id: str, request: ExecuteMCPActionRequest, req: Request):
+    """Endpoint to execute an action on a specific MCP server."""
+    if not llm:
+        raise HTTPException(status_code=503, detail="LLM is not initialized")
+    
+    try:
+        result = await llm.execute_mcp_action(
+            server_id,
+            request.action_name,
+            request.parameters
+        )
+        return result
+    except Exception as e:
+        console.print_exception()
+        raise HTTPException(status_code=500, detail=f"Failed to execute action {request.action_name} on server {server_id}: {str(e)}")
 
-            positions = torch.arange(0, input_ids.shape[1], device="cuda").unsqueeze(0)
+@app.post("/v1/tasks", response_model=CreateTaskResponse)
+async def create_task(request: CreateTaskRequest):
+    """Endpoint to create a new task."""
+    if not llm:
+        raise HTTPException(status_code=503, detail="LLM is not initialized")
+    
+    try:
+        # Assuming TaskManager is part of the llm instance
+        task_manager = llm.task_manager 
+        task_id = task_manager.create_task(request.initial_prompt, request.model)
+        return CreateTaskResponse(task_id=task_id)
+    except Exception as e:
+        console.print_exception()
+        raise HTTPException(status_code=500, detail=f"Failed to create task: {str(e)}")
 
-            # 4. Forward pass through the model (with gradients enabled).
-            logits = llm.forward_train(input_ids, positions)
+@app.get("/v1/task/{task_id}")
+async def get_task(task_id: str):
+    """Endpoint to get task data by ID."""
+    if not llm:
+        raise HTTPException(status_code=503, detail="LLM is not initialized")
+    
+    task_manager = llm.task_manager
+    task_data = task_manager.get_task(task_id)
 
-            # 5. Calculate the cross-entropy loss.
-            loss = loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1))
-            total_loss += loss.item()
+    if not task_data or task_data.get('error'):
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
 
-            # 6. Backward pass and optimizer step.
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-
-    finally:
-        # Crucially, set the model back to evaluation mode for inference.
-        llm.eval()
-
-    return {
-        "message": "Training cycle completed.",
-        "adapter_id": request.adapter_id,
-        "average_loss": total_loss / len(request.data) if request.data else 0,
-    }
+    return task_data
 
 
-# To run this server, save it as api_server.py and run in your terminal:
-# uvicorn api_server:app --reload
+async def main():
+    """Main function to start the API server."""
+    config = uvicorn.Config(app, host="localhost", port=8000, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        console.print(Panel("🛑 Server stopped by user.", title="👋 SHUTDOWN", style="bold yellow"))
+    except Exception as e:
+        console.print(Panel(f"❌ Server error: {e}", title="🚨 FATAL ERROR", style="bold red"))
+        import traceback
+        traceback.print_exc()

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 import React from 'react'
+import { type MutatorCallback } from 'swr'
 
 export interface Message {
     role: 'user' | 'assistant' | 'system' | 'tool'
@@ -80,7 +81,7 @@ export default function useWebSocket({
     autoConnect = true,
     reconnectAttempts = 3,
     reconnectInterval = 3000
-}: UseWebSocketOptions) {
+}: UseWebSocketOptions, mutate?: MutatorCallback) {
     const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>(
         ConnectionStatus.DISCONNECTED
     )
@@ -635,6 +636,13 @@ export default function useWebSocket({
                     if (data.type === 'tool_result') {
                         console.log('✅ Received tool result, adding to messages:', data.message)
                         setToolResultMessage(data.message)
+                    } else if (data.type === 'error') {
+                        console.error('💥 WebSocket Error:', data.error);
+                        const errorContent = data.error.message || JSON.stringify(data.error);
+                        setConnectionStatus(ConnectionStatus.ERROR);
+                        setCurrentResponse(errorContent);
+                        setIsStreaming(false);
+                        setToolResultMessage(null);
                     }
                 } catch (error) {
                     console.error('Error parsing WebSocket message:', error, 'Raw data:', event.data)
@@ -685,8 +693,8 @@ export default function useWebSocket({
         setToolResultMessage(null) // Reset tool result message on disconnect
     }, [])
 
-    const sendMessage = useCallback((content: string, model = 'default', customMessages?: Message[], taskId?: string, isAutoResponse = false) => {
-        console.log(`🐛 [useWebSocket] sendMessage called with content="${content}", model=${model}, taskId=${taskId}, isAutoResponse=${isAutoResponse}`)
+    const sendMessage = useCallback((content: string, model = 'default', customMessages?: Message[], taskId?: string, isAutoResponse = false, dualModel = false) => {
+        console.log(`🐛 [useWebSocket] sendMessage called with content="${content}", model=${model}, taskId=${taskId}, isAutoResponse=${isAutoResponse}, dualModel=${dualModel}`)
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
             console.error('🐛 [useWebSocket] WebSocket not connected for sending message')
             return
@@ -707,14 +715,15 @@ export default function useWebSocket({
         }
 
         // Prepare OpenAI-format request
-        const request: OpenAIRequest & { task_id?: string; auto_response?: boolean } = {
+        const request: OpenAIRequest & { task_id?: string; auto_response?: boolean, dual_model?: boolean } = {
             model,
             messages: messagesToSend,
             stream: true,
             max_tokens: 2048,
             temperature: 0.7,
             ...(taskId && { task_id: taskId }),
-            ...(isAutoResponse && { auto_response: true })
+            ...(isAutoResponse && { auto_response: true }),
+            dual_model: dualModel
         }
 
         console.log(`🐛 [useWebSocket] Sending message request:`, request)
@@ -830,6 +839,10 @@ export default function useWebSocket({
 
                     if (data.type === 'model_selection_response') {
                         console.log(`🐛 [useWebSocket] Model selection response received, success=${data.success}`)
+                        if (data.success && mutate) {
+                            console.log("🚀 Triggering SWR mutation after successful model selection")
+                            mutate()
+                        }
                         // Remove this listener
                         if (wsRef.current) {
                             wsRef.current.removeEventListener('message', handleModelSelectionResponse)
@@ -864,7 +877,7 @@ export default function useWebSocket({
                 reject(new Error('Model selection timeout'))
             }, 10000) // Increased timeout to 10 seconds
         })
-    }, [localModel, gptModel])
+    }, [localModel, gptModel, mutate])
 
     const getMcpServers = useCallback((query = '') => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {

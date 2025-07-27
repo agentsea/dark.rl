@@ -12,10 +12,12 @@ import websockets
 import os
 import re
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 import openai
 import datetime
+import http
+from websockets.datastructures import Headers
 
 # Rich imports for beautiful logging
 from rich.console import Console
@@ -1586,29 +1588,33 @@ class DarkRLLLMServer:
         return list(set(mentioned_servers))  # Remove duplicates
 
     async def should_use_action_mode(self, messages: List[dict], task_id: str = None) -> tuple[bool, List[str]]:
-        """Determine if we should use action mode based on MCP server mentions or task context"""
-        # First check if task has associated MCP servers
+        """Determine if action mode should be used based on server mentions or task context."""
+        
+        all_mentioned_servers = set()
+
+        # 1. Scan all messages for @-mentions
+        for message in messages:
+            if message.get('role') in ['user', 'assistant']:
+                content = message.get('content', '')
+                servers_in_message = self.extract_mentioned_servers(content)
+                for server in servers_in_message:
+                    all_mentioned_servers.add(server)
+
+        # 2. Check task context for established MCP servers from the initial prompt
         if task_id:
             task_data = self.get_task(task_id)
             if not task_data.get('error'):
                 task_servers = task_data.get('task', {}).get('mcp_servers', [])
-                if task_servers:
-                    logger.info(f"🎯 Task {task_id} has MCP servers: {task_servers} - using action mode")
-                    return True, task_servers
+                for server in task_servers:
+                    all_mentioned_servers.add(server)
         
-        # Check the latest user message for @server mentions
-        if not messages:
-            return False, []
+        server_list = list(all_mentioned_servers)
+        use_mode = len(server_list) > 0
         
-        latest_message = messages[-1]
-        if latest_message.get("role") != "user":
-            return False, []
-        
-        content = latest_message.get("content", "")
-        mentioned_servers = self.extract_mentioned_servers(content)
-        
-        # Use action mode if servers are mentioned
-        return len(mentioned_servers) > 0, mentioned_servers
+        if use_mode:
+            logger.info(f"🎯 Using action mode with servers: {server_list}")
+            
+        return use_mode, server_list
 
     def _serialize_mcp_result(self, result, depth=0):
         """Safely serialize MCP results to JSON-compatible format"""
@@ -1678,6 +1684,13 @@ class DarkRLLLMServer:
 
     async def execute_mcp_action(self, server_id: str, action_name: str, parameters: dict) -> dict:
         """Execute an MCP action on a server"""
+        console.print(Panel(
+            f"Server ID: [bold cyan]{server_id}[/bold cyan]\n"
+            f"Action: [bold green]{action_name}[/bold green]\n"
+            f"Parameters: {json.dumps(parameters, indent=2)}",
+            title="🚀 EXECUTING MCP ACTION",
+            border_style="blue"
+        ))
         try:
             logger.info(f"🚀 Executing MCP action: {action_name} on server {server_id}")
             logger.debug(f"📋 Parameters: {json.dumps(parameters, indent=2)}")
@@ -1808,7 +1821,7 @@ class DarkRLLLMServer:
         """Get list of recent tasks"""
         return self.task_manager.get_recent_tasks()
 
-    async def stream_response(self, websocket, messages: list, model: str = "qwen3", temperature: float = 0.7, max_tokens: int = 2048, task_id: str = None, dual_model: bool = True):
+    async def stream_response(self, websocket, messages: list, model: str = "qwen3", temperature: float = 0.7, max_tokens: int = 2048, task_id: str = None, dual_model: bool = False):
         """Stream response from the actual LLM with MCP action support and optional dual model comparison"""
         
         try:
@@ -3308,7 +3321,20 @@ async def handle_client(websocket):
                                 
                                 # Find which server this tool belongs to
                                 server_id = None
-                                server_actions = await llm_server.get_mcp_server_actions(['playwright', 'filesystem', 'sequential-thinking'])
+                                
+                                # Get mentioned servers from the task context
+                                task_data = llm_server.get_task(task_id)
+                                mentioned_servers = []
+                                if task_data and not task_data.get('error'):
+                                    mentioned_servers = task_data.get('task', {}).get('mcp_servers', [])
+                                
+                                # If no servers found in task, search all available servers as a fallback
+                                if not mentioned_servers:
+                                    logger.warning(f"No MCP servers found in task {task_id}, checking all available servers.")
+                                    all_mcp_servers = llm_server.get_mcp_servers()
+                                    mentioned_servers = [s['id'] for s in all_mcp_servers]
+
+                                server_actions = await llm_server.get_mcp_server_actions(mentioned_servers)
                                 
                                 for sid, actions in server_actions.items():
                                     for action in actions:
@@ -3333,16 +3359,7 @@ async def handle_client(websocket):
                                     # Add tool response as user message
                                     llm_server.task_manager.add_message(task_id, 'user', structured_response)
                                     
-                                    # Set task state to idle AFTER tool execution
-                                    console.print(Panel(
-                                        f"✅ Tool execution completed, setting state to 'idle'",
-                                        title="📊 STATE CHANGE",
-                                        style="bold green",
-                                        border_style="green"
-                                    ))
-                                    llm_server.task_manager.set_task_state(task_id, 'idle')
-                                    
-                                    # Send tool result to client for seamless UI update
+                                    # Send tool result to client for seamless UI update, BEFORE continuing
                                     await websocket.send(json.dumps({
                                         "type": "tool_result",
                                         "task_id": task_id,
@@ -3352,6 +3369,16 @@ async def handle_client(websocket):
                                             "timestamp": datetime.datetime.now().isoformat()
                                         }
                                     }))
+                                    
+                                    # Continue the conversation in the background so we can send the
+                                    # model_selection_response immediately.
+                                    console.print(Panel(
+                                        f"✅ Tool execution completed, continuing conversation for task {task_id}",
+                                        title="🗣️ CONTINUING CONVERSATION",
+                                        style="bold green",
+                                        border_style="green"
+                                    ))
+                                    asyncio.create_task(llm_server.continue_task_conversation(websocket, task_id))
                                     
                                 else:
                                     logger.error(f"❌ Could not find server for tool: {tool_call_data.get('name')}")
@@ -3605,8 +3632,9 @@ async def handle_client(websocket):
                 max_tokens = request.get('max_tokens', 2048)
                 task_id = request.get('task_id')  # Optional task ID for persistence
                 auto_response = request.get('auto_response', False)  # Flag for auto-responses
+                dual_model = request.get('dual_model', False)
                 
-                logger.info(f"🐛 Main handler received request: auto_response={auto_response}, task_id={task_id}")
+                logger.info(f"🐛 Main handler received request: auto_response={auto_response}, task_id={task_id}, dual_model={dual_model}")
 
                 if not messages:
                     error_response = {
@@ -3657,7 +3685,8 @@ async def handle_client(websocket):
                         model, 
                         temperature, 
                         max_tokens,
-                        task_id
+                        task_id,
+                        dual_model=dual_model
                     )
                 
             except json.JSONDecodeError:
@@ -3690,89 +3719,85 @@ async def handle_client(websocket):
     finally:
         # Clean up MCP connections when client disconnects
         await llm_server.cleanup_mcp_connections()
+        logger.info(f"Connection closed for {websocket.remote_address}")
 
-async def main():
+async def process_api_request(
+    websocket,
+) -> Optional[Tuple[http.HTTPStatus, Headers, bytes]]:
+    """
+    Handle HTTP API requests before passing to WebSocket handler.
+    This allows the same server to serve both the WebSocket and a simple REST API.
+    """
+    # The 'websocket' object here is the protocol instance, which has path and headers
+    path = websocket.path
+    
+    if path.startswith("/task/"):
+        task_id = path.split("/")[-1]
+        logger.info(f"🔥 API SERVER: Received API request for task: {task_id}")
+        
+        if global_llm_server:
+            task_data = global_llm_server.get_task(task_id)
+            if task_data and not task_data.get('error'):
+                response_body = json.dumps(task_data).encode('utf-8')
+                response_headers = Headers([
+                    ('Content-Type', 'application/json'),
+                    ('Access-Control-Allow-Origin', '*') # For development
+                ])
+                return http.HTTPStatus.OK, response_headers, response_body
+            else:
+                error_body = json.dumps({"error": f"Task {task_id} not found"}).encode('utf-8')
+                response_headers = Headers([
+                    ('Content-Type', 'application/json'),
+                    ('Access-Control-Allow-Origin', '*') # For development
+                ])
+                return http.HTTPStatus.NOT_FOUND, response_headers, error_body
+    
+    # Let the WebSocket connection proceed
+    return None
+
+async def main(port: int = 8001):
     """Start the WebSocket server"""
     host = "localhost"
-    port = 8000
     
-    console.print(Panel(
-        f"🚀 **Dark.RL WebSocket Server**\n\n"
-        f"🌐 **Host:** {host}\n"
-        f"🔌 **Port:** {port}\n"
-        f"🤖 **Engine:** AsyncOnlineLLM\n"
-        f"🛠️ **Features:** Real MCP servers, API key management, tool calling\n\n"
-        f"**Connect your frontend to:** ws://{host}:{port}\n\n"
-        f"⚡ **Ready for connections!**",
-        title="🔥 DARK.RL SERVER STARTING",
-        style="bold green",
-        border_style="green"
-    ))
+    # This function is now designed to be called from api_server.py
+    # The global LLM server is initialized there.
     
-    # Initialize global LLM server and load model during startup
-    global global_llm_server
-    console.print(Panel(
-        "🧠 Initializing AI model...\n"
-        "This may take a moment on first startup",
-        title="🔄 MODEL LOADING",
-        style="bold yellow",
-        border_style="yellow"
-    ))
-    
-    global_llm_server = DarkRLLLMServer()
-    try:
-        await global_llm_server.initialize_model("qwen2.5-vl")  # Load default model
-        console.print(Panel(
-            "✅ AI model loaded successfully!\n"
-            "🎯 Ready for immediate responses",
-            title="🧠 MODEL READY",
-            style="bold green",
-            border_style="green"
-        ))
-    except Exception as e:
-        console.print(Panel(
-            f"❌ Failed to load model: {str(e)}\n"
-            "⚠️ Model will be loaded on first request",
-            title="🚨 MODEL LOADING ERROR",
-            style="bold red",
-            border_style="red"
-        ))
-        # Continue with server startup even if model loading fails
-    
-    # Start server on root path
-    async with websockets.serve(handle_client, host, port):
-        console.print(Panel(
-            "✅ Server started successfully!\n"
-            "🎯 Ready to handle WebSocket connections",
-            title="🚀 SERVER READY",
-            style="bold blue",
-            border_style="blue"
-        ))
+    # Start the server
+    async with websockets.serve(
+        handle_client, 
+        host, 
+        port, 
+        max_size=10*1024*1024
+    ):
+        logger.info(f"🚀 WebSocket server is running on ws://{host}:{port}")
         await asyncio.Future()  # Run forever
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
+async def initialize_global_llm_server():
+    """Initializes the global LLM server instance."""
+    global global_llm_server
+    if global_llm_server is None:
         console.print(Panel(
-            "🛑 Server stopped by user",
-            title="👋 SHUTDOWN",
+            "🧠 Initializing AI model...\\n"
+            "This may take a moment on first startup",
+            title="🔄 MODEL LOADING",
             style="bold yellow",
             border_style="yellow"
         ))
-        # Clean up global resources
-        if global_llm_server is not None:
-            try:
-                # Cleanup MCP connections
-                asyncio.run(global_llm_server.cleanup_mcp_connections())
-            except:
-                pass
-    except Exception as e:
-        console.print(Panel(
-            f"❌ Server error: {str(e)}",
-            title="🚨 SERVER ERROR",
-            style="bold red",
-            border_style="red"
-        ))
-        import traceback
-        traceback.print_exc() 
+        global_llm_server = DarkRLLLMServer()
+        try:
+            await global_llm_server.initialize_model("qwen2.5-vl")  # Load default model
+            console.print(Panel(
+                "✅ AI model loaded successfully!\\n"
+                "🎯 Ready for immediate responses",
+                title="🧠 MODEL READY",
+                style="bold green",
+                border_style="green"
+            ))
+        except Exception as e:
+            console.print(Panel(
+                f"❌ Failed to load AI model: {e}\\n"
+                "The server will continue to run, but AI features will be limited.",
+                title="🚨 MODEL LOADING ERROR",
+                style="bold red",
+                border_style="red"
+            ))

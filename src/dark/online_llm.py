@@ -9,63 +9,34 @@ import torch
 import bitsandbytes as bnb
 from concurrent.futures import ThreadPoolExecutor
 import math
-from dataclasses import dataclass
-
-# Rich imports for pretty printing stats
-try:
-    from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich.columns import Columns
-    from rich.text import Text
-    from rich.tree import Tree
-    RICH_AVAILABLE = True
-except ImportError:
-    RICH_AVAILABLE = False
-
-# Suppress specific transformers warnings
-warnings.filterwarnings("ignore", message=".*generation_config.*default values have been modified.*")
-warnings.filterwarnings("ignore", message=".*You are using the default legacy behaviour.*")
-warnings.filterwarnings("ignore", message=".*torch.utils.checkpoint.*")
-
-# Set transformers logging to reduce warnings
-try:
-    import transformers
-    transformers.logging.set_verbosity_error()
-except ImportError:
-    pass
-
+from dataclasses import dataclass, field
+import gc
+import inspect
+from rich.console import Console
+from rich.table import Table
+from rich import box
 from dark.llm import LLM
 from dark.sampling_params import SamplingParams
 from dark.engine.sequence import Sequence
-
-# Import KTO trainer
+from dark.models.hf_qwen2_5_vl import load_hf_qwen2_5_vl_model
+from dark.models.qwen3_hf import Qwen3HFForCausalLM
+from dark.models.qwen3_moe import create_qwen3_moe_model
+from mcp_use import MCPClient # Assuming mcp_use is in the path
+from dark.utils.models import (
+    get_model_and_tokenizer,
+    SUPPORTED_MODELS,
+)
+from dark.utils.lora import (
+    load_lora_weights,
+    save_lora_weights,
+    get_lora_config,
+)
 try:
-    from dark.trainers.kto import KTOTrainer
-    KTO_AVAILABLE = True
+    from task_manager import TaskManager
+    TASK_MANAGER_AVAILABLE = True
 except ImportError:
-    KTO_AVAILABLE = False
-
-# Add import for HF wrapper
-try:
-    from dark.models.hf_qwen2_5_vl import load_hf_qwen2_5_vl_model
-    HF_WRAPPER_AVAILABLE = True
-except ImportError:
-    HF_WRAPPER_AVAILABLE = False
-
-# Add import for Qwen3MoE upstream model
-try:
-    from dark.models.qwen3_moe import create_qwen3_moe_model
-    QWEN3_MOE_AVAILABLE = True
-except ImportError:
-    QWEN3_MOE_AVAILABLE = False
-
-# Add import for Qwen3 HF model
-try:
-    from dark.models.qwen3_hf import Qwen3HFForCausalLM
-    QWEN3_HF_AVAILABLE = True
-except ImportError:
-    QWEN3_HF_AVAILABLE = False
+    TASK_MANAGER_AVAILABLE = False
+import json
 
 
 @dataclass
@@ -151,22 +122,6 @@ class BatchManager:
         }
 
 
-SUPPORTED_MODELS = [
-    "Qwen/Qwen2.5-VL-3B-Instruct",
-    "Qwen/Qwen2.5-VL-7B-Instruct",
-    "Qwen/Qwen2.5-VL-32B-Instruct",
-    "Qwen/Qwen2.5-VL-72B-Instruct",
-    "Qwen/Qwen3-0.6B",
-    "Qwen/Qwen3-1.7B",
-    "Qwen/Qwen3-4B",
-    "Qwen/Qwen3-8B",
-    "Qwen/Qwen3-14B",
-    "Qwen/Qwen3-32B",
-    "Qwen/Qwen3-MoE-15B-A2B",
-    "Qwen/Qwen3-MoE-32B-A2B",
-]
-
-
 class OnlineLLM:
     """An online LLM that can be used to chat, learn, and fine-tune with LoRA adapters.
     
@@ -205,7 +160,7 @@ class OnlineLLM:
         batch_config: Optional[BatchConfig] = None,  # Batch processing configuration
     ):
         if model not in SUPPORTED_MODELS:
-            raise ValueError(f"Model {model} not supported. Supported models: {SUPPORTED_MODELS}")
+            raise ValueError(f"Model {model} not supported. Supported models: {list(SUPPORTED_MODELS.keys())}")
 
         self.model_path = model
         self.temperature = temperature
@@ -226,12 +181,7 @@ class OnlineLLM:
         
         # Set default engine based on model type
         if engine is None:
-            if is_vl_model:
-                engine = "hf"  # VL models default to HF (no custom implementation available)
-            elif is_moe_model:
-                engine = "dark"  # MoE models default to custom Dark implementation
-            else:
-                engine = "dark"  # Text models default to custom Dark implementation
+            engine = SUPPORTED_MODELS[model]['engine']
         
         # Validate engine parameter
         if engine not in ["hf", "dark"]:
@@ -240,101 +190,20 @@ class OnlineLLM:
         self.engine = engine
         self.using_hf = (engine == "hf")
         
-        if engine == "hf":
+        if self.using_hf:
             # Use HF implementation
-            if is_vl_model:
-                # VL models use the VL wrapper
-                if not HF_WRAPPER_AVAILABLE:
-                    raise ImportError("HF wrapper not available. Please ensure src.dark.models.hf_qwen2_5_vl is properly installed.")
-                
-                logging.debug(f"Using HuggingFace VL engine for {model} with {attn_implementation} attention")
-                # Initialize the HF VL wrapper
-                self.hf_model = load_hf_qwen2_5_vl_model(
-                    model,
-                    attn_implementation=attn_implementation,
-                    lora_rank=lora_rank,
-                    lora_alpha=lora_alpha
-                )
-                self.tokenizer = self.hf_model.processor.tokenizer
-                self.llm = None
-                self.using_hf = True
-            else:
-                # Text-only models use the Qwen3 HF implementation
-                try:
-                    from dark.models.qwen3_hf import create_qwen3_hf_model
-                    from dark.config import Config
-                    
-                    logging.debug(f"Using HuggingFace text engine for {model} with {attn_implementation} attention")
-                    
-                    # Create config for HF model
-                    config = Config(model=model)
-                    config.model_name = model  # Add model_name attribute for HF compatibility
-                    self.hf_model = create_qwen3_hf_model(
-                        config,
-                        lora_rank=lora_rank,
-                        lora_alpha=lora_alpha,
-                        thinking_mode=thinking_mode
-                    )
-                    self.tokenizer = self.hf_model.tokenizer
-                    self.llm = None
-                    self.using_hf = True
-                    
-                except ImportError as e:
-                    logging.warning(f"HF text engine not available ({e}), falling back to custom engine")
-                    # Fallback to custom implementation
-                    self.llm = LLM(
-                        model,
-                        enforce_eager=enforce_eager,
-                        lora_rank=lora_rank,
-                        lora_alpha=lora_alpha
-                    )
-                    self.tokenizer = self.llm.tokenizer
-                    self.hf_model = None
-                    self.using_hf = False
+            self.hf_model, self.tokenizer = get_model_and_tokenizer(model, lora_rank=lora_rank, lora_alpha=lora_alpha)
+            self.llm = None
         else:
             # Use custom Dark engine
-            if is_moe_model:
-                # Use Qwen3MoE implementation
-                if not QWEN3_MOE_AVAILABLE:
-                    raise ImportError("Qwen3MoE engine not available. Please ensure src.dark.models.qwen3_moe is properly installed.")
-                
-                logging.debug(f"Using custom Dark MoE engine for {model}")
-                from dark.config import Config
-                
-                # Create config for MoE model
-                config = Config(model=model)
-                config.model_name = model  # Add model_name attribute for compatibility
-                self.hf_model = create_qwen3_moe_model(
-                    config,
-                    lora_rank=lora_rank,
-                    lora_alpha=lora_alpha
-                )
-                self.tokenizer = self.hf_model.get_input_embeddings().tokenizer if hasattr(self.hf_model.get_input_embeddings(), 'tokenizer') else None
-                
-                # If we don't have a tokenizer from the model, load it separately
-                if self.tokenizer is None:
-                    from transformers import AutoTokenizer
-                    self.tokenizer = AutoTokenizer.from_pretrained(model)
-                
-                # Ensure tokenizer has required attributes
-                if not hasattr(self.tokenizer, 'eos_token_id') or self.tokenizer.eos_token_id is None:
-                    self.tokenizer.eos_token_id = self.tokenizer.pad_token_id
-                if not hasattr(self.tokenizer, 'pad_token_id') or self.tokenizer.pad_token_id is None:
-                    self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-                
-                self.llm = None
-                self.using_hf = True  # We treat MoE as HF-like for interface purposes
-            else:
-                logging.debug(f"Using custom Dark engine for {model}")
-                self.llm = LLM(
-                    model,
-                    enforce_eager=enforce_eager,
-                    lora_rank=lora_rank,
-                    lora_alpha=lora_alpha
-                )
-                self.tokenizer = self.llm.tokenizer
-                self.hf_model = None
-                self.using_hf = False
+            self.llm = LLM(
+                model,
+                enforce_eager=enforce_eager,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha
+            )
+            self.tokenizer = self.llm.tokenizer
+            self.hf_model = None
 
         # LoRA adapter management
         self.lora_states: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -351,6 +220,139 @@ class OnlineLLM:
             max_tokens=max_tokens,
             ignore_eos=True
         )
+
+        # Initialize Task Manager if available
+        if TASK_MANAGER_AVAILABLE:
+            self.task_manager = TaskManager()
+        else:
+            self.task_manager = None
+
+        # Real MCP server configurations
+        self.mcp_servers = [
+            {
+                "id": "playwright",
+                "name": "Playwright",
+                "description": "Web automation and testing",
+                "config": {
+                    "command": "npx",
+                    "args": ["@playwright/mcp@latest"]
+                },
+                "required_env": [],
+                "optional_env": []
+            },
+            {
+                "id": "filesystem",
+                "name": "File System",
+                "description": "File and directory operations",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/ubuntu/dark.rl"]
+                },
+                "required_env": [],
+                "optional_env": []
+            },
+            {
+                "id": "sequential-thinking",
+                "name": "Sequential Thinking",
+                "description": "Sequential reasoning and thought processes",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+                },
+                "required_env": [],
+                "optional_env": []
+            },
+            {
+                "id": "firecrawl",
+                "name": "Firecrawl",
+                "description": "Web scraping and content extraction",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "firecrawl-mcp"],
+                    "env": {
+                        "FIRECRAWL_API_KEY": ""
+                    }
+                },
+                "required_env": ["FIRECRAWL_API_KEY"],
+                "optional_env": []
+            },
+            {
+                "id": "postgres",
+                "name": "PostgreSQL",
+                "description": "Database operations",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-postgres"],
+                    "env": {
+                        "POSTGRES_CONNECTION_STRING": ""
+                    }
+                },
+                "required_env": ["POSTGRES_CONNECTION_STRING"],
+                "optional_env": []
+            },
+            {
+                "id": "github",
+                "name": "GitHub",
+                "description": "Git repository management",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-github"],
+                    "env": {
+                        "GITHUB_PERSONAL_ACCESS_TOKEN": ""
+                    }
+                },
+                "required_env": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+                "optional_env": []
+            },
+            {
+                "id": "slack",
+                "name": "Slack",
+                "description": "Team communication",
+                "config": {
+                    "command": "npx",
+                    "args": [
+                        "-y",
+                        "slack-mcp-server@latest",
+                        "--transport",
+                        "stdio"
+                    ],
+                    "env": {
+                        "SLACK_MCP_XOXP_TOKEN": ""
+                    }
+                },
+                "required_env": ["SLACK_MCP_XOXP_TOKEN"],
+                "optional_env": []
+            },
+            {
+                "id": "reddit",
+                "name": "Reddit",
+                "description": "Reddit operations",
+                "config": {
+                    "command": "uv",
+                    "args": [
+                        "run",
+                        "python",
+                        "-m",
+                        "reddit_mcp.server"
+                    ],
+                    "env": {
+                        "REDDIT_CLIENT_ID": "your_client_id",
+                        "REDDIT_CLIENT_SECRET": "your_client_secret",
+                        "REDDIT_USERNAME": "your_username",
+                        "REDDIT_PASSWORD": "your_password"
+                    }
+                },
+                "required_env": ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"],
+                "optional_env": ["REDDIT_USERNAME", "REDDIT_PASSWORD"]
+            }
+        ]
+        
+        # MCP client connections cache
+        self.mcp_clients = {}
+        self.mcp_sessions = {}
+        
+        # MCP server actions cache
+        self.mcp_actions_cache = {}
 
     def get_lora_state(self, to_cpu: bool = None) -> Dict[str, torch.Tensor]:
         """Clone and return all LoRA parameters of the model.
@@ -494,6 +496,11 @@ class OnlineLLM:
         This method ensures proper adapter isolation by first resetting ALL LoRA 
         parameters to zero, then loading only the specified adapter's weights.
         """
+        # --- DEBUG: Log LoRA state loading ---
+        state_norm = sum(p.norm().item() for p in state.values()) if state else 0.0
+        print(f"[load_lora_state_DEBUG] Loading LoRA state. Total norm of state to load: {state_norm:.6f}")
+        # --- END DEBUG ---
+
         t0 = time.perf_counter()
         if not state:
             logging.debug(f"[metric] lora_load_ms=0.00 (no state)")
@@ -938,6 +945,8 @@ class OnlineLLM:
             logging.info(f"Training adapter: {adapter_name} with {len(examples)} examples")
             
             try:
+                print(f"Training {adapter_name} with {len(examples)} examples and {steps} steps and {lr} lr")
+                print(f"Examples: {examples}")
                 result = await self._train_single_adapter_batch(
                     adapter_name, examples, steps, lr, trainer
                 )
@@ -982,6 +991,7 @@ class OnlineLLM:
         
         # Run fine-tuning
         is_moe_model = "MoE" in self.model_path
+        print(f"Training {adapter} with {len(examples)} examples and {steps} steps and {lr} lr and is_moe_model: {is_moe_model}")
         opt_state = await self.fine_tune(examples, adapter, steps, lr, is_moe_model, trainer)
         
         # Save updated states
@@ -1261,97 +1271,19 @@ class OnlineLLM:
         else:
             optimizer = torch.optim.Adam(params_to_tune, lr=lr)
         
-        # Check if KTO training is requested
-        is_kto_training = (trainer is not None and 
-                          KTO_AVAILABLE and 
-                          isinstance(trainer, KTOTrainer))
-        
-        # Prepare KTO-specific data if needed
-        if is_kto_training:
-            # Process examples for KTO using TRL-style tokenization
-            kto_data = []
-            for ex in examples:
-                # Extract prompt and response
-                prompt = ex.get("prompt", "")
-                response = ex.get("response", "")
-                
-                # Get preference label (1 for desirable, 0 for undesirable)
-                pref_label = ex.get("desirable", ex.get("preference", 1))
-                
-                # Tokenize using TRL approach
-                tokenized = trainer.tokenize_conversation(self.tokenizer, prompt, response)
-                tokenized["preference_label"] = pref_label
-                kto_data.append(tokenized)
-            
-            # Create KL dataset if we have multiple examples
-            if len(kto_data) >= 2:
-                kto_data = trainer.create_kl_dataset(kto_data)
-            
-            # Create reference model before training if needed
-            reference_model = None
-            if not trainer.reference_free and not trainer._reference_model_created:
-                logging.debug(f"[KTO] Creating reference model before training...")
-                reference_model = trainer.create_reference_model(model_for_training)
-            else:
-                reference_model = trainer._reference_model
-                
-            logging.debug(f"[KTO] Using reference model: {reference_model is not None}, reference_free={trainer.reference_free}")
+        # --- DEBUG: Print initial LoRA parameter norms ---
+        with torch.no_grad():
+            initial_norms = {n: p.norm().item() for n, p in model_for_training.named_parameters() if "lora_" in n and p.requires_grad}
+            avg_initial_norm = sum(initial_norms.values()) / len(initial_norms) if initial_norms else 0.0
+            print(f"        [fine_tune_DEBUG] Initial avg LoRA norm for '{adapter}': {avg_initial_norm:.6f}")
+        # --- END DEBUG ---
+
         
         # Training loop
         for step in range(steps):
+            print("training step", step)
             async with self.lock:
-                if is_kto_training:
-                    # Create batch from KTO data
-                    batch = {}
-                    
-                    # Stack all tokenized data
-                    for key in ['completion_input_ids', 'completion_attention_mask', 'completion_labels']:
-                        values = [item[key] for item in kto_data]
-                        # Pad sequences to same length
-                        max_len = max(len(v) for v in values)
-                        padded_values = []
-                        for v in values:
-                            padded = v + [self.tokenizer.pad_token_id if key.endswith('_ids') else 0] * (max_len - len(v))
-                            if key == 'completion_labels':
-                                # Use -100 for padding in labels
-                                padded = v + [-100] * (max_len - len(v))
-                            padded_values.append(padded)
-                        batch[key] = torch.tensor(padded_values, device=device)
-                    
-                    # Add preference labels and labels for KTO trainer
-                    batch['preference_labels'] = torch.tensor([item['preference_label'] for item in kto_data], device=device)
-                    # KTO trainer expects 'label' field: True for desirable/chosen, False for undesirable/rejected
-                    batch['label'] = [bool(item['preference_label']) for item in kto_data]
-                    
-                    # Add KL data if available
-                    if 'KL_completion_input_ids' in kto_data[0]:
-                        for key in ['KL_completion_input_ids', 'KL_completion_attention_mask', 'KL_completion_labels']:
-                            values = [item[key] for item in kto_data]
-                            max_len = max(len(v) for v in values)
-                            padded_values = []
-                            for v in values:
-                                if key == 'KL_completion_labels':
-                                    padded = v + [-100] * (max_len - len(v))
-                                else:
-                                    padded = v + [self.tokenizer.pad_token_id if key.endswith('_ids') else 0] * (max_len - len(v))
-                                padded_values.append(padded)
-                            batch[key] = torch.tensor(padded_values, device=device)
-                    
-                    metrics = trainer.train_step(
-                        model_for_training,
-                        reference_model,
-                        batch,
-                        optimizer
-                    )
-                    
-                    loss_value = metrics['loss']
-                    logging.debug(f"        [KTO] {adapter} step={step:3d}  loss={loss_value:.4f}")
-                    if 'chosen_rewards' in metrics:
-                        logging.debug(f"        [KTO] chosen_rewards={metrics['chosen_rewards']:.4f}")
-                    if 'rejected_rewards' in metrics:
-                        logging.debug(f"        [KTO] rejected_rewards={metrics['rejected_rewards']:.4f}")
-                        
-                elif self.using_hf:
+                if self.using_hf:
                     # Standard HF training
                     self.hf_model.train()
                     optimizer.zero_grad()
@@ -1383,6 +1315,7 @@ class OnlineLLM:
                     optimizer.step()
                 else:
                     # Standard custom training
+                    print("training using dark trainer", step)
                     self.llm.train()
                     optimizer.zero_grad()
                     torch.cuda.reset_peak_memory_stats()
@@ -1392,8 +1325,7 @@ class OnlineLLM:
                     optimizer.step()
 
             if step == 0 or step == steps - 1 or step % 10 == 0:
-                if not is_kto_training:  # KTO logging is handled above
-                    logging.debug(f"        [fine_tune] {adapter} step={step:3d}  loss={loss.item():.4f}")
+                print(f"        [fine_tune] {adapter} step={step:3d}  loss={loss.item():.4f}")
 
             if step == 0:
                 step_t0 = time.perf_counter()
@@ -1414,7 +1346,11 @@ class OnlineLLM:
                         if "lora_" in n or p.requires_grad
                     }
                     avg_norm = sum(norms.values()) / len(norms) if norms else 0.0
-                    logging.debug(f"        [fine_tune] {adapter} average LoRA param norm={avg_norm:.4f}")
+                    print(f"        [fine_tune_DEBUG] Final avg LoRA norm for '{adapter}': {avg_norm:.6f}")
+                    if avg_norm == avg_initial_norm:
+                        print(f"        [fine_tune_DEBUG] ⚠️ WARNING: LoRA parameter norms did not change for adapter '{adapter}'.")
+                    else:
+                        print(f"        [fine_tune_DEBUG] ✅ LoRA parameter norms changed for adapter '{adapter}'.")
             else:
                 self.llm.eval()
                 with torch.no_grad():
@@ -1424,7 +1360,11 @@ class OnlineLLM:
                         if "lora_" in n
                     }
                     avg_norm = sum(norms.values()) / len(norms) if norms else 0.0
-                    logging.debug(f"        [fine_tune] {adapter} average LoRA param norm={avg_norm:.4f}")
+                    print(f"        [fine_tune_DEBUG] Final avg LoRA norm for '{adapter}': {avg_norm:.6f}")
+                    if avg_norm == avg_initial_norm:
+                        print(f"        [fine_tune_DEBUG] ⚠️ WARNING: LoRA parameter norms did not change for adapter '{adapter}'.")
+                    else:
+                        print(f"        [fine_tune_DEBUG] ✅ LoRA parameter norms changed for adapter '{adapter}'.")
 
         total_ft_ms = (time.perf_counter() - t_ft_start) * 1000
         logging.debug(f"[metric] fine_tune_total_ms={total_ft_ms:.2f}")
@@ -1495,7 +1435,7 @@ class OnlineLLM:
             async_instance.opt_states = self.opt_states.copy()
             
             async def _run_learn():
-                await async_instance.learn(msgs, adapter, trainer=trainer)
+                await async_instance.learn(msgs, adapter)
                 # Copy state back
                 self.lora_states.update(async_instance.lora_states)
                 self.opt_states.update(async_instance.opt_states)
@@ -1530,7 +1470,7 @@ class OnlineLLM:
             async_instance.opt_states = self.opt_states.copy()
             
             async def _run_unlearn():
-                await async_instance.unlearn(msgs, adapter, trainer=trainer)
+                await async_instance.unlearn(msgs, adapter)
                 # Copy state back
                 self.lora_states.update(async_instance.lora_states)
                 self.opt_states.update(async_instance.opt_states)
@@ -2016,6 +1956,34 @@ class OnlineLLM:
         
         console.print()
 
+    def get_mcp_servers(self, query: str = "") -> list:
+        """Get list of MCP servers, optionally filtered by query"""
+        servers = []
+        
+        for server in self.mcp_servers:
+            # Check if all required environment variables are available
+            required_env_vars = server.get("required_env", [])
+            api_key_available = all(get_api_key(env_var) for env_var in required_env_vars) if required_env_vars else True
+            
+            server_info = {
+                "id": server["id"],
+                "name": server["name"],
+                "description": server["description"],
+                "api_key_available": api_key_available
+            }
+            
+            # Filter by query if provided
+            if query:
+                query_lower = query.lower()
+                if not (query_lower in server["name"].lower() or 
+                       query_lower in server["description"].lower() or
+                       query_lower in server["id"].lower()):
+                    continue
+            
+            servers.append(server_info)
+        
+        return servers
+
 
 class AsyncOnlineLLM(OnlineLLM):
     """
@@ -2036,12 +2004,12 @@ class AsyncOnlineLLM(OnlineLLM):
     4. Each adapter maintains its own learned behavior
     """
     
-    def __init__(self, *args: Any, train_every: int = 10, default_trainer: Optional[Any] = None, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, train_every: int = 4, default_trainer: Optional[Any] = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         # Batch accumulation for KTO training
         self.pending_learn_examples: Dict[str, List[Dict]] = {}
         self.pending_unlearn_examples: Dict[str, List[Dict]] = {}
-        self.min_batch_size = 2  # KTO requirement (reduced from 4)
+        self.min_batch_size = 2
         self.train_every = train_every  # Train every N examples
         self.example_counts: Dict[str, int] = {}  # Track total examples per adapter
         self.default_trainer = default_trainer  # Default trainer to use if none specified
@@ -2295,6 +2263,10 @@ class AsyncOnlineLLM(OnlineLLM):
         This method ensures proper adapter isolation by training only the specified
         adapter without any concurrent training that could cause contamination.
         """
+
+        print(f"Training {adapter} with {len(examples)} examples and {steps} steps and {lr} lr")
+        print(f"Examples: {examples}")
+        
         # Wait for any existing training task for this adapter
         if adapter in self.training_tasks:
             await self.training_tasks.pop(adapter)
@@ -2707,7 +2679,7 @@ class AsyncOnlineLLM(OnlineLLM):
             buffer_table = Table(
                 "Adapter",
                 "Pending Learn",
-                "Pending Unlearn", 
+                "Pending Unlearn",
                 "Total Pending",
                 "Progress to Training",
                 title="[bold orange]Training Buffers[/bold orange]",
@@ -2837,3 +2809,24 @@ class AsyncOnlineLLM(OnlineLLM):
                 console.print(Panel(recommendations_text, title="[bold blue]Recommendations[/bold blue]", border_style="blue"))
         
         console.print()
+
+def get_api_key(env_var: str) -> str:
+    """Get API key from environment variables or local file"""
+    # First check environment variables
+    env_value = os.getenv(env_var, "")
+    if env_value:
+        return env_value
+    
+    # Then check local file
+    try:
+        agentsea_dir = Path.home() / '.agentsea'
+        api_keys_file = agentsea_dir / 'api_keys.json'
+        
+        if not api_keys_file.exists():
+            return ""
+        
+        with open(api_keys_file, 'r') as f:
+            local_keys = json.load(f)
+            return local_keys.get(env_var, "")
+    except Exception:
+        return ""
